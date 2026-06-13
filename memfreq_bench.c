@@ -1695,6 +1695,37 @@ static void usage(const char *prog)
 "  -h          This help\n", prog);
 }
 
+/*
+ * Find the lowest frequency (in kHz) whose throughput is ≥ threshold × max.
+ * Returns 0 if no such frequency exists (no plateau, e.g. compute-bound).
+ * The data arrays are indexed by frequency point, in ascending-freq order
+ * (same order as `results[]` in main()).
+ */
+static int find_sweet_spot(const double *mops, const int *freqs_khz,
+                           int n, int *out_index, double threshold)
+{
+	if (n <= 0 || threshold <= 0.0)
+		return 0;
+
+	/* max throughput across all valid points */
+	double mx = -INFINITY;
+	for (int i = 0; i < n; i++)
+		if (mops[i] > mx)
+			mx = mops[i];
+
+	if (mx <= 0.0 || !isfinite(mx))
+		return 0;
+
+	/* lowest freq that meets threshold */
+	for (int i = 0; i < n; i++) {
+		if (mops[i] >= mx * threshold) {
+			*out_index = i;
+			return freqs_khz[i];
+		}
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int   cpu       = 0;
@@ -2134,20 +2165,29 @@ int main(int argc, char **argv)
 	double c_max = do_chase ? results[ref].chase_tput : 0;
 	double p_max = results[ref].compute_tput;
 
-	double THRESHOLD = 0.95;   /* 5 % tolerance for sweet spot */
-	int stride_sweet = 0, chase_sweet = 0;
-
-	/* find sweet spots (lowest valid freq within threshold of max) */
+	/* Per-workload throughput arrays (descending-freq order in results[],
+	 * but find_sweet_spot() walks the array linearly so order doesn't matter
+	 * as long as we pass valid data). We build ascending-freq arrays. */
+	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], random_mops[MAX_FREQS], compute_mops[MAX_FREQS];
+	int    freqs_khz[MAX_FREQS];
+	int    n_valid = 0;
 	for (int fi = 0; fi < nfreqs; fi++) {
-		if (!results[fi].valid)
-			continue;
-		if (!stride_sweet &&
-		    results[fi].stride_tput >= s_max * THRESHOLD)
-			stride_sweet = results[fi].freq_khz;
-		if (do_chase && !chase_sweet &&
-		    results[fi].chase_tput >= c_max * THRESHOLD)
-			chase_sweet = results[fi].freq_khz;
+		if (!results[fi].valid) continue;
+		stride_mops[n_valid]  = results[fi].stride_tput;
+		chase_mops[n_valid]   = results[fi].chase_tput;
+		random_mops[n_valid]  = results[fi].random_tput;
+		compute_mops[n_valid] = results[fi].compute_tput;
+		freqs_khz[n_valid]    = results[fi].freq_khz;
+		n_valid++;
 	}
+
+	int stride_sweet_idx = -1, chase_sweet_idx = -1;
+	int stride_sweet = find_sweet_spot(stride_mops, freqs_khz, n_valid,
+	                                   &stride_sweet_idx, threshold);
+	int chase_sweet  = do_chase
+		? find_sweet_spot(chase_mops, freqs_khz, n_valid,
+		                  &chase_sweet_idx, threshold)
+		: 0;
 
 	/* data rows */
 	for (int fi = 0; fi < nfreqs; fi++) {
@@ -2223,7 +2263,7 @@ int main(int argc, char **argv)
 	/* summary */
 	printf("#\n");
 	printf("# === Sweet spot (lowest freq ≥ %.0f%% of max throughput) ===\n",
-	       THRESHOLD * 100);
+	       threshold * 100);
 
 	if (stride_sweet)
 		printf("# stride  sweet spot: %d MHz  (%d%% of max %d MHz)\n",
