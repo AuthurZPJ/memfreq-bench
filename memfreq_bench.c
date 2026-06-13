@@ -1687,6 +1687,10 @@ static void usage(const char *prog)
 "  -f          Flush cache line after each access (clflush/dc cvac)\n"
 "  -F          Force run even if system is busy (skip idle check)\n"
 "  -B NODE     Bind array memory to NUMA node (default: -1 = no binding)\n"
+"  -T FRAC     Sweet-spot threshold in (0, 1]   (default: 0.95)\n"
+"  -L LIST     Multi-threshold sweep, e.g. 0.8,0.9,0.95,0.99 (max 16)\n"
+"  -r          Emit per-sample raw data (for custom analysis)\n"
+"  -P          Suppress plateau detection block\n"
 "  -h          This help\n", prog);
 }
 
@@ -1705,9 +1709,14 @@ int main(int argc, char **argv)
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   force_run = 0;
 	int   numa_node = -1;  /* -1 = no binding */
+	double  threshold      = 0.95;  /* user-overridable sweet-spot threshold */
+	int     n_user_thresholds = 0;
+	double  user_thresholds[16];
+	int     emit_raw       = 0;     /* --emit-raw: per-sample data in output */
+	int     no_plateau     = 0;     /* --no-plateau: suppress plateau block */
 	int   opt;
 
-	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFh")) != -1) {
+	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rP")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'N': ncpu      = atoi(optarg); break;
@@ -1722,6 +1731,27 @@ int main(int argc, char **argv)
 		case 'R': do_random = 1;            break;
 		case 'f': do_flush  = 1;            break;
 		case 'F': force_run = 1;            break;
+		case 'T': threshold = atof(optarg);
+		          if (threshold <= 0.0 || threshold > 1.0) {
+		              dprintf("ERROR: --threshold must be in (0, 1], got %s\n", optarg);
+		              return 1;
+		          }
+		          break;
+		case 'L': {
+		          char *tok = strtok(optarg, ",");
+		          while (tok && n_user_thresholds < 16) {
+		              double v = atof(tok);
+		              if (v <= 0.0 || v > 1.0) {
+		                  dprintf("ERROR: --thresholds values must be in (0, 1], got %s\n", tok);
+		                  return 1;
+		              }
+		              user_thresholds[n_user_thresholds++] = v;
+		              tok = strtok(NULL, ",");
+		          }
+		          break;
+		      }
+		case 'r': emit_raw   = 1; (void)emit_raw;   break;
+		case 'P': no_plateau = 1; (void)no_plateau; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
