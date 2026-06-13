@@ -1,0 +1,5 @@
+memfreq_bench
+*.o
+memfreq_results.json
+*.pyc
+__pycache__/
