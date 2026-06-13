@@ -739,6 +739,10 @@ struct result {
 	double energy_uj;       /* loaded energy (µJ), 0=N/A           */
 	double idle_power_uw;   /* idle power (µW), 0=N/A              */
 	double load_power_uw;   /* loaded power (µW), 0=N/A            */
+	double stride_min,  stride_max,  stride_iqr;
+	double chase_min,   chase_max,   chase_iqr;
+	double random_min,  random_max,  random_iqr;
+	double compute_min, compute_max, compute_iqr;
 };
 
 /* ------------------------------------------------------------------ */
@@ -1726,6 +1730,25 @@ static int find_sweet_spot(const double *mops, const int *freqs_khz,
 	return 0;
 }
 
+/*
+ * Linear-interpolation percentile, matching numpy's default (method='linear').
+ * `sorted` must be in ascending order. `p` in [0, 1].
+ * For nsamples < 3, returns 0.0 (insufficient data for IQR).
+ */
+static double percentile(const double *sorted, int n, double p)
+{
+	if (n <= 0 || p < 0.0 || p > 1.0)
+		return 0.0;
+	if (n == 1)
+		return sorted[0];
+	double idx = p * (n - 1);
+	int lo = (int)idx;
+	double frac = idx - lo;
+	if (lo + 1 >= n)
+		return sorted[n - 1];
+	return sorted[lo] * (1.0 - frac) + sorted[lo + 1] * frac;
+}
+
 int main(int argc, char **argv)
 {
 	int   cpu       = 0;
@@ -1967,6 +1990,9 @@ int main(int argc, char **argv)
 		results[fi].energy_uj = 0;
 		results[fi].idle_power_uw = 0;
 		results[fi].load_power_uw = 0;
+		results[fi].stride_min = 0; results[fi].stride_max = 0; results[fi].stride_iqr = 0;
+		results[fi].chase_min  = 0; results[fi].chase_max  = 0; results[fi].chase_iqr  = 0;
+		results[fi].compute_min= 0; results[fi].compute_max= 0; results[fi].compute_iqr= 0;
 
 		if (set_freq(cpu, freqs[fi]) < 0) {
 			dprintf("\nWARN: cannot set cpu%d to %d kHz, skipping\n",
@@ -2018,6 +2044,11 @@ int main(int argc, char **argv)
 		}
 		qsort(buf, nsamples, sizeof(double), cmp_double);
 		results[fi].stride_tput = buf[nsamples / 2];
+		results[fi].stride_min = buf[0];
+		results[fi].stride_max = buf[nsamples - 1];
+		results[fi].stride_iqr = nsamples >= 3
+		    ? percentile(buf, nsamples, 0.75) - percentile(buf, nsamples, 0.25)
+		    : 0.0;
 		double cpu_after = cpu_time_sec();
 		results[fi].stride_cpu_time = cpu_after - cpu_before;
 
@@ -2027,6 +2058,11 @@ int main(int argc, char **argv)
 				buf[s] = bench_chase(chase_nodes, test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
 			results[fi].chase_tput = buf[nsamples / 2];
+			results[fi].chase_min  = buf[0];
+			results[fi].chase_max  = buf[nsamples - 1];
+			results[fi].chase_iqr  = nsamples >= 3
+			    ? percentile(buf, nsamples, 0.75) - percentile(buf, nsamples, 0.25)
+			    : 0.0;
 		}
 
 		/* random permutation */
@@ -2036,6 +2072,11 @@ int main(int argc, char **argv)
 						      test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
 			results[fi].random_tput = buf[nsamples / 2];
+			results[fi].random_min  = buf[0];
+			results[fi].random_max  = buf[nsamples - 1];
+			results[fi].random_iqr  = nsamples >= 3
+			    ? percentile(buf, nsamples, 0.75) - percentile(buf, nsamples, 0.25)
+			    : 0.0;
 		}
 
 		/* compute */
@@ -2043,6 +2084,11 @@ int main(int argc, char **argv)
 			buf[s] = bench_compute(test_secs);
 		qsort(buf, nsamples, sizeof(double), cmp_double);
 		results[fi].compute_tput = buf[nsamples / 2];
+		results[fi].compute_min = buf[0];
+		results[fi].compute_max = buf[nsamples - 1];
+		results[fi].compute_iqr = nsamples >= 3
+		    ? percentile(buf, nsamples, 0.75) - percentile(buf, nsamples, 0.25)
+		    : 0.0;
 
 		/* energy: compute total energy for this frequency point */
 		if (npower_paths > 0 && power_before > 0) {
@@ -2285,6 +2331,56 @@ int main(int argc, char **argv)
 	printf("#   stride/chase %% drops with freq        → workload has compute component\n");
 	printf("#     → sweet spot is higher, be careful with aggressive DVFS\n");
 	printf("#   compute %% ≈ freq ratio                → sanity check (pure compute)\n");
+
+	/* ---- per-freq stats blocks ---- */
+	printf("#\n# --- per-freq stats (stride) ---\n");
+	printf("# freq_MHz  min_Mops  max_Mops  median_Mops  iqr_Mops\n");
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid) continue;
+		printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
+		       results[fi].freq_khz / 1000,
+		       results[fi].stride_min  / 1e6,
+		       results[fi].stride_max  / 1e6,
+		       results[fi].stride_tput / 1e6,
+		       results[fi].stride_iqr  / 1e6);
+	}
+	if (do_chase) {
+		printf("#\n# --- per-freq stats (chase) ---\n");
+		printf("# freq_MHz  min_Mops  max_Mops  median_Mops  iqr_Mops\n");
+		for (int fi = 0; fi < nfreqs; fi++) {
+			if (!results[fi].valid) continue;
+			printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
+			       results[fi].freq_khz / 1000,
+			       results[fi].chase_min  / 1e6,
+			       results[fi].chase_max  / 1e6,
+			       results[fi].chase_tput / 1e6,
+			       results[fi].chase_iqr  / 1e6);
+		}
+	}
+	if (do_random) {
+		printf("#\n# --- per-freq stats (random) ---\n");
+		printf("# freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps\n");
+		for (int fi = 0; fi < nfreqs; fi++) {
+			if (!results[fi].valid) continue;
+			printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
+			       results[fi].freq_khz / 1000,
+			       results[fi].random_min  / 1e6,
+			       results[fi].random_max  / 1e6,
+			       results[fi].random_tput / 1e6,
+			       results[fi].random_iqr  / 1e6);
+		}
+	}
+	printf("#\n# --- per-freq stats (compute) ---\n");
+	printf("# freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps\n");
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid) continue;
+		printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
+		       results[fi].freq_khz / 1000,
+		       results[fi].compute_min  / 1e6,
+		       results[fi].compute_max  / 1e6,
+		       results[fi].compute_tput / 1e6,
+		       results[fi].compute_iqr  / 1e6);
+	}
 
 	free(buf);
 	free(results);
