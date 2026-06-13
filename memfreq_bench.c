@@ -40,7 +40,7 @@
 #include <math.h>
 
 #define CL        64          /* cache line size (bytes)               */
-#define MAX_FREQS 64
+#define MAX_FREQS 256
 
 #define dprintf(...) fprintf(stderr, __VA_ARGS__)
 
@@ -109,35 +109,6 @@ static int sysfs_write(const char *path, const char *val)
 /* Frequency management                                                */
 /* ------------------------------------------------------------------ */
 
-static int read_freqs(int cpu, int *freqs, int max)
-{
-	char path[256], buf[4096];
-
-	snprintf(path, sizeof(path),
-		 "/sys/devices/system/cpu/cpu%d/cpufreq/"
-		 "scaling_available_frequencies", cpu);
-
-	if (sysfs_read(path, buf, sizeof(buf)) < 0)
-		return 0;
-
-	int count = 0;
-	char *tok = strtok(buf, " \n");
-	while (tok && count < max) {
-		freqs[count++] = atoi(tok);
-		tok = strtok(NULL, " \n");
-	}
-
-	/* sort ascending */
-	for (int i = 0; i < count - 1; i++)
-		for (int j = i + 1; j < count; j++)
-			if (freqs[i] > freqs[j]) {
-				int t = freqs[i];
-				freqs[i] = freqs[j];
-				freqs[j] = t;
-			}
-	return count;
-}
-
 static int read_freq_khz(const char *path)
 {
 	char buf[64];
@@ -145,6 +116,82 @@ static int read_freq_khz(const char *path)
 	if (sysfs_read(path, buf, sizeof(buf)) < 0)
 		return -1;
 	return atoi(buf);
+}
+
+/*
+ * Read available frequencies.
+ *
+ * Path 1 (discrete): scaling_available_frequencies
+ *   Traditional cpufreq drivers expose a whitespace-separated list.
+ *
+ * Path 2 (continuous/CPPC): cpuinfo_min_freq → cpuinfo_max_freq
+ *   CPPC-based drivers (common on ARM servers) don't expose a discrete
+ *   list.  Instead, the firmware reports a continuous range.  We generate
+ *   a sweep from min to max with a configurable step (default 25 MHz).
+ *   The actual frequency set by the firmware may not be exact, but the
+ *   hardware will clamp to the nearest valid OPP.
+ */
+static int read_freqs(int cpu, int *freqs, int max, int step_khz, int *is_range)
+{
+	char path[256], buf[4096];
+
+	*is_range = 0;
+
+	/* Path 1: try discrete list */
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/"
+		 "scaling_available_frequencies", cpu);
+
+	if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+		int count = 0;
+		char *tok = strtok(buf, " \n");
+		while (tok && count < max) {
+			freqs[count++] = atoi(tok);
+			tok = strtok(NULL, " \n");
+		}
+
+		/* sort ascending */
+		for (int i = 0; i < count - 1; i++)
+			for (int j = i + 1; j < count; j++)
+				if (freqs[i] > freqs[j]) {
+					int t = freqs[i];
+					freqs[i] = freqs[j];
+					freqs[j] = t;
+				}
+		if (count >= 2)
+			return count;
+	}
+
+	/* Path 2: CPPC continuous range */
+	int fmin, fmax;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_min_freq",
+		 cpu);
+	fmin = read_freq_khz(path);
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",
+		 cpu);
+	fmax = read_freq_khz(path);
+
+	if (fmin <= 0 || fmax <= 0 || fmin >= fmax)
+		return 0;
+
+	if (step_khz <= 0)
+		step_khz = 25000;   /* 25 MHz default step */
+
+	*is_range = 1;
+
+	int count = 0;
+	for (int f = fmin; f <= fmax && count < max; f += step_khz)
+		freqs[count++] = f;
+
+	/* ensure max is included */
+	if (count > 0 && freqs[count - 1] != fmax && count < max)
+		freqs[count++] = fmax;
+
+	return count;
 }
 
 /*
@@ -376,13 +423,14 @@ static void usage(const char *prog)
 {
 	dprintf(
 "Usage: %s [options]\n"
-"  -c CPU     Pin to this CPU           (default: 0)\n"
-"  -m SIZE_MB Array size in MB          (default: 128)\n"
-"  -s STRIDE  Stride in uint64 units    (default: 8 = 64B = 1 cache line)\n"
-"  -t SECS    Seconds per test point    (default: 2)\n"
-"  -n N       Samples per point (median)(default: 3)\n"
-"  -C         Skip pointer chase test\n"
-"  -h         This help\n", prog);
+"  -c CPU      Pin to this CPU            (default: 0)\n"
+"  -m SIZE_MB  Array size in MB           (default: 128)\n"
+"  -s STRIDE   Stride in uint64 units     (default: 8 = 64B = 1 cache line)\n"
+"  -t SECS     Seconds per test point     (default: 2)\n"
+"  -n N        Samples per point (median) (default: 3)\n"
+"  -S STEP_KHZ Frequency step in kHz      (default: 25000, CPPC range mode only)\n"
+"  -C          Skip pointer chase test\n"
+"  -h          This help\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -393,15 +441,17 @@ int main(int argc, char **argv)
 	int   test_secs = 2;
 	int   nsamples  = 3;
 	int   do_chase  = 1;
+	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   opt;
 
-	while ((opt = getopt(argc, argv, "c:m:s:t:n:Ch")) != -1) {
+	while ((opt = getopt(argc, argv, "c:m:s:t:n:S:Ch")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'm': size_mb   = atoi(optarg); break;
 		case 's': stride    = atoi(optarg); break;
 		case 't': test_secs = atoi(optarg); break;
 		case 'n': nsamples  = atoi(optarg); break;
+		case 'S': step_khz  = atoi(optarg); break;
 		case 'C': do_chase  = 0;            break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
@@ -445,9 +495,14 @@ int main(int argc, char **argv)
 
 	/* ---- read available frequencies ---- */
 	int freqs[MAX_FREQS];
-	int nfreqs = read_freqs(cpu, freqs, MAX_FREQS);
+	int freq_is_range = 0;
+	int nfreqs = read_freqs(cpu, freqs, MAX_FREQS, step_khz, &freq_is_range);
 	if (nfreqs < 2) {
 		dprintf("ERROR: need ≥2 frequencies, got %d.\n", nfreqs);
+		dprintf("       Checked both:\n");
+		dprintf("         scaling_available_frequencies (discrete list)\n");
+		dprintf("         cpuinfo_min/max_freq (CPPC range, step=%d kHz)\n",
+			step_khz);
 		dprintf("       Is cpufreq configured on cpu%d?\n", cpu);
 		free(arr);
 		free(chase_nodes);
@@ -468,6 +523,10 @@ int main(int argc, char **argv)
 	dprintf("Chase     : %s\n", do_chase ? "enabled" : "disabled");
 	dprintf("Duration  : %d s × %d samples (median)\n",
 		test_secs, nsamples);
+	if (freq_is_range)
+		dprintf("Freq mode : CPPC range, step %d kHz\n", step_khz);
+	else
+		dprintf("Freq mode : discrete list\n");
 	dprintf("Freq pts  : %d (%d – %d MHz)\n",
 		nfreqs, freqs[0] / 1000, freqs[nfreqs - 1] / 1000);
 	dprintf("\n");
