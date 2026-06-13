@@ -39,13 +39,39 @@
 #include <unistd.h>
 #include <math.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <signal.h>
+#include <linux/mempolicy.h>
 
 #define CL        64          /* cache line size (bytes)               */
 #define MAX_FREQS 256
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
 #define MAX_NODES 16          /* max NUMA nodes                        */
+
+/* Convert ops/sec to MB/s for stride test (each op = 8 bytes) */
+#define OPS_TO_MBS(ops) ((ops) * 8.0 / 1048576.0)
+
+/* Cache line flush: platform-specific */
+#if defined(__x86_64__) || defined(__i386__)
+static inline void flush_cacheline(const void *addr)
+{
+	__asm__ volatile("clflush (%0)" : : "r"(addr) : "memory");
+}
+#elif defined(__aarch64__)
+static inline void flush_cacheline(const void *addr)
+{
+	__asm__ volatile("dc cvac, %0" : : "r"(addr) : "memory");
+}
+#else
+static inline void flush_cacheline(const void *addr)
+{
+	(void)addr;  /* no-op on unsupported platforms */
+}
+#endif
 
 #define dprintf(...) fprintf(stderr, __VA_ARGS__)
 
@@ -56,6 +82,7 @@
 /* forward declarations */
 static int sysfs_read(const char *path, char *buf, size_t sz);
 static int sysfs_write(const char *path, const char *val);
+static int select_primary_threads(int *out_cpus, int max_cpus);
 
 struct numa_node {
 	int cpus[MAX_CPUS];
@@ -165,7 +192,17 @@ static int select_cpus(int ncpus, int *out_cpus,
 	if (nnodes <= 0 || ndomains <= 0)
 		return -1;
 
-	/* simple round-robin across NUMA nodes */
+	/* get primary threads (one per physical core, no SMT siblings) */
+	int primary[MAX_CPUS];
+	int nprimary = select_primary_threads(primary, MAX_CPUS);
+
+	int allowed[MAX_CPUS] = {0};
+	if (nprimary > 0) {
+		for (int i = 0; i < nprimary; i++)
+			allowed[primary[i]] = 1;
+	}
+
+	/* round-robin across NUMA nodes, preferring primary threads */
 	int per_node = ncpus / nnodes;
 	int remainder = ncpus % nnodes;
 	int selected = 0;
@@ -174,11 +211,12 @@ static int select_cpus(int ncpus, int *out_cpus,
 		int target = per_node + (n < remainder ? 1 : 0);
 		int node_sel = 0;
 
-		/* pick one CPU per freq domain within this node */
 		for (int d = 0; d < ndomains && node_sel < target; d++) {
 			for (int c = 0; c < domains[d].ncpus && node_sel < target; c++) {
 				int cpu = domains[d].cpus[c];
-				/* check if this CPU belongs to this NUMA node */
+				/* prefer primary threads (avoid SMT siblings) */
+				if (nprimary > 0 && !allowed[cpu])
+					continue;
 				int belongs = 0;
 				for (int k = 0; k < nodes[n].ncpus; k++) {
 					if (nodes[n].cpus[k] == cpu) {
@@ -189,7 +227,7 @@ static int select_cpus(int ncpus, int *out_cpus,
 				if (belongs) {
 					out_cpus[selected++] = cpu;
 					node_sel++;
-					break;  /* one per domain */
+					break;
 				}
 			}
 		}
@@ -517,6 +555,78 @@ bench_stride(const uint64_t *arr, size_t count, size_t stride, double secs)
 	return (double)iterations * (count / stride) / elapsed;
 }
 
+/* Flush-enabled stride: clflush/dc cvac after each read */
+static double __attribute__((noinline))
+bench_stride_flush(const uint64_t *arr, size_t count, size_t stride,
+		   double secs)
+{
+	size_t iterations = 0;
+	double start = now();
+
+	while (now() - start < secs) {
+		uint64_t sum = 0;
+		for (size_t i = 0; i < count; i += stride) {
+			sum += arr[i];
+			flush_cacheline(&arr[i]);
+		}
+		sink = (double)sum;
+		iterations++;
+	}
+	double elapsed = now() - start;
+	return (double)iterations * (count / stride) / elapsed;
+}
+
+/* ------------------------------------------------------------------ */
+/* Workload: random permutation traversal (Fisher-Yates shuffle)       */
+/*                                                                     */
+/* Creates an index array, shuffles it with Fisher-Yates, then walks   */
+/* the data array using random indices.  This completely defeats the   */
+/* HW prefetcher — every access is unpredictable.                      */
+/*                                                                     */
+/* Unlike pointer chasing (serial dependency), this allows the CPU to  */
+/* issue multiple outstanding loads → tests random access bandwidth    */
+/* rather than latency.                                                */
+/* ------------------------------------------------------------------ */
+
+static size_t *build_random_index(size_t count)
+{
+	size_t *idx = malloc(count * sizeof(size_t));
+	if (!idx)
+		return NULL;
+
+	/* sequential init */
+	for (size_t i = 0; i < count; i++)
+		idx[i] = i;
+
+	/* Fisher-Yates shuffle */
+	for (size_t i = count - 1; i > 0; i--) {
+		size_t j = (size_t)rand() % (i + 1);
+		size_t tmp = idx[i];
+		idx[i] = idx[j];
+		idx[j] = tmp;
+	}
+
+	return idx;
+}
+
+static double __attribute__((noinline))
+bench_random(const uint64_t *arr, const size_t *idx, size_t count,
+	     double secs)
+{
+	size_t iterations = 0;
+	double start = now();
+
+	while (now() - start < secs) {
+		uint64_t sum = 0;
+		for (size_t i = 0; i < count; i++)
+			sum += arr[idx[i]];
+		sink = (double)sum;
+		iterations++;
+	}
+	double elapsed = now() - start;
+	return (double)iterations * count / elapsed;
+}
+
 /* ------------------------------------------------------------------ */
 /* Workload: pointer chasing                                           */
 /*                                                                     */
@@ -614,11 +724,250 @@ struct result {
 	int    actual_khz;      /* verified actual freq after set       */
 	double stride_tput;
 	double chase_tput;
+	double random_tput;     /* random permutation test, 0=N/A      */
 	double compute_tput;
+	double stride_cpu_time; /* CPU seconds for stride test          */
 	double energy_uj;       /* loaded energy (µJ), 0=N/A           */
 	double idle_power_uw;   /* idle power (µW), 0=N/A              */
 	double load_power_uw;   /* loaded power (µW), 0=N/A            */
 };
+
+/* ------------------------------------------------------------------ */
+/* L3 cache detection                                                  */
+/*                                                                     */
+/* Scan /sys/devices/system/cpu/cpu0/cache/indexN/ for the highest     */
+/* level unified (or data) cache.  Returns size in bytes, or -1.       */
+/* ------------------------------------------------------------------ */
+
+static long detect_l3_size(void)
+{
+	long max_size = -1;
+	char path[512], buf[128];
+
+	for (int idx = 0; idx < 16; idx++) {
+		/* read cache level */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/level",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			break;
+		int level = atoi(buf);
+
+		/* read cache type */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/type",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		/* only consider Unified or Data caches */
+		if (strncmp(buf, "Unified", 7) != 0 &&
+		    strncmp(buf, "Data", 4) != 0)
+			continue;
+
+		/* read size */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/size",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		long sz = atol(buf);
+		/* handle K/M suffix */
+		size_t len = strlen(buf);
+		if (len > 0 && (buf[len - 1] == 'K' || buf[len - 1] == 'k'))
+			sz *= 1024;
+		else if (len > 0 && (buf[len - 1] == 'M' || buf[len - 1] == 'm'))
+			sz *= 1024 * 1024;
+
+		if (level >= 3 && sz > max_size)
+			max_size = sz;
+	}
+
+	return max_size;
+}
+
+/* ------------------------------------------------------------------ */
+/* NUMA detection via /proc/self/status                                */
+/*                                                                     */
+/* Parse Mems_allowed field from /proc/self/status.  This respects     */
+/* cgroup cpuset restrictions automatically.                           */
+/* ------------------------------------------------------------------ */
+
+static int detect_numa_from_proc(int *nodes, int max_nodes)
+{
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f)
+		return -1;
+
+	char line[512];
+	int nnodes = 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "Mems_allowed:", 13) != 0)
+			continue;
+
+		/* parse hex bitmask: "Mems_allowed:\t00000000,00000003\n" */
+		char *p = line + 13;
+		while (*p == '\t' || *p == ' ')
+			p++;
+
+		/* count set bits in hex digits (from right to left) */
+		int bit = 0;
+		for (int i = strlen(p) - 1; i >= 0; i--) {
+			char c = p[i];
+			if (c == '\n' || c == '\r')
+				continue;
+			if (c == ',')
+				continue;
+			int nibble = 0;
+			if (c >= '0' && c <= '9') nibble = c - '0';
+			else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+			else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+			else break;  /* end of hex */
+
+			for (int b = 0; b < 4 && bit + b < max_nodes; b++) {
+				if (nibble & (1 << b)) {
+					nodes[nnodes++] = bit + b;
+					if (nnodes >= max_nodes)
+						break;
+				}
+			}
+			bit += 4;
+		}
+		break;
+	}
+
+	fclose(f);
+	return nnodes;
+}
+
+/* ------------------------------------------------------------------ */
+/* SMT sibling avoidance                                               */
+/*                                                                     */
+/* Read thread_siblings_list from topology sysfs.  Returns a set of    */
+/* "primary" threads (one per physical core).                          */
+/* ------------------------------------------------------------------ */
+
+static int select_primary_threads(int *out_cpus, int max_cpus)
+{
+	DIR *d = opendir("/sys/devices/system/cpu");
+	if (!d)
+		return -1;
+
+	int seen[MAX_CPUS] = {0};
+	int nprimary = 0;
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL && nprimary < max_cpus) {
+		if (strncmp(ent->d_name, "cpu", 3) != 0 ||
+		    !isdigit(ent->d_name[3]))
+			continue;
+		int cpu_id = atoi(ent->d_name + 3);
+		if (cpu_id >= MAX_CPUS || seen[cpu_id])
+			continue;
+
+		/* read thread_siblings_list */
+		char path[256], buf[256];
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/topology/"
+			 "thread_siblings_list", cpu_id);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0) {
+			/* no SMT info, assume standalone */
+			out_cpus[nprimary++] = cpu_id;
+			seen[cpu_id] = 1;
+			continue;
+		}
+
+		/* parse first CPU from list (e.g. "0,48" → take 0) */
+		int first = atoi(buf);
+		if (first >= MAX_CPUS)
+			continue;
+
+		if (!seen[first]) {
+			out_cpus[nprimary++] = first;
+			/* mark all siblings as seen */
+			char *tok = strtok(buf, ",-");
+			while (tok) {
+				int c = atoi(tok);
+				if (c < MAX_CPUS)
+					seen[c] = 1;
+				tok = strtok(NULL, ",-");
+			}
+		} else {
+			seen[cpu_id] = 1;
+		}
+	}
+
+	closedir(d);
+	return nprimary;
+}
+
+/* ------------------------------------------------------------------ */
+/* Thermal monitoring                                                  */
+/*                                                                     */
+/* Read CPU temperature from thermal zones.  Returns max temp in      */
+/* millidegrees Celsius, or -1 if unavailable.                         */
+/* ------------------------------------------------------------------ */
+
+static long read_max_temp(void)
+{
+	long max_temp = -1;
+	DIR *d = opendir("/sys/class/thermal");
+	if (!d)
+		return -1;
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL) {
+		if (strncmp(ent->d_name, "thermal_zone", 12) != 0)
+			continue;
+
+		char path[512], buf[64];
+		snprintf(path, sizeof(path),
+			 "/sys/class/thermal/%s/temp", ent->d_name);
+		if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+			long temp = atol(buf);
+			if (temp > max_temp)
+				max_temp = temp;
+		}
+	}
+
+	closedir(d);
+	return max_temp;
+}
+
+/* ------------------------------------------------------------------ */
+/* mbind wrapper                                                       */
+/*                                                                     */
+/* Bind memory to a specific NUMA node.  Uses raw syscall to avoid    */
+/* libnuma dependency.                                                 */
+/* ------------------------------------------------------------------ */
+
+static int bind_memory(void *addr, size_t len, int node)
+{
+	if (node < 0)
+		return 0;  /* no binding requested */
+
+	unsigned long nodemask = 1UL << node;
+	long ret = syscall(SYS_mbind, addr, len, MPOL_BIND,
+			   &nodemask, sizeof(nodemask) * 8, 0);
+	return (ret == 0) ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* getrusage CPU time                                                  */
+/*                                                                     */
+/* Returns CPU time (user + system) in seconds since program start.    */
+/* ------------------------------------------------------------------ */
+
+static double cpu_time_sec(void)
+{
+	struct rusage ru;
+	if (getrusage(RUSAGE_SELF, &ru) < 0)
+		return -1.0;
+	return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
+	       ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+}
 
 /* ------------------------------------------------------------------ */
 /* System idle gate (from sbc-bench)                                   */
@@ -906,6 +1255,32 @@ static int verify_freq(int cpu, int target_khz)
  * For now, simplified implementation: just run sequentially on each CPU.
  * TODO: true parallel fork-based execution.
  */
+/*
+ * Shared memory structure for multi-core results.
+ * Each child writes its per-frequency results here.
+ */
+struct mc_shared {
+	int ncpus;
+	int nfreqs;
+	int freqs[MAX_FREQS];              /* frequency list (kHz)       */
+	struct {
+		double stride[MAX_FREQS];  /* per-freq stride tput      */
+		double chase[MAX_FREQS];   /* per-freq chase tput       */
+		double compute[MAX_FREQS]; /* per-freq compute tput     */
+		int actual_khz[MAX_FREQS]; /* actual freq observed      */
+	} per_core[MAX_CPUS];
+	volatile int ready[MAX_CPUS];      /* 1 = child done            */
+};
+
+/*
+ * Run benchmark on multiple cores in parallel using fork().
+ *
+ * Architecture (from stress-ng patterns):
+ *   - Parent: controls frequency, forks/reaps children
+ *   - Children: pin to CPU, allocate array, run benchmark, write to shared mem
+ *   - Shared memory: mmap(MAP_SHARED|MAP_ANONYMOUS)
+ *   - Aggregation: median across cores per frequency point
+ */
 static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 			 int nsamples, int do_chase, int step_khz,
 			 int force_run)
@@ -939,39 +1314,295 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 		return 1;
 	}
 
+	/* ---- system idle check ---- */
+	int ncpus_online = 0;
+	if (!force_run && check_system_idle(&ncpus_online) < 0)
+		return 1;
+	if (ncpus_online == 0)
+		ncpus_online = sysconf(_SC_NPROCESSORS_ONLN);
+
+	/* ---- read frequencies (use first selected CPU) ---- */
+	int freqs[MAX_FREQS];
+	int freq_is_range = 0;
+	int nfreqs = read_freqs(selected_cpus[0], freqs, MAX_FREQS,
+				step_khz, &freq_is_range);
+	if (nfreqs < 2) {
+		dprintf("ERROR: need ≥2 frequencies on cpu%d\n",
+			selected_cpus[0]);
+		return 1;
+	}
+
+	/* ---- allocate shared memory ---- */
+	size_t shm_size = sizeof(struct mc_shared);
+	struct mc_shared *shm = mmap(NULL, shm_size,
+				     PROT_READ | PROT_WRITE,
+				     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (shm == MAP_FAILED) {
+		perror("mmap shared");
+		return 1;
+	}
+
+	shm->ncpus = ncpu;
+	shm->nfreqs = nfreqs;
+	memcpy(shm->freqs, freqs, nfreqs * sizeof(int));
+	memset((void *)shm->ready, 0, sizeof(shm->ready));
+
+	/* ---- save original frequency range ---- */
+	int orig_min, orig_max;
+	save_freq_range(selected_cpus[0], &orig_min, &orig_max);
+
+	/* ---- disable turbo ---- */
+	if (boost_disable() < 0)
+		dprintf("WARN: could not disable turbo boost\n");
+
 	/* ---- banner ---- */
 	dprintf("=== memfreq_bench (multi-core) ===\n");
 	dprintf("Mode      : %d cores in parallel\n", ncpu);
 	dprintf("NUMA      : %d nodes\n", nnodes);
 	dprintf("Freq dom  : %d domains\n", ndomains);
+	dprintf("Freq pts  : %d (%d – %d MHz)\n",
+		nfreqs, freqs[0] / 1000, freqs[nfreqs - 1] / 1000);
 	dprintf("CPUs      : ");
 	for (int i = 0; i < ncpu; i++)
 		dprintf("%d ", selected_cpus[i]);
 	dprintf("\n\n");
 
-	/* ---- system idle check ---- */
-	int ncpus_online = 0;
-	if (!force_run && check_system_idle(&ncpus_online) < 0)
-		return 1;
+	/* ---- sweep: high → low ---- */
+	for (int fi = nfreqs - 1; fi >= 0; fi--) {
+		int target_khz = freqs[fi];
 
-	/* ---- run sweep on each CPU sequentially (for now) ---- */
-	/* TODO: fork-based parallel execution */
-	for (int i = 0; i < ncpu; i++) {
-		dprintf("\n");
-		dprintf("========================================\n");
-		dprintf("CPU %d of %d: core %d\n", i + 1, ncpu, selected_cpus[i]);
-		dprintf("========================================\n");
+		/* parent sets frequency */
+		if (set_freq(selected_cpus[0], target_khz) < 0) {
+			dprintf("WARN: cannot set freq %d kHz, skipping\n",
+				target_khz);
+			continue;
+		}
+		usleep(100000);
 
-		/* TODO: refactor single-core sweep into a function */
-		/* For now, just print which CPU we'd test */
-		dprintf("  (would run sweep on CPU %d)\n", selected_cpus[i]);
-		dprintf("  TODO: implement actual sweep\n");
+		dprintf("  %4d MHz: forking %d children ...\n",
+			target_khz / 1000, ncpu);
+
+		/* clear ready flags */
+		for (int c = 0; c < ncpu; c++)
+			shm->ready[c] = 0;
+
+		/* fork children */
+		pid_t pids[MAX_CPUS];
+		for (int c = 0; c < ncpu; c++) {
+			pid_t pid = fork();
+			if (pid < 0) {
+				perror("fork");
+				pids[c] = -1;
+				continue;
+			}
+			if (pid == 0) {
+				/* ---- child process ---- */
+				int my_cpu = selected_cpus[c];
+				pin_to_cpu(my_cpu);
+
+				/* allocate per-core array */
+				size_t array_bytes =
+					(size_t)size_mb * 1024 * 1024;
+				size_t count = array_bytes / sizeof(uint64_t);
+
+				uint64_t *arr = NULL;
+				if (posix_memalign((void **)&arr, CL,
+						   array_bytes)) {
+					_exit(1);
+				}
+				for (size_t i = 0; i < count; i++)
+					arr[i] = i * 2654435761ULL;
+
+				struct pnode *chase_nodes = NULL;
+				if (do_chase) {
+					srand((unsigned)time(NULL) ^ my_cpu);
+					size_t nn = array_bytes / CL;
+					chase_nodes = build_chase(nn);
+				}
+
+				/* verify actual frequency */
+				int actual = verify_freq(my_cpu, target_khz);
+				shm->per_core[c].actual_khz[fi] =
+					actual > 0 ? actual : target_khz;
+
+				/* run benchmarks */
+				double buf[16];
+				int ns = nsamples < 16 ? nsamples : 16;
+
+				/* stride */
+				for (int s = 0; s < ns; s++)
+					buf[s] = bench_stride(arr, count,
+							       stride,
+							       test_secs);
+				qsort(buf, ns, sizeof(double), cmp_double);
+				shm->per_core[c].stride[fi] = buf[ns / 2];
+
+				/* chase */
+				if (do_chase && chase_nodes) {
+					for (int s = 0; s < ns; s++)
+						buf[s] = bench_chase(
+							chase_nodes,
+							test_secs);
+					qsort(buf, ns, sizeof(double),
+					      cmp_double);
+					shm->per_core[c].chase[fi] =
+						buf[ns / 2];
+				}
+
+				/* compute */
+				for (int s = 0; s < ns; s++)
+					buf[s] = bench_compute(test_secs);
+				qsort(buf, ns, sizeof(double), cmp_double);
+				shm->per_core[c].compute[fi] = buf[ns / 2];
+
+				free(arr);
+				free(chase_nodes);
+
+				shm->ready[c] = 1;
+				_exit(0);
+			}
+			pids[c] = pid;
+		}
+
+		/* ---- parent: wait for all children ---- */
+		for (int c = 0; c < ncpu; c++) {
+			if (pids[c] > 0) {
+				int status;
+				waitpid(pids[c], &status, 0);
+			}
+		}
 	}
 
-	dprintf("\n");
-	dprintf("Multi-core mode: completed (sequential placeholder)\n");
-	dprintf("TODO: implement fork-based parallel execution\n");
+	/* ---- restore ---- */
+	boost_enable();
+	restore_freq_range(selected_cpus[0], orig_min, orig_max);
 
+	/* ---- aggregate results (median across cores per freq) ---- */
+	printf("# %s\n", "memfreq_bench multi-core results");
+	printf("# ncpus=%d array=%dMB stride=%d\n", ncpu, size_mb, stride);
+	printf("# CPUs: ");
+	for (int i = 0; i < ncpu; i++)
+		printf("%d ", selected_cpus[i]);
+	printf("\n#\n");
+
+	if (do_chase) {
+		printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		     "target_MHz", "actual_MHz",
+		     "stride_Mops", "stride_MBs", "stride_%",
+		     "chase_Mops", "chase_%",
+		     "compute_Mops", "compute_%");
+	} else {
+		printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		     "target_MHz", "actual_MHz",
+		     "stride_Mops", "stride_MBs", "stride_%",
+		     "compute_Mops", "compute_%");
+	}
+
+	/* find reference (highest freq) */
+	double *stride_buf = calloc(ncpu, sizeof(double));
+	double *chase_buf = calloc(ncpu, sizeof(double));
+	double *compute_buf = calloc(ncpu, sizeof(double));
+
+	/* collect per-freq median across cores */
+	struct {
+		int target_khz;
+		int actual_khz;
+		double stride_median;
+		double chase_median;
+		double compute_median;
+	} agg[MAX_FREQS];
+
+	for (int fi = 0; fi < nfreqs; fi++) {
+		int nc = 0;
+		for (int c = 0; c < ncpu; c++) {
+			if (shm->ready[c] && shm->per_core[c].stride[fi] > 0) {
+				stride_buf[nc] = shm->per_core[c].stride[fi];
+				if (do_chase)
+					chase_buf[nc] =
+						shm->per_core[c].chase[fi];
+				compute_buf[nc] =
+					shm->per_core[c].compute[fi];
+				nc++;
+			}
+		}
+		if (nc == 0)
+			continue;
+
+		qsort(stride_buf, nc, sizeof(double), cmp_double);
+		agg[fi].stride_median = stride_buf[nc / 2];
+		if (do_chase) {
+			qsort(chase_buf, nc, sizeof(double), cmp_double);
+			agg[fi].chase_median = chase_buf[nc / 2];
+		}
+		qsort(compute_buf, nc, sizeof(double), cmp_double);
+		agg[fi].compute_median = compute_buf[nc / 2];
+		agg[fi].target_khz = freqs[fi];
+		agg[fi].actual_khz = shm->per_core[0].actual_khz[fi];
+	}
+
+	/* reference = highest freq */
+	double s_max = agg[nfreqs - 1].stride_median;
+	double c_max = do_chase ? agg[nfreqs - 1].chase_median : 0;
+	double p_max = agg[nfreqs - 1].compute_median;
+
+	double THRESHOLD = 0.95;
+	int stride_sweet = 0, chase_sweet = 0;
+
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (agg[fi].stride_median <= 0)
+			continue;
+		if (!stride_sweet &&
+		    agg[fi].stride_median >= s_max * THRESHOLD)
+			stride_sweet = agg[fi].target_khz;
+		if (do_chase && !chase_sweet &&
+		    agg[fi].chase_median >= c_max * THRESHOLD)
+			chase_sweet = agg[fi].target_khz;
+	}
+
+	/* output rows */
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (agg[fi].stride_median <= 0)
+			continue;
+		int t_mhz = agg[fi].target_khz / 1000;
+		int a_mhz = agg[fi].actual_khz / 1000;
+		double s_pct = agg[fi].stride_median / s_max * 100.0;
+		double p_pct = agg[fi].compute_median / p_max * 100.0;
+		double s_mbs = OPS_TO_MBS(agg[fi].stride_median);
+
+		if (do_chase) {
+			double c_pct = agg[fi].chase_median / c_max * 100.0;
+			printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+			       t_mhz, a_mhz,
+			       agg[fi].stride_median / 1e6, s_mbs, s_pct,
+			       agg[fi].chase_median / 1e6, c_pct,
+			       agg[fi].compute_median / 1e6, p_pct);
+		} else {
+			printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+			       t_mhz, a_mhz,
+			       agg[fi].stride_median / 1e6, s_mbs, s_pct,
+			       agg[fi].compute_median / 1e6, p_pct);
+		}
+	}
+
+	/* summary */
+	printf("#\n");
+	printf("# === Sweet spot (lowest freq ≥ %.0f%% of max throughput) ===\n",
+	       THRESHOLD * 100);
+	if (stride_sweet)
+		printf("# stride  sweet spot: %d MHz (%d%% of max %d MHz)\n",
+		       stride_sweet / 1000,
+		       stride_sweet * 100 / freqs[nfreqs - 1],
+		       freqs[nfreqs - 1] / 1000);
+	if (do_chase && chase_sweet)
+		printf("# chase   sweet spot: %d MHz (%d%% of max %d MHz)\n",
+		       chase_sweet / 1000,
+		       chase_sweet * 100 / freqs[nfreqs - 1],
+		       freqs[nfreqs - 1] / 1000);
+
+	free(stride_buf);
+	free(chase_buf);
+	free(compute_buf);
+	munmap(shm, shm_size);
 	return 0;
 }
 
@@ -987,12 +1618,16 @@ static void usage(const char *prog)
 "  -N NCPU     Test NCPU cores in parallel (stress-ng style)\n"
 "              Auto-distributes across NUMA nodes and freq domains\n"
 "  -m SIZE_MB  Array size in MB           (default: 128)\n"
+"  -A          Auto-size array to 2× L3   (ensures working set > L3)\n"
 "  -s STRIDE   Stride in uint64 units     (default: 8 = 64B = 1 cache line)\n"
 "  -t SECS     Seconds per test point     (default: 2)\n"
 "  -n N        Samples per point (median) (default: 3)\n"
 "  -S STEP_KHZ Frequency step in kHz      (default: 25000, CPPC range mode only)\n"
 "  -C          Skip pointer chase test\n"
+"  -R          Add random permutation test (Fisher-Yates, defeats prefetcher)\n"
+"  -f          Flush cache line after each access (clflush/dc cvac)\n"
 "  -F          Force run even if system is busy (skip idle check)\n"
+"  -B NODE     Bind array memory to NUMA node (default: -1 = no binding)\n"
 "  -h          This help\n", prog);
 }
 
@@ -1001,28 +1636,51 @@ int main(int argc, char **argv)
 	int   cpu       = 0;
 	int   ncpu      = 0;  /* 0 = single-core mode, >0 = multi-core */
 	int   size_mb   = 128;
+	int   auto_size = 0;  /* -A: auto-size to 2× L3 */
 	int   stride    = 8;
 	int   test_secs = 2;
 	int   nsamples  = 3;
 	int   do_chase  = 1;
+	int   do_random = 0;  /* -R: random permutation test */
+	int   do_flush  = 0;  /* -f: flush cache line after each access */
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   force_run = 0;
+	int   numa_node = -1;  /* -1 = no binding */
 	int   opt;
 
-	while ((opt = getopt(argc, argv, "c:N:m:s:t:n:S:CFh")) != -1) {
+	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFh")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'N': ncpu      = atoi(optarg); break;
 		case 'm': size_mb   = atoi(optarg); break;
+		case 'A': auto_size = 1;            break;
 		case 's': stride    = atoi(optarg); break;
 		case 't': test_secs = atoi(optarg); break;
 		case 'n': nsamples  = atoi(optarg); break;
 		case 'S': step_khz  = atoi(optarg); break;
+		case 'B': numa_node = atoi(optarg); break;
 		case 'C': do_chase  = 0;            break;
+		case 'R': do_random = 1;            break;
+		case 'f': do_flush  = 1;            break;
 		case 'F': force_run = 1;            break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
+	}
+
+	/* ---- detect L3 cache ---- */
+	long l3_bytes = detect_l3_size();
+	if (auto_size && l3_bytes > 0) {
+		size_mb = (int)((l3_bytes * 2) / (1024 * 1024));
+		if (size_mb < 16)
+			size_mb = 16;  /* minimum 16 MB */
+	} else if (l3_bytes > 0 && (long)size_mb * 1024 * 1024 < l3_bytes) {
+		dprintf("WARN: array size (%d MB) < L3 cache (%ld MB)\n",
+			size_mb, l3_bytes / (1024 * 1024));
+		dprintf("      Working set may fit in L3 → test may not be "
+			"fully memory-bound\n");
+		dprintf("      Use -A to auto-size to 2× L3, or -m %ld\n",
+			(l3_bytes * 2) / (1024 * 1024));
 	}
 
 	/* ---- multi-core mode ---- */
@@ -1065,6 +1723,16 @@ int main(int argc, char **argv)
 	for (size_t i = 0; i < count; i++)
 		arr[i] = i * 2654435761ULL;          /* Knuth hash fill */
 
+	/* ---- NUMA binding ---- */
+	if (numa_node >= 0) {
+		if (bind_memory(arr, array_bytes, numa_node) < 0) {
+			dprintf("WARN: mbind to node %d failed\n", numa_node);
+			dprintf("      Falling back to default allocation\n");
+		} else {
+			dprintf("Memory bound to NUMA node %d\n", numa_node);
+		}
+	}
+
 	struct pnode *chase_nodes = NULL;
 	if (do_chase) {
 		srand((unsigned)time(NULL));
@@ -1073,6 +1741,15 @@ int main(int argc, char **argv)
 		if (!chase_nodes) {
 			dprintf("WARN: chase alloc failed, skipping\n");
 			do_chase = 0;
+		}
+	}
+
+	size_t *random_idx = NULL;
+	if (do_random) {
+		random_idx = build_random_index(count);
+		if (!random_idx) {
+			dprintf("WARN: random index alloc failed, skipping\n");
+			do_random = 0;
 		}
 	}
 
@@ -1098,10 +1775,25 @@ int main(int argc, char **argv)
 	save_freq_range(cpu, &orig_min, &orig_max);
 
 	/* ---- banner ---- */
+	int proc_nodes[MAX_NODES];
+	int nproc_nodes = detect_numa_from_proc(proc_nodes, MAX_NODES);
+
+	long max_temp = read_max_temp();
+
 	dprintf("=== memfreq_bench ===\n");
 	dprintf("CPU       : %d (of %d online)\n", cpu, ncpus_online);
-	dprintf("Array     : %d MB (%zu cache lines)\n",
-		size_mb, array_bytes / CL);
+	if (l3_bytes > 0)
+		dprintf("L3 cache  : %ld MB\n", l3_bytes / (1024 * 1024));
+	if (nproc_nodes > 0)
+		dprintf("NUMA      : %d nodes allowed\n", nproc_nodes);
+	if (max_temp > 0)
+		dprintf("Temp      : %ld.%ld°C\n", max_temp / 1000,
+			(max_temp % 1000) / 100);
+	dprintf("Array     : %d MB (%zu cache lines)%s\n",
+		size_mb, array_bytes / CL,
+		auto_size ? " (auto-sized to 2× L3)" : "");
+	if (numa_node >= 0)
+		dprintf("NUMA bind : node %d\n", numa_node);
 	dprintf("Stride    : %d (= %d B, %s)\n", stride, stride * 8,
 		stride >= 8 ? "1 cache line / access" : "prefetcher-friendly");
 	dprintf("Chase     : %s\n", do_chase ? "enabled" : "disabled");
@@ -1185,10 +1877,19 @@ int main(int argc, char **argv)
 		results[fi].valid = 1;
 
 		/* stride */
-		for (int s = 0; s < nsamples; s++)
-			buf[s] = bench_stride(arr, count, stride, test_secs);
+		double cpu_before = cpu_time_sec();
+		for (int s = 0; s < nsamples; s++) {
+			if (do_flush)
+				buf[s] = bench_stride_flush(arr, count,
+							     stride, test_secs);
+			else
+				buf[s] = bench_stride(arr, count, stride,
+						      test_secs);
+		}
 		qsort(buf, nsamples, sizeof(double), cmp_double);
 		results[fi].stride_tput = buf[nsamples / 2];
+		double cpu_after = cpu_time_sec();
+		results[fi].stride_cpu_time = cpu_after - cpu_before;
 
 		/* chase */
 		if (do_chase) {
@@ -1196,6 +1897,15 @@ int main(int argc, char **argv)
 				buf[s] = bench_chase(chase_nodes, test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
 			results[fi].chase_tput = buf[nsamples / 2];
+		}
+
+		/* random permutation */
+		if (do_random) {
+			for (int s = 0; s < nsamples; s++)
+				buf[s] = bench_random(arr, random_idx, count,
+						      test_secs);
+			qsort(buf, nsamples, sizeof(double), cmp_double);
+			results[fi].random_tput = buf[nsamples / 2];
 		}
 
 		/* compute */
@@ -1233,6 +1943,13 @@ int main(int argc, char **argv)
 	dprintf("\r                                  \r");
 	fflush(stderr);
 
+	/* ---- thermal check ---- */
+	long temp_after = read_max_temp();
+	if (temp_after > 85000)  /* > 85°C */
+		dprintf("WARN: temperature reached %ld.%ld°C — possible "
+			"thermal throttling!\n",
+			temp_after / 1000, (temp_after % 1000) / 100);
+
 	/* ---- restore ---- */
 	boost_enable();
 	restore_freq_range(cpu, orig_min, orig_max);
@@ -1269,46 +1986,46 @@ int main(int argc, char **argv)
 	if (npower_paths > 0 && !power_is_uj) {
 		/* hwmon: idle_W, load_W, delta_W, energy_J */
 		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "chase_Mops",   "chase_%",
 			     "compute_Mops", "compute_%",
 			     "idle_W", "load_W", "delta_W", "energy_J");
 		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "compute_Mops", "compute_%",
 			     "idle_W", "load_W", "delta_W", "energy_J");
 		}
 	} else if (npower_paths > 0) {
 		/* RAPL: just energy_J */
 		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "chase_Mops",   "chase_%",
 			     "compute_Mops", "compute_%",
 			     "energy_J");
 		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "compute_Mops", "compute_%",
 			     "energy_J");
 		}
 	} else {
 		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "chase_Mops",   "chase_%",
 			     "compute_Mops", "compute_%");
 		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\n",
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
-			     "stride_Mops",  "stride_%",
+			     "stride_Mops", "stride_MBs", "stride_%",
 			     "compute_Mops", "compute_%");
 		}
 	}
@@ -1348,54 +2065,57 @@ int main(int argc, char **argv)
 			double load_w = results[fi].load_power_uw / 1e6;
 			double delta_w = load_w - idle_w;
 			double e_j = results[fi].energy_uj / 1e6;
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
 					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].chase_tput / 1e6, c_pct,
 				       results[fi].compute_tput / 1e6, p_pct,
 				       idle_w, load_w, delta_w, e_j);
 			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].compute_tput / 1e6, p_pct,
 				       idle_w, load_w, delta_w, e_j);
 			}
 		} else if (npower_paths > 0) {
 			/* RAPL: just energy_J */
 			double e_j = results[fi].energy_uj / 1e6;
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
 					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].chase_tput / 1e6, c_pct,
 				       results[fi].compute_tput / 1e6, p_pct,
 				       e_j);
 			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].compute_tput / 1e6, p_pct,
 				       e_j);
 			}
 		} else {
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
 					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].chase_tput / 1e6, c_pct,
 				       results[fi].compute_tput / 1e6, p_pct);
 			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
 				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
 				       results[fi].compute_tput / 1e6, p_pct);
 			}
 		}

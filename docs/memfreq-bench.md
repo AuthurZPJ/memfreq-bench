@@ -44,9 +44,9 @@ memory-bound:
 
 ---
 
-## 三种工作负载
+## 五种工作负载
 
-工具运行三种基准测试，覆盖不同的"内存依赖度"：
+工具运行五种基准测试，覆盖不同的"内存依赖度"：
 
 ### 1. Stride（顺序遍历）
 
@@ -96,7 +96,21 @@ for (size_t i = 0; i < 100000; i++)
 
 这是**最纯粹的 memory-bound** 测试。
 
-### 3. Compute（纯计算，对照组）
+### 3. Random（随机置换遍历）— 新增
+
+```c
+size_t *idx = build_random_index(count);  // Fisher-Yates shuffle
+for (size_t i = 0; i < count; i++)
+    sum += arr[idx[i]];
+```
+
+**微架构分析：**
+- 访问模式完全随机 → HW prefetcher 无法预测
+- 但与 chase 不同：**没有串行依赖**（每次访问的索引是预先确定的）
+- CPU 可以并行发射多个 outstanding load → 测试**随机访问带宽**而非延迟
+- 用 `-R` 启用
+
+### 4. Compute（纯计算，对照组）
 
 ```c
 double x = 1.00001;
@@ -110,6 +124,20 @@ for (size_t i = 0; i < 1000000; i++)
 - 吞吐**完全由 CPU 频率决定** → 频率减半，吞吐减半
 
 **用途：sanity check**。如果 compute 在不同频率下的吞吐比不等于频率比，说明频率没有成功锁定（turbo 还在跑、或者 governor 覆盖了你的设置）。
+
+### 5. Stride + Flush（强制 L3 miss）— 新增
+
+```c
+for (size_t i = 0; i < count; i += stride) {
+    sum += arr[i];
+    flush_cacheline(&arr[i]);  // x86: clflush, ARM: dc cvac
+}
+```
+
+**微架构分析：**
+- 每次访问后立即驱逐 cache line → 下次必须从 DRAM 重新加载
+- 消除 L3 hit 的可能性 → 测试**纯 DRAM 带宽**
+- 用 `-f` 启用
 
 ---
 
@@ -214,11 +242,18 @@ sudo ./memfreq_bench -C
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-c CPU` | 0 | 绑定到指定 CPU 核心（逻辑 CPU 编号） |
+| `-N NCPU` | — | 多核并行模式，自动分布到 NUMA 节点（见下方） |
 | `-m SIZE_MB` | 128 | 数组大小（MB），**必须 > L3 cache** |
+| `-A` | — | 自动检测 L3 大小，将数组设为 2× L3 |
 | `-s STRIDE` | 8 | 步长（uint64 单位），8 = 64B = 一个 cache line |
 | `-t SECS` | 2 | 每个频率点的测试时间 |
 | `-n N` | 3 | 每个频率点采样次数，取中位数 |
+| `-S STEP_KHZ` | 25000 | CPPC 范围模式下的频率步长（25 MHz） |
 | `-C` | — | 跳过 pointer chase 测试 |
+| `-R` | — | 启用 random permutation 测试 |
+| `-f` | — | 启用 cache flush（clflush/dc cvac） |
+| `-B NODE` | -1 | 将数组绑定到指定 NUMA 节点 |
+| `-F` | — | 强制运行（跳过系统空闲检查） |
 
 ### 可视化
 
@@ -244,20 +279,26 @@ python3 memfreq_sweep.py --file results.txt
 
 ```
 # memfreq_bench results
-# cpu=0 array=512MB stride=8 duration=3s samples=5
+# cpu=0 ncpus=192 array=512MB stride=8 duration=3s samples=5
+# NUMA: 2 nodes allowed   L3 cache: 273 MB   Temp: 42.3°C
 #
-# freq_MHz  stride_Mops  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
-800    152.3    97.2    12.5    98.1    82.1    25.3
-1200   154.1    98.4    12.6    98.8    123.4   37.9
-1800   155.8    99.5    12.7    99.6    184.2   56.6
-2400   156.5    99.9    12.8    100.0   246.1   75.6
-3000   156.6    100.0   12.8    100.0   325.8   100.0
+# target_MHz  actual_MHz  stride_Mops  stride_MBs  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
+2600          2598        156.6        1193.2      100.0     12.8        100.0    325.8         100.0
+2575          2573        156.5        1192.4       99.9     12.8        100.0    322.1          98.9
+2550          2548        156.3        1190.9       99.8     12.8        100.0    319.0          97.9
+...
+2000          1998        152.3        1160.2       97.2     12.5         98.1    250.3          76.8
 #
 # === Sweet spot (lowest freq ≥ 95% of max throughput) ===
-# stride  sweet spot: 800 MHz  (27% of max 3000 MHz)
-# chase   sweet spot: 800 MHz  (27% of max 3000 MHz)
+# stride  sweet spot: 2000 MHz  (77% of max 2600 MHz)
+# chase   sweet spot: 2000 MHz  (77% of max 2600 MHz)
 # compute sweet spot: — (scales linearly, always needs max freq)
 ```
+
+注意输出现在包含：
+- **target_MHz / actual_MHz**：设定频率和实际运行频率（`cpuinfo_cur_freq`）
+- **stride_MBs**：显式带宽报告（MB/s），比 Mops 更直观
+- **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
 
 ### 关键指标
 
@@ -289,6 +330,70 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 
 如果 compute_% = 95% → 频率没锁住！turbo 仍在跑
 如果 compute_% = 30% → 该频率点 set_freq 可能失败了
+```
+
+---
+
+## 多核并行模式（`-N`）
+
+### 为什么需要多核测试？
+
+单核测试测的是 **latency-bound** 甜点（DRAM 延迟主导），多核测试测的是 **bandwidth-bound** 甜点（内存控制器带宽饱和）。两者代表不同的真实场景：
+
+| 模式 | 瓶颈 | 甜点位置 | 代表场景 |
+|------|------|----------|----------|
+| 单核 (`-c 0`) | DRAM 延迟 (~100ns) | 很低频 | DB 查询、编译器、shell |
+| 多核 (`-N 4`) | MC 带宽饱和 | 中频 | HPC、AI 训练、视频编码 |
+
+### CPU 自动分配（stress-ng 风格）
+
+`-N NCPU` 自动选择 NCPU 个核心，分配策略：
+
+1. **检测 NUMA 拓扑**（从 `/sys/devices/system/node/`）
+2. **检测频率域**（从 `cpufreq/related_cpus`）
+3. **SMT 规避**：读取 `thread_siblings_list`，只选每个物理核的第一个逻辑核
+4. **均匀分布**：round-robin 跨 NUMA 节点分配
+5. **每频率域一个**：避免同一频率域内重复测试
+
+```bash
+# 2 NUMA node, 每个 node 选 1 核（共 2 核）
+sudo ./memfreq_bench -N 2 -m 512
+
+# 每个 NUMA node 选 2 核（共 4 核）
+sudo ./memfreq_bench -N 4 -m 512
+
+# 半核（48 物理核 = 每 node 24 核）
+sudo ./memfreq_bench -N 48 -m 512
+```
+
+### 多核执行架构（借鉴 stress-ng）
+
+```
+父进程（coordinator）
+  ├── set_freq(f)
+  ├── fork → child 0 (CPU 0, Node 0) → bench → write shared mem
+  ├── fork → child 1 (CPU 48, Node 1) → bench → write shared mem
+  ├── waitpid(all)
+  ├── set_freq(f-1)
+  ├── fork → child 0 (CPU 0) → bench → write shared mem
+  ├── fork → child 1 (CPU 48) → bench → write shared mem
+  └── ...
+```
+
+- 共享内存：`mmap(MAP_SHARED|MAP_ANONYMOUS)` — 零拷贝结果收集
+- 父进程控制频率，子进程只跑 benchmark
+- 结果按频率点聚合（中位数）
+
+### 多核输出
+
+```
+# memfreq_bench multi-core results
+# ncpus=4 array=512MB stride=8
+# CPUs: 0 48 1 49
+#
+# target_MHz  actual_MHz  stride_Mops  stride_MBs  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
+2600          2598        580.2        4422.1      100.0     48.1        100.0    1205.8        100.0
+...
 ```
 
 ---
@@ -591,29 +696,30 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 # ── 1. 拓扑侦察 ──
 lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
 numactl -H
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
 
-# ── 2. 可选：隔离 SMT 兄弟 ──
-for s in $(ls /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
-           | xargs -I{} sh -c 'cut -d, -f2 {}' | sort -u); do
-    echo 0 > /sys/devices/system/cpu/cpu$s/online
-done
+# ── 2. 基本测试（L3 自动检测，数组自动 2× L3）──
+sudo ./memfreq_bench -c 0 -A -t 3 -n 5
 
-# ── 3. 基本测试（数组 > L3）──
-sudo ./memfreq_bench -c 0 -m 512 -t 3 -n 5
+# ── 3. 多核带宽饱和测试（每 NUMA node 各 1 核）──
+sudo ./memfreq_bench -N 2 -A -t 3 -n 5
 
-# ── 4. 可视化 ──
-sudo python3 memfreq_sweep.py -c 0 -m 512 --json
+# ── 4. 半核带宽饱和测试（48 物理核）──
+sudo ./memfreq_bench -N 48 -A -t 3 -n 5
 
-# ── 5. 可选：不同 stride 对比 ──
-sudo ./memfreq_bench -c 0 -m 512 -s 1    # prefetcher-friendly
-sudo ./memfreq_bench -c 0 -m 512 -s 64   # 极端 mem-bound
+# ── 5. NUMA 绑定测试（强制内存到 Node 0）──
+sudo ./memfreq_bench -c 0 -A -B 0 -t 3 -n 5
 
-# ── 6. 可选：跨 NUMA 对比 ──
-sudo numactl --membind=1 ./memfreq_bench -c 0 -m 512 -t 3 -n 5
+# ── 6. 可选：random permutation 测试 ──
+sudo ./memfreq_bench -c 0 -A -R -t 3 -n 5
 
-# ── 7. 恢复 SMT ──
-echo on > /sys/devices/system/cpu/smt/control
+# ── 7. 可选：cache flush 测试（强制 L3 miss）──
+sudo ./memfreq_bench -c 0 -A -f -t 3 -n 5
+
+# ── 8. 可选：不同 stride 对比 ──
+sudo ./memfreq_bench -c 0 -A -s 1     # prefetcher-friendly
+sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
 ```
 
 ---
