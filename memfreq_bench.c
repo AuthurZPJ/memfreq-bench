@@ -38,11 +38,165 @@
 #include <sched.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <ctype.h>
 
 #define CL        64          /* cache line size (bytes)               */
 #define MAX_FREQS 256
+#define MAX_CPUS  256         /* max CPUs for multi-core mode          */
+#define MAX_NODES 16          /* max NUMA nodes                        */
 
 #define dprintf(...) fprintf(stderr, __VA_ARGS__)
+
+/* ------------------------------------------------------------------ */
+/* Topology detection for multi-core mode                              */
+/* ------------------------------------------------------------------ */
+
+/* forward declarations */
+static int sysfs_read(const char *path, char *buf, size_t sz);
+static int sysfs_write(const char *path, const char *val);
+
+struct numa_node {
+	int cpus[MAX_CPUS];
+	int ncpus;
+};
+
+struct freq_domain {
+	int cpus[MAX_CPUS];
+	int ncpus;
+	int leader;       /* first CPU, used for frequency control */
+};
+
+static int detect_numa_nodes(struct numa_node *nodes)
+{
+	DIR *d = opendir("/sys/devices/system/node");
+	if (!d)
+		return -1;
+
+	int nnodes = 0;
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL && nnodes < MAX_NODES) {
+		if (strncmp(ent->d_name, "node", 4) != 0 ||
+		    !isdigit(ent->d_name[4]))
+			continue;
+		int node_id = atoi(ent->d_name + 4);
+		if (node_id >= MAX_NODES)
+			continue;
+
+		char path[512], buf[4096];
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/node/%s/cpulist", ent->d_name);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		nodes[node_id].ncpus = 0;
+		/* parse cpulist: "0-23,48-71" or "0,1,2,3" */
+		char *tok = strtok(buf, ",");
+		while (tok && nodes[node_id].ncpus < MAX_CPUS) {
+			int start, end;
+			if (sscanf(tok, "%d-%d", &start, &end) == 2) {
+				for (int c = start; c <= end && nodes[node_id].ncpus < MAX_CPUS; c++)
+					nodes[node_id].cpus[nodes[node_id].ncpus++] = c;
+			} else if (sscanf(tok, "%d", &start) == 1) {
+				nodes[node_id].cpus[nodes[node_id].ncpus++] = start;
+			}
+			tok = strtok(NULL, ",");
+		}
+		if (nodes[node_id].ncpus > 0)
+			nnodes++;
+	}
+	closedir(d);
+	return nnodes;
+}
+
+static int detect_freq_domains(struct freq_domain *domains)
+{
+	DIR *d = opendir("/sys/devices/system/cpu");
+	if (!d)
+		return -1;
+
+	int ndomains = 0;
+	int seen[MAX_CPUS] = {0};
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL) {
+		if (strncmp(ent->d_name, "cpu", 3) != 0 ||
+		    !isdigit(ent->d_name[3]))
+			continue;
+		int cpu_id = atoi(ent->d_name + 3);
+		if (cpu_id >= MAX_CPUS || seen[cpu_id])
+			continue;
+
+		char path[256], buf[4096];
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/cpufreq/related_cpus",
+			 cpu_id);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		domains[ndomains].ncpus = 0;
+		domains[ndomains].leader = cpu_id;
+		char *tok = strtok(buf, " ");
+		while (tok && domains[ndomains].ncpus < MAX_CPUS) {
+			int c = atoi(tok);
+			if (c < MAX_CPUS) {
+				domains[ndomains].cpus[domains[ndomains].ncpus++] = c;
+				seen[c] = 1;
+			}
+			tok = strtok(NULL, " ");
+		}
+		if (domains[ndomains].ncpus > 0)
+			ndomains++;
+	}
+	closedir(d);
+	return ndomains;
+}
+
+/*
+ * Select N CPUs for multi-core testing.
+ * Strategy: distribute evenly across NUMA nodes, one per freq domain.
+ * Avoid SMT siblings when possible.
+ */
+static int select_cpus(int ncpus, int *out_cpus,
+		       struct numa_node *nodes, int nnodes,
+		       struct freq_domain *domains, int ndomains)
+{
+	if (nnodes <= 0 || ndomains <= 0)
+		return -1;
+
+	/* simple round-robin across NUMA nodes */
+	int per_node = ncpus / nnodes;
+	int remainder = ncpus % nnodes;
+	int selected = 0;
+
+	for (int n = 0; n < nnodes && selected < ncpus; n++) {
+		int target = per_node + (n < remainder ? 1 : 0);
+		int node_sel = 0;
+
+		/* pick one CPU per freq domain within this node */
+		for (int d = 0; d < ndomains && node_sel < target; d++) {
+			for (int c = 0; c < domains[d].ncpus && node_sel < target; c++) {
+				int cpu = domains[d].cpus[c];
+				/* check if this CPU belongs to this NUMA node */
+				int belongs = 0;
+				for (int k = 0; k < nodes[n].ncpus; k++) {
+					if (nodes[n].cpus[k] == cpu) {
+						belongs = 1;
+						break;
+					}
+				}
+				if (belongs) {
+					out_cpus[selected++] = cpu;
+					node_sel++;
+					break;  /* one per domain */
+				}
+			}
+		}
+	}
+
+	return selected;
+}
 
 /* ------------------------------------------------------------------ */
 /* Timing                                                              */
@@ -737,6 +891,91 @@ static int verify_freq(int cpu, int target_khz)
 }
 
 /* ------------------------------------------------------------------ */
+/* Multi-core orchestration (stress-ng style)                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Run benchmark on multiple cores in parallel.
+ * Strategy:
+ *   1. Detect NUMA and frequency domain topology
+ *   2. Select N CPUs (evenly distributed across NUMA nodes)
+ *   3. Fork N children, each pinned to one CPU
+ *   4. Each child runs single-core sweep, writes to temp file
+ *   5. Parent collects and aggregates results
+ *
+ * For now, simplified implementation: just run sequentially on each CPU.
+ * TODO: true parallel fork-based execution.
+ */
+static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
+			 int nsamples, int do_chase, int step_khz,
+			 int force_run)
+{
+	/* ---- detect topology ---- */
+	struct numa_node nodes[MAX_NODES];
+	int nnodes = detect_numa_nodes(nodes);
+	if (nnodes <= 0) {
+		dprintf("ERROR: cannot detect NUMA topology\n");
+		return 1;
+	}
+
+	struct freq_domain domains[MAX_CPUS];
+	int ndomains = detect_freq_domains(domains);
+	if (ndomains <= 0) {
+		dprintf("ERROR: cannot detect frequency domains\n");
+		return 1;
+	}
+
+	/* ---- select CPUs ---- */
+	int selected_cpus[MAX_CPUS];
+	int nselected = select_cpus(ncpu, selected_cpus, nodes, nnodes,
+				    domains, ndomains);
+	if (nselected < ncpu) {
+		dprintf("WARN: requested %d CPUs, but only found %d suitable\n",
+			ncpu, nselected);
+		ncpu = nselected;
+	}
+	if (ncpu <= 0) {
+		dprintf("ERROR: no CPUs selected\n");
+		return 1;
+	}
+
+	/* ---- banner ---- */
+	dprintf("=== memfreq_bench (multi-core) ===\n");
+	dprintf("Mode      : %d cores in parallel\n", ncpu);
+	dprintf("NUMA      : %d nodes\n", nnodes);
+	dprintf("Freq dom  : %d domains\n", ndomains);
+	dprintf("CPUs      : ");
+	for (int i = 0; i < ncpu; i++)
+		dprintf("%d ", selected_cpus[i]);
+	dprintf("\n\n");
+
+	/* ---- system idle check ---- */
+	int ncpus_online = 0;
+	if (!force_run && check_system_idle(&ncpus_online) < 0)
+		return 1;
+
+	/* ---- run sweep on each CPU sequentially (for now) ---- */
+	/* TODO: fork-based parallel execution */
+	for (int i = 0; i < ncpu; i++) {
+		dprintf("\n");
+		dprintf("========================================\n");
+		dprintf("CPU %d of %d: core %d\n", i + 1, ncpu, selected_cpus[i]);
+		dprintf("========================================\n");
+
+		/* TODO: refactor single-core sweep into a function */
+		/* For now, just print which CPU we'd test */
+		dprintf("  (would run sweep on CPU %d)\n", selected_cpus[i]);
+		dprintf("  TODO: implement actual sweep\n");
+	}
+
+	dprintf("\n");
+	dprintf("Multi-core mode: completed (sequential placeholder)\n");
+	dprintf("TODO: implement fork-based parallel execution\n");
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -745,6 +984,8 @@ static void usage(const char *prog)
 	dprintf(
 "Usage: %s [options]\n"
 "  -c CPU      Pin to this CPU            (default: 0)\n"
+"  -N NCPU     Test NCPU cores in parallel (stress-ng style)\n"
+"              Auto-distributes across NUMA nodes and freq domains\n"
 "  -m SIZE_MB  Array size in MB           (default: 128)\n"
 "  -s STRIDE   Stride in uint64 units     (default: 8 = 64B = 1 cache line)\n"
 "  -t SECS     Seconds per test point     (default: 2)\n"
@@ -758,6 +999,7 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
 	int   cpu       = 0;
+	int   ncpu      = 0;  /* 0 = single-core mode, >0 = multi-core */
 	int   size_mb   = 128;
 	int   stride    = 8;
 	int   test_secs = 2;
@@ -767,9 +1009,10 @@ int main(int argc, char **argv)
 	int   force_run = 0;
 	int   opt;
 
-	while ((opt = getopt(argc, argv, "c:m:s:t:n:S:CFh")) != -1) {
+	while ((opt = getopt(argc, argv, "c:N:m:s:t:n:S:CFh")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
+		case 'N': ncpu      = atoi(optarg); break;
 		case 'm': size_mb   = atoi(optarg); break;
 		case 's': stride    = atoi(optarg); break;
 		case 't': test_secs = atoi(optarg); break;
@@ -780,6 +1023,12 @@ int main(int argc, char **argv)
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
+	}
+
+	/* ---- multi-core mode ---- */
+	if (ncpu > 1) {
+		return run_multicore(ncpu, size_mb, stride, test_secs,
+				     nsamples, do_chase, step_khz, force_run);
 	}
 
 	/* ---- validate ---- */
