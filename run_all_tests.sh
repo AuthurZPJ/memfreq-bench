@@ -73,12 +73,28 @@ detect_topology() {
     # NUMA nodes
     NUM_NUMA_NODES=$(numactl -H 2>/dev/null | grep "available:" | awk '{print $2}' || echo 1)
     
-    # L3 cache size (MB)
+    # L3 cache size (MB) — total across all sharing cores
+    # lscpu reports total L3 (e.g. "L3 cache: 273 MB")
     L3_SIZE_MB=$(lscpu | grep "L3 cache" | awk '{print $3}' | sed 's/M//')
-    if [[ -z "$L3_SIZE_MB" ]]; then
-        # Fallback: read from sysfs
-        L3_SIZE_BYTES=$(cat /sys/devices/system/cpu/cpu0/cache/index3/size 2>/dev/null || echo 0)
-        L3_SIZE_MB=$((L3_SIZE_BYTES / 1024 / 1024))
+    if [[ -z "$L3_SIZE_MB" || "$L3_SIZE_MB" == "0" ]]; then
+        # Fallback: per-core slice from sysfs × number of sharing cores
+        local slice_bytes=$(cat /sys/devices/system/cpu/cpu0/cache/index3/size 2>/dev/null || echo 0)
+        # Handle K suffix
+        if [[ "$slice_bytes" == *K ]]; then
+            slice_bytes=$(( ${slice_bytes%K} * 1024 ))
+        fi
+        local shared=$(cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list 2>/dev/null || echo "0")
+        # Count CPUs in shared list (handles "0-47" or "0,1,2" etc.)
+        local n_sharing=$(echo "$shared" | tr ',' '\n' | while read range; do
+            if [[ "$range" == *-* ]]; then
+                local lo=${range%-*} hi=${range#*-}
+                echo $((hi - lo + 1))
+            else
+                echo 1
+            fi
+        done | awk '{s+=$1} END {print s}')
+        n_sharing=${n_sharing:-1}
+        L3_SIZE_MB=$(( slice_bytes * n_sharing / 1024 / 1024 ))
     fi
     
     # Array size (2x L3)

@@ -739,10 +739,34 @@ struct result {
 /* level unified (or data) cache.  Returns size in bytes, or -1.       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Parse CPU list like "0-23" or "0,1,2,3" or "0-11,24-35"
+ * Returns count of CPUs in the list.
+ */
+static int count_cpus_in_list(const char *cpulist)
+{
+	int count = 0;
+	char buf[512];
+	strncpy(buf, cpulist, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	char *tok = strtok(buf, ",");
+	while (tok) {
+		int start, end;
+		if (sscanf(tok, "%d-%d", &start, &end) == 2) {
+			count += end - start + 1;
+		} else if (sscanf(tok, "%d", &start) == 1) {
+			count++;
+		}
+		tok = strtok(NULL, ",");
+	}
+	return count;
+}
+
 static long detect_l3_size(void)
 {
-	long max_size = -1;
-	char path[512], buf[128];
+	long max_total = -1;
+	char path[512], buf[512], shared_list[512];
 
 	for (int idx = 0; idx < 16; idx++) {
 		/* read cache level */
@@ -752,6 +776,9 @@ static long detect_l3_size(void)
 		if (sysfs_read(path, buf, sizeof(buf)) < 0)
 			break;
 		int level = atoi(buf);
+
+		if (level < 3)
+			continue;
 
 		/* read cache type */
 		snprintf(path, sizeof(path),
@@ -765,26 +792,44 @@ static long detect_l3_size(void)
 		    strncmp(buf, "Data", 4) != 0)
 			continue;
 
-		/* read size */
+		/* read size (per-core slice) */
 		snprintf(path, sizeof(path),
 			 "/sys/devices/system/cpu/cpu0/cache/index%d/size",
 			 idx);
 		if (sysfs_read(path, buf, sizeof(buf)) < 0)
 			continue;
 
-		long sz = atol(buf);
+		long slice_size = atol(buf);
 		/* handle K/M suffix */
 		size_t len = strlen(buf);
 		if (len > 0 && (buf[len - 1] == 'K' || buf[len - 1] == 'k'))
-			sz *= 1024;
+			slice_size *= 1024;
 		else if (len > 0 && (buf[len - 1] == 'M' || buf[len - 1] == 'm'))
-			sz *= 1024 * 1024;
+			slice_size *= 1024 * 1024;
 
-		if (level >= 3 && sz > max_size)
-			max_size = sz;
+		/* read shared_cpu_list to find how many cores share this L3 */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/shared_cpu_list",
+			 idx);
+		if (sysfs_read(path, shared_list, sizeof(shared_list)) < 0) {
+			/* fallback: assume this is the total size */
+			if (slice_size > max_total)
+				max_total = slice_size;
+			continue;
+		}
+
+		int num_sharing = count_cpus_in_list(shared_list);
+		if (num_sharing <= 0)
+			num_sharing = 1;
+
+		/* total L3 = per-core slice × number of cores sharing it */
+		long total_size = slice_size * num_sharing;
+
+		if (total_size > max_total)
+			max_total = total_size;
 	}
 
-	return max_size;
+	return max_total;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1783,7 +1828,8 @@ int main(int argc, char **argv)
 	dprintf("=== memfreq_bench ===\n");
 	dprintf("CPU       : %d (of %d online)\n", cpu, ncpus_online);
 	if (l3_bytes > 0)
-		dprintf("L3 cache  : %ld MB\n", l3_bytes / (1024 * 1024));
+		dprintf("L3 cache  : %ld MB (total shared across all cores)\n",
+			l3_bytes / (1024 * 1024));
 	if (nproc_nodes > 0)
 		dprintf("NUMA      : %d nodes allowed\n", nproc_nodes);
 	if (max_temp > 0)
