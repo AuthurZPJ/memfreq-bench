@@ -45,7 +45,9 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <signal.h>
+#ifdef __linux__
 #include <linux/mempolicy.h>
+#endif
 
 #define CL        64          /* cache line size (bytes)               */
 #define MAX_FREQS 256
@@ -263,10 +265,16 @@ static int cmp_double(const void *a, const void *b)
 
 static int pin_to_cpu(int cpu)
 {
+#ifdef __linux__
 	cpu_set_t mask;
 	CPU_ZERO(&mask);
 	CPU_SET(cpu, &mask);
 	return sched_setaffinity(0, sizeof(mask), &mask);
+#else
+	(void)cpu;
+	dprintf("WARN: CPU pinning is Linux-only; ignored on this platform\n");
+	return -1;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -993,10 +1001,16 @@ static int bind_memory(void *addr, size_t len, int node)
 	if (node < 0)
 		return 0;  /* no binding requested */
 
+#ifdef __linux__
 	unsigned long nodemask = 1UL << node;
 	long ret = syscall(SYS_mbind, addr, len, MPOL_BIND,
 			   &nodemask, sizeof(nodemask) * 8, 0);
 	return (ret == 0) ? 0 : -1;
+#else
+	(void)addr; (void)len;
+	dprintf("WARN: NUMA binding (-B) is Linux-only; ignored on this platform\n");
+	return -1;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
