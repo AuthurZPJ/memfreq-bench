@@ -53,6 +53,7 @@
 #define MAX_FREQS 256
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
 #define MAX_NODES 16          /* max NUMA nodes                        */
+#define MAX_USER_THRESHOLDS 16 /* max entries in -L threshold list     */
 
 /* Convert ops/sec to MB/s for stride test (each op = 8 bytes) */
 #define OPS_TO_MBS(ops) ((ops) * 8.0 / 1048576.0)
@@ -1711,9 +1712,9 @@ int main(int argc, char **argv)
 	int   numa_node = -1;  /* -1 = no binding */
 	double  threshold      = 0.95;  /* user-overridable sweet-spot threshold */
 	int     n_user_thresholds = 0;
-	double  user_thresholds[16];
-	int     emit_raw       = 0;     /* --emit-raw: per-sample data in output */
-	int     no_plateau     = 0;     /* --no-plateau: suppress plateau block */
+	double  user_thresholds[MAX_USER_THRESHOLDS];
+	int     emit_raw       __attribute__((unused)) = 0;     /* -r: per-sample data in output, used in Task 6 */
+	int     no_plateau     __attribute__((unused)) = 0;     /* -P: suppress plateau block, used in Task 5   */
 	int   opt;
 
 	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rP")) != -1) {
@@ -1733,25 +1734,33 @@ int main(int argc, char **argv)
 		case 'F': force_run = 1;            break;
 		case 'T': threshold = atof(optarg);
 		          if (threshold <= 0.0 || threshold > 1.0) {
-		              dprintf("ERROR: --threshold must be in (0, 1], got %s\n", optarg);
+		              dprintf("ERROR: threshold must be in (0, 1], got %s\n", optarg);
 		              return 1;
 		          }
 		          break;
 		case 'L': {
 		          char *tok = strtok(optarg, ",");
-		          while (tok && n_user_thresholds < 16) {
+		          if (!tok || !*tok) {
+		              dprintf("ERROR: -L requires a non-empty comma-separated list\n");
+		              return 1;
+		          }
+		          while (tok && n_user_thresholds < MAX_USER_THRESHOLDS) {
 		              double v = atof(tok);
 		              if (v <= 0.0 || v > 1.0) {
-		                  dprintf("ERROR: --thresholds values must be in (0, 1], got %s\n", tok);
+		                  dprintf("ERROR: threshold value must be in (0, 1], got %s\n", tok);
 		                  return 1;
 		              }
 		              user_thresholds[n_user_thresholds++] = v;
 		              tok = strtok(NULL, ",");
 		          }
+		          if (tok && n_user_thresholds == MAX_USER_THRESHOLDS) {
+		              dprintf("WARN: -L truncated to %d entries (more given)\n",
+		                      MAX_USER_THRESHOLDS);
+		          }
 		          break;
 		      }
-		case 'r': emit_raw   = 1; (void)emit_raw;   break;
-		case 'P': no_plateau = 1; (void)no_plateau; break;
+		case 'r': emit_raw   = 1;            break;
+		case 'P': no_plateau = 1;            break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
