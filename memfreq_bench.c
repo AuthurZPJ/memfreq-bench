@@ -534,11 +534,19 @@ static int check_system_idle(int *online_cpus)
 /* Power / energy measurement                                          */
 /*                                                                     */
 /* Tries multiple sources in order of preference:                       */
-/*   1. hwmon power*_input (µW instantaneous) — some ARM servers       */
-/*   2. Intel RAPL energy_uj (µJ cumulative) — x86 only               */
+/*   1. hwmon power*_average (µW, time-averaged) — ARM servers         */
+/*      Supports configurable averaging interval via:                   */
+/*        power*_average_interval (ms)                                  */
+/*      Set to 1000ms (1s) before benchmarking for stable              */
+/*      readings.                                                       */
+/*   2. hwmon power*_input (µW, instantaneous) — generic fallback       */
+/*   3. Intel RAPL energy_uj (µJ, cumulative) — x86 only               */
 /*                                                                     */
-/* For hwmon (instantaneous power in µW), we sample before and after   */
-/* and compute energy = avg_power × elapsed_time.                       */
+/* For hwmon (average power in µW):                                    */
+/*   energy = ((P_before + P_after) / 2) × elapsed_time                */
+/*                                                                     */
+/* For RAPL (cumulative energy in µJ):                                 */
+/*   energy = counter_after - counter_before                           */
 /*                                                                     */
 /* On ARM without hwmon power sensors, this returns -1 (not available).*/
 /* ------------------------------------------------------------------ */
@@ -547,26 +555,83 @@ static int check_system_idle(int *online_cpus)
 static char power_paths[MAX_POWER_PATHS][256];
 static int  npower_paths = 0;
 static int  power_is_uj  = 0;  /* 1=RAPL (cumulative µJ), 0=hwmon (µW) */
+static int  power_is_avg = 0;  /* 1=power*_average, 0=power*_input     */
+
+/*
+ * Try to set power*_average_interval to target_ms for each hwmon device.
+ * This controls the time window over which power*_average is computed.
+ * Unit is milliseconds. 1000ms (1s) gives a stable, low-noise reading
+ * that covers a full benchmark inner-loop iteration.
+ */
+static void configure_avg_interval(int target_ms)
+{
+	char val[32];
+	snprintf(val, sizeof(val), "%d", target_ms);
+
+	for (int h = 0; h < 16; h++) {
+		for (int p = 1; p <= 4; p++) {
+			char path[256];
+			snprintf(path, sizeof(path),
+				 "/sys/class/hwmon/hwmon%d/"
+				 "power%d_average_interval", h, p);
+			/* silently ignore if file doesn't exist */
+			sysfs_write(path, val);
+		}
+	}
+}
 
 static void detect_power_sensors(void)
 {
 	npower_paths = 0;
 	power_is_uj = 0;
 
-	/* Try hwmon power sensors first */
+	/* Priority 1: hwmon power*_average (time-averaged, preferred) */
 	for (int h = 0; h < 16 && npower_paths < MAX_POWER_PATHS; h++) {
 		char base[128];
 		snprintf(base, sizeof(base),
 			 "/sys/class/hwmon/hwmon%d", h);
 
-		/* check if this hwmon device exists */
 		char name[192];
 		snprintf(name, sizeof(name), "%s/name", base);
 		char namebuf[64];
 		if (sysfs_read(name, namebuf, sizeof(namebuf)) < 0)
 			continue;
 
-		/* look for power*_input files */
+		for (int p = 1; p <= 4 && npower_paths < MAX_POWER_PATHS; p++) {
+			char path[256];
+			snprintf(path, sizeof(path),
+				 "%s/power%d_average", base, p);
+			char buf[64];
+			if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+				long long val = strtoll(buf, NULL, 10);
+				if (val > 0) {
+					snprintf(power_paths[npower_paths],
+						 sizeof(power_paths[0]),
+						 "%s", path);
+					npower_paths++;
+				}
+			}
+		}
+	}
+	if (npower_paths > 0) {
+		/* configure averaging interval to 1s (1000ms) */
+		configure_avg_interval(1000);
+		power_is_avg = 1;
+		return;
+	}
+
+	/* Priority 2: hwmon power*_input (instantaneous) */
+	for (int h = 0; h < 16 && npower_paths < MAX_POWER_PATHS; h++) {
+		char base[128];
+		snprintf(base, sizeof(base),
+			 "/sys/class/hwmon/hwmon%d", h);
+
+		char name[192];
+		snprintf(name, sizeof(name), "%s/name", base);
+		char namebuf[64];
+		if (sysfs_read(name, namebuf, sizeof(namebuf)) < 0)
+			continue;
+
 		for (int p = 1; p <= 4 && npower_paths < MAX_POWER_PATHS; p++) {
 			char path[256];
 			snprintf(path, sizeof(path),
@@ -586,7 +651,7 @@ static void detect_power_sensors(void)
 	if (npower_paths > 0)
 		return;
 
-	/* Fallback: Intel RAPL (x86 only) */
+	/* Priority 3: Intel RAPL (x86 only) */
 	const char *rapl_paths[] = {
 		"/sys/class/powercap/intel-rapl:0/energy_uj",
 		"/sys/class/powercap/intel-rapl:0:0/energy_uj",
@@ -793,7 +858,8 @@ int main(int argc, char **argv)
 		test_secs, nsamples);
 	dprintf("Power     : %s\n", npower_paths > 0 ?
 		(power_is_uj ? "RAPL (cumulative energy)" :
-			       "hwmon (instantaneous power)") :
+		 power_is_avg ? "hwmon power*_average (1s avg)" :
+			       "hwmon power*_input (instantaneous)") :
 		"not available (energy measurement skipped)");
 	if (freq_is_range) {
 		dprintf("Freq mode : range, step %d kHz\n", step_khz);
@@ -919,7 +985,8 @@ int main(int argc, char **argv)
 	printf("# cpu=%d ncpus=%d array=%dMB stride=%d duration=%ds samples=%d",
 	       cpu, ncpus_online, size_mb, stride, test_secs, nsamples);
 	if (npower_paths > 0)
-		printf(" power=%s", power_is_uj ? "rapl" : "hwmon");
+		printf(" power=%s", power_is_uj ? "rapl" :
+		       power_is_avg ? "hwmon_avg" : "hwmon_inst");
 	printf("\n#\n");
 
 	/* column headers */
