@@ -461,7 +461,9 @@ struct result {
 	double stride_tput;
 	double chase_tput;
 	double compute_tput;
-	double energy_uj;       /* RAPL energy for this point (µJ), 0=N/A */
+	double energy_uj;       /* loaded energy (µJ), 0=N/A           */
+	double idle_power_uw;   /* idle power (µW), 0=N/A              */
+	double load_power_uw;   /* loaded power (µW), 0=N/A            */
 };
 
 /* ------------------------------------------------------------------ */
@@ -892,6 +894,8 @@ int main(int argc, char **argv)
 		results[fi].valid = 0;
 		results[fi].actual_khz = 0;
 		results[fi].energy_uj = 0;
+		results[fi].idle_power_uw = 0;
+		results[fi].load_power_uw = 0;
 
 		if (set_freq(cpu, freqs[fi]) < 0) {
 			dprintf("\nWARN: cannot set cpu%d to %d kHz, skipping\n",
@@ -905,13 +909,28 @@ int main(int argc, char **argv)
 		int actual = verify_freq(cpu, freqs[fi]);
 		results[fi].actual_khz = actual > 0 ? actual : freqs[fi];
 
+		/*
+		 * For hwmon power*_average: wait for the averaging window
+		 * (1s) to settle so we get a stable idle reading.
+		 * The test core is pinned but idle — all benchmarks are
+		 * single-core, so other cores are running their normal
+		 * background tasks.
+		 */
+		if (npower_paths > 0 && !power_is_uj)
+			usleep(1100000);  /* 1.1s > averaging interval */
+
 		progress++;
 		dprintf("\r[%2d/%2d]  %4d MHz ...   ",
 			progress, nfreqs, freqs[fi] / 1000);
 		fflush(stderr);
 
-		/* energy: sample power/energy before tests */
-		long long power_before = npower_paths > 0 ? read_power() : -1;
+		/* Measure idle power (no benchmark running yet) */
+		long long power_idle = npower_paths > 0 ? read_power() : -1;
+		if (power_idle > 0)
+			results[fi].idle_power_uw = (double)power_idle;
+
+		/* Measure loaded power (sample before tests start) */
+		long long power_before = power_idle;  /* reuse idle as start */
 		double t_energy_start = now();
 
 		results[fi].valid = 1;
@@ -946,11 +965,19 @@ int main(int argc, char **argv)
 					results[fi].energy_uj =
 						(double)(power_after - power_before);
 			} else if (power_after > 0) {
-				/* hwmon: instantaneous µW → µJ = µW × s */
-				double avg_uw =
-					(power_before + power_after) / 2.0;
+				/*
+				 * hwmon: µW average power.
+				 * Record loaded power, compute delta energy:
+				 *   delta_energy = (P_load - P_idle) × time
+				 * This isolates the single test core's
+				 * incremental power from the full-SoC baseline.
+				 */
+				results[fi].load_power_uw = (double)power_after;
+				double delta_uw = power_after - power_idle;
 				double elapsed = t_energy_end - t_energy_start;
-				results[fi].energy_uj = avg_uw * elapsed;
+				if (delta_uw > 0)
+					results[fi].energy_uj =
+						delta_uw * elapsed;
 			}
 		}
 	}
@@ -990,7 +1017,24 @@ int main(int argc, char **argv)
 	printf("\n#\n");
 
 	/* column headers */
-	if (npower_paths > 0) {
+	if (npower_paths > 0 && !power_is_uj) {
+		/* hwmon: idle_W, load_W, delta_W, energy_J */
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%",
+			     "idle_W", "load_W", "delta_W", "energy_J");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "compute_Mops", "compute_%",
+			     "idle_W", "load_W", "delta_W", "energy_J");
+		}
+	} else if (npower_paths > 0) {
+		/* RAPL: just energy_J */
 		if (do_chase) {
 			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			     "target_MHz", "actual_MHz",
@@ -1049,7 +1093,30 @@ int main(int argc, char **argv)
 		double s_pct = results[fi].stride_tput / s_max * 100.0;
 		double p_pct = results[fi].compute_tput / p_max * 100.0;
 
-		if (npower_paths > 0) {
+		if (npower_paths > 0 && !power_is_uj) {
+			/* hwmon: idle_W, load_W, delta_W, energy_J */
+			double idle_w = results[fi].idle_power_uw / 1e6;
+			double load_w = results[fi].load_power_uw / 1e6;
+			double delta_w = load_w - idle_w;
+			double e_j = results[fi].energy_uj / 1e6;
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       idle_w, load_w, delta_w, e_j);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       idle_w, load_w, delta_w, e_j);
+			}
+		} else if (npower_paths > 0) {
+			/* RAPL: just energy_J */
 			double e_j = results[fi].energy_uj / 1e6;
 			if (do_chase) {
 				double c_pct =
