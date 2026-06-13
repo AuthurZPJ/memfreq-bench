@@ -457,10 +457,217 @@ bench_compute(double secs)
 struct result {
 	int    freq_khz;
 	int    valid;           /* 0 if set_freq failed for this point  */
+	int    actual_khz;      /* verified actual freq after set       */
 	double stride_tput;
 	double chase_tput;
 	double compute_tput;
+	double energy_uj;       /* RAPL energy for this point (µJ), 0=N/A */
 };
+
+/* ------------------------------------------------------------------ */
+/* System idle gate (from sbc-bench)                                   */
+/*                                                                     */
+/* Refuse to benchmark if the system is obviously busy.  Background     */
+/* load contaminates measurements with cache pollution, CPU contention, */
+/* and frequency governor interference.                                 */
+/* ------------------------------------------------------------------ */
+
+static double read_loadavg1(void)
+{
+	FILE *f = fopen("/proc/loadavg", "r");
+	if (!f)
+		return -1.0;
+	double avg;
+	if (fscanf(f, "%lf", &avg) != 1) {
+		fclose(f);
+		return -1.0;
+	}
+	fclose(f);
+	return avg;
+}
+
+/*
+ * Check if the system is idle enough for benchmarking.
+ * Returns 0 if OK, -1 if too busy.
+ *
+ * Heuristic: loadavg(1min) should be < online_cpus.
+ * On a 96-core server, loadavg=5 is fine (5/96 = 5% utilization).
+ * On a 4-core board, loadavg=5 means the system is saturated.
+ */
+static int check_system_idle(int *online_cpus)
+{
+	*online_cpus = 0;
+
+	/* count online CPUs */
+	for (int i = 0; i < 1024; i++) {
+		char path[128], buf[8];
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/online", i);
+		if (sysfs_read(path, buf, sizeof(buf)) == 0 && buf[0] == '1')
+			(*online_cpus)++;
+	}
+	/* fallback: assume nproc */
+	if (*online_cpus == 0)
+		*online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+	double loadavg = read_loadavg1();
+	if (loadavg < 0)
+		return 0;  /* can't read, don't block */
+
+	if (loadavg > *online_cpus) {
+		dprintf("ERROR: system too busy for reliable benchmarking\n");
+		dprintf("       loadavg(1min) = %.2f, online CPUs = %d\n",
+			loadavg, *online_cpus);
+		dprintf("       Use -F to force run anyway\n");
+		return -1;
+	}
+
+	if (loadavg > *online_cpus * 0.5) {
+		dprintf("WARN: system moderately loaded (loadavg=%.2f, "
+			"cpus=%d) — results may have noise\n",
+			loadavg, *online_cpus);
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Power / energy measurement                                          */
+/*                                                                     */
+/* Tries multiple sources in order of preference:                       */
+/*   1. hwmon power*_input (µW instantaneous) — some ARM servers       */
+/*   2. Intel RAPL energy_uj (µJ cumulative) — x86 only               */
+/*                                                                     */
+/* For hwmon (instantaneous power in µW), we sample before and after   */
+/* and compute energy = avg_power × elapsed_time.                       */
+/*                                                                     */
+/* On ARM without hwmon power sensors, this returns -1 (not available).*/
+/* ------------------------------------------------------------------ */
+
+#define MAX_POWER_PATHS 8
+static char power_paths[MAX_POWER_PATHS][256];
+static int  npower_paths = 0;
+static int  power_is_uj  = 0;  /* 1=RAPL (cumulative µJ), 0=hwmon (µW) */
+
+static void detect_power_sensors(void)
+{
+	npower_paths = 0;
+	power_is_uj = 0;
+
+	/* Try hwmon power sensors first */
+	for (int h = 0; h < 16 && npower_paths < MAX_POWER_PATHS; h++) {
+		char base[128];
+		snprintf(base, sizeof(base),
+			 "/sys/class/hwmon/hwmon%d", h);
+
+		/* check if this hwmon device exists */
+		char name[192];
+		snprintf(name, sizeof(name), "%s/name", base);
+		char namebuf[64];
+		if (sysfs_read(name, namebuf, sizeof(namebuf)) < 0)
+			continue;
+
+		/* look for power*_input files */
+		for (int p = 1; p <= 4 && npower_paths < MAX_POWER_PATHS; p++) {
+			char path[256];
+			snprintf(path, sizeof(path),
+				 "%s/power%d_input", base, p);
+			char buf[64];
+			if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+				long long val = strtoll(buf, NULL, 10);
+				if (val > 0) {
+					snprintf(power_paths[npower_paths],
+						 sizeof(power_paths[0]),
+						 "%s", path);
+					npower_paths++;
+				}
+			}
+		}
+	}
+	if (npower_paths > 0)
+		return;
+
+	/* Fallback: Intel RAPL (x86 only) */
+	const char *rapl_paths[] = {
+		"/sys/class/powercap/intel-rapl:0/energy_uj",
+		"/sys/class/powercap/intel-rapl:0:0/energy_uj",
+		NULL
+	};
+	for (int i = 0; rapl_paths[i] && npower_paths < MAX_POWER_PATHS; i++) {
+		char buf[64];
+		if (sysfs_read(rapl_paths[i], buf, sizeof(buf)) == 0) {
+			long long val = strtoll(buf, NULL, 10);
+			if (val > 0) {
+				snprintf(power_paths[npower_paths],
+					 sizeof(power_paths[0]),
+					 "%s", rapl_paths[i]);
+				npower_paths++;
+				power_is_uj = 1;
+			}
+		}
+	}
+}
+
+/*
+ * Read total power/energy from all detected sensors.
+ * Returns: cumulative µJ (RAPL) or instantaneous µW (hwmon), or -1 if N/A.
+ */
+static long long read_power(void)
+{
+	if (npower_paths == 0)
+		return -1;
+
+	long long total = 0;
+	for (int i = 0; i < npower_paths; i++) {
+		char buf[64];
+		if (sysfs_read(power_paths[i], buf, sizeof(buf)) == 0) {
+			long long val = strtoll(buf, NULL, 10);
+			if (val > 0)
+				total += val;
+		}
+	}
+	return total > 0 ? total : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Frequency verification                                              */
+/*                                                                     */
+/* After setting a target frequency, read the actual running frequency.*/
+/* Uses cpuinfo_cur_freq (instantaneous) or cpuinfo_avg_freq (average  */
+/* over recent interval) — NOT scaling_cur_freq which only reflects    */
+/* the governor's request, not what hardware actually delivers.        */
+/*                                                                     */
+/* On ARM CPPC systems, frequency fluctuates naturally as firmware     */
+/* autonomously adjusts within the requested range.  We just record    */
+/* the actual value for the output table — no warnings.                */
+/* ------------------------------------------------------------------ */
+
+static int verify_freq(int cpu, int target_khz)
+{
+	char path[256], buf[64];
+
+	/* try cpuinfo_cur_freq first (instantaneous actual frequency) */
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq",
+		 cpu);
+	if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+		int actual = atoi(buf);
+		if (actual > 0)
+			return actual;
+	}
+
+	/* fallback: cpuinfo_avg_freq (average over recent interval) */
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_avg_freq",
+		 cpu);
+	if (sysfs_read(path, buf, sizeof(buf)) == 0) {
+		int actual = atoi(buf);
+		if (actual > 0)
+			return actual;
+	}
+
+	(void)target_khz;  /* no warning — fluctuation is normal on CPPC */
+	return -1;
+}
 
 /* ------------------------------------------------------------------ */
 /* main                                                                */
@@ -477,6 +684,7 @@ static void usage(const char *prog)
 "  -n N        Samples per point (median) (default: 3)\n"
 "  -S STEP_KHZ Frequency step in kHz      (default: 25000, CPPC range mode only)\n"
 "  -C          Skip pointer chase test\n"
+"  -F          Force run even if system is busy (skip idle check)\n"
 "  -h          This help\n", prog);
 }
 
@@ -489,9 +697,10 @@ int main(int argc, char **argv)
 	int   nsamples  = 3;
 	int   do_chase  = 1;
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
+	int   force_run = 0;
 	int   opt;
 
-	while ((opt = getopt(argc, argv, "c:m:s:t:n:S:Ch")) != -1) {
+	while ((opt = getopt(argc, argv, "c:m:s:t:n:S:CFh")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'm': size_mb   = atoi(optarg); break;
@@ -500,6 +709,7 @@ int main(int argc, char **argv)
 		case 'n': nsamples  = atoi(optarg); break;
 		case 'S': step_khz  = atoi(optarg); break;
 		case 'C': do_chase  = 0;            break;
+		case 'F': force_run = 1;            break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
@@ -510,6 +720,16 @@ int main(int argc, char **argv)
 		dprintf("ERROR: stride must be ≥ 1 (got %d)\n", stride);
 		return 1;
 	}
+
+	/* ---- system idle gate (from sbc-bench) ---- */
+	int ncpus_online = 0;
+	if (!force_run && check_system_idle(&ncpus_online) < 0)
+		return 1;
+	if (ncpus_online == 0)
+		ncpus_online = sysconf(_SC_NPROCESSORS_ONLN);
+
+	/* ---- detect power sensors ---- */
+	detect_power_sensors();
 
 	/* ---- pin ---- */
 	if (pin_to_cpu(cpu) < 0) {
@@ -563,7 +783,7 @@ int main(int argc, char **argv)
 
 	/* ---- banner ---- */
 	dprintf("=== memfreq_bench ===\n");
-	dprintf("CPU       : %d\n", cpu);
+	dprintf("CPU       : %d (of %d online)\n", cpu, ncpus_online);
 	dprintf("Array     : %d MB (%zu cache lines)\n",
 		size_mb, array_bytes / CL);
 	dprintf("Stride    : %d (= %d B, %s)\n", stride, stride * 8,
@@ -571,6 +791,10 @@ int main(int argc, char **argv)
 	dprintf("Chase     : %s\n", do_chase ? "enabled" : "disabled");
 	dprintf("Duration  : %d s × %d samples (median)\n",
 		test_secs, nsamples);
+	dprintf("Power     : %s\n", npower_paths > 0 ?
+		(power_is_uj ? "RAPL (cumulative energy)" :
+			       "hwmon (instantaneous power)") :
+		"not available (energy measurement skipped)");
 	if (freq_is_range) {
 		dprintf("Freq mode : range, step %d kHz\n", step_khz);
 		dprintf("Freq range: %d – %d MHz\n",
@@ -600,6 +824,8 @@ int main(int argc, char **argv)
 	for (int fi = nfreqs - 1; fi >= 0; fi--) {
 		results[fi].freq_khz = freqs[fi];
 		results[fi].valid = 0;
+		results[fi].actual_khz = 0;
+		results[fi].energy_uj = 0;
 
 		if (set_freq(cpu, freqs[fi]) < 0) {
 			dprintf("\nWARN: cannot set cpu%d to %d kHz, skipping\n",
@@ -609,10 +835,18 @@ int main(int argc, char **argv)
 		/* let frequency settle */
 		usleep(100000);
 
+		/* verify actual frequency (from sbc-bench) */
+		int actual = verify_freq(cpu, freqs[fi]);
+		results[fi].actual_khz = actual > 0 ? actual : freqs[fi];
+
 		progress++;
 		dprintf("\r[%2d/%2d]  %4d MHz ...   ",
 			progress, nfreqs, freqs[fi] / 1000);
 		fflush(stderr);
+
+		/* energy: sample power/energy before tests */
+		long long power_before = npower_paths > 0 ? read_power() : -1;
+		double t_energy_start = now();
 
 		results[fi].valid = 1;
 
@@ -635,6 +869,24 @@ int main(int argc, char **argv)
 			buf[s] = bench_compute(test_secs);
 		qsort(buf, nsamples, sizeof(double), cmp_double);
 		results[fi].compute_tput = buf[nsamples / 2];
+
+		/* energy: compute total energy for this frequency point */
+		if (npower_paths > 0 && power_before > 0) {
+			double t_energy_end = now();
+			long long power_after = read_power();
+			if (power_is_uj) {
+				/* RAPL: cumulative µJ, take difference */
+				if (power_after > power_before)
+					results[fi].energy_uj =
+						(double)(power_after - power_before);
+			} else if (power_after > 0) {
+				/* hwmon: instantaneous µW → µJ = µW × s */
+				double avg_uw =
+					(power_before + power_after) / 2.0;
+				double elapsed = t_energy_end - t_energy_start;
+				results[fi].energy_uj = avg_uw * elapsed;
+			}
+		}
 	}
 	dprintf("\r                                  \r");
 	fflush(stderr);
@@ -664,21 +916,41 @@ int main(int argc, char **argv)
 
 	/* header */
 	printf("# %s\n", "memfreq_bench results");
-	printf("# cpu=%d array=%dMB stride=%d duration=%ds samples=%d\n",
-	       cpu, size_mb, stride, test_secs, nsamples);
-	printf("#\n");
+	printf("# cpu=%d ncpus=%d array=%dMB stride=%d duration=%ds samples=%d",
+	       cpu, ncpus_online, size_mb, stride, test_secs, nsamples);
+	if (npower_paths > 0)
+		printf(" power=%s", power_is_uj ? "rapl" : "hwmon");
+	printf("\n#\n");
 
-	if (do_chase) {
-		printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		     "freq_MHz",
-		     "stride_Mops",  "stride_%",
-		     "chase_Mops",   "chase_%",
-		     "compute_Mops", "compute_%");
+	/* column headers */
+	if (npower_paths > 0) {
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%",
+			     "energy_J");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "compute_Mops", "compute_%",
+			     "energy_J");
+		}
 	} else {
-		printf("# %s\t%s\t%s\t%s\t%s\n",
-		     "freq_MHz",
-		     "stride_Mops",  "stride_%",
-		     "compute_Mops", "compute_%");
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops",  "stride_%",
+			     "compute_Mops", "compute_%");
+		}
 	}
 
 	/* reference = highest valid freq */
@@ -705,22 +977,44 @@ int main(int argc, char **argv)
 	for (int fi = 0; fi < nfreqs; fi++) {
 		if (!results[fi].valid)
 			continue;
-		int mhz = results[fi].freq_khz / 1000;
+		int target_mhz = results[fi].freq_khz / 1000;
+		int actual_mhz = results[fi].actual_khz / 1000;
 		double s_pct = results[fi].stride_tput / s_max * 100.0;
 		double p_pct = results[fi].compute_tput / p_max * 100.0;
 
-		if (do_chase) {
-			double c_pct = results[fi].chase_tput / c_max * 100.0;
-			printf("%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
-			       mhz,
-			       results[fi].stride_tput / 1e6, s_pct,
-			       results[fi].chase_tput / 1e6,  c_pct,
-			       results[fi].compute_tput / 1e6, p_pct);
+		if (npower_paths > 0) {
+			double e_j = results[fi].energy_uj / 1e6;
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       e_j);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       e_j);
+			}
 		} else {
-			printf("%d\t%.1f\t%.1f\t%.1f\t%.1f\n",
-			       mhz,
-			       results[fi].stride_tput / 1e6, s_pct,
-			       results[fi].compute_tput / 1e6, p_pct);
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct);
+			}
 		}
 	}
 
