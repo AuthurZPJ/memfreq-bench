@@ -119,17 +119,46 @@ static int read_freq_khz(const char *path)
 }
 
 /*
- * Read available frequencies.
+ * Generate ascending frequency list from fmin to fmax with given step.
+ * Always includes fmax as the last entry.  Returns count, or 0 on error.
+ */
+static int gen_freq_range(int *freqs, int max, int fmin, int fmax, int step_khz)
+{
+	if (fmin <= 0 || fmax <= 0 || fmin >= fmax)
+		return 0;
+	if (step_khz <= 0)
+		step_khz = 25000;   /* 25 MHz default step */
+
+	int count = 0;
+	for (int f = fmin; f <= fmax && count < max; f += step_khz)
+		freqs[count++] = f;
+
+	/* ensure max is included */
+	if (count > 0 && freqs[count - 1] != fmax && count < max)
+		freqs[count++] = fmax;
+
+	return count;
+}
+
+/*
+ * Read available frequencies.  Three detection paths, tried in order:
  *
  * Path 1 (discrete): scaling_available_frequencies
  *   Traditional cpufreq drivers expose a whitespace-separated list.
  *
- * Path 2 (continuous/CPPC): cpuinfo_min_freq → cpuinfo_max_freq
- *   CPPC-based drivers (common on ARM servers) don't expose a discrete
- *   list.  Instead, the firmware reports a continuous range.  We generate
- *   a sweep from min to max with a configurable step (default 25 MHz).
- *   The actual frequency set by the firmware may not be exact, but the
- *   hardware will clamp to the nearest valid OPP.
+ * Path 2 (acpi_cppc): highest_perf / lowest_nonlinear_perf
+ *   ARM servers with CPPC expose performance levels via:
+ *     /sys/devices/system/cpu/cpuN/acpi_cppc/highest_perf
+ *     /sys/devices/system/cpu/cpuN/acpi_cppc/lowest_nonlinear_perf
+ *   highest_perf → cpuinfo_max_freq (ceiling)
+ *   lowest_nonlinear_perf → floor of the "efficient" range
+ *     (below this perf level, power savings diminish — non-linear region)
+ *   We map perf → kHz linearly: khz = (perf / highest_perf) × max_khz
+ *
+ * Path 3 (cpuinfo range): cpuinfo_min_freq → cpuinfo_max_freq
+ *   Fallback when acpi_cppc is absent.  Uses the full range exposed by
+ *   the driver (which may include the non-linear inefficient region below
+ *   lowest_nonlinear_perf).
  */
 static int read_freqs(int cpu, int *freqs, int max, int step_khz, int *is_range)
 {
@@ -162,7 +191,35 @@ static int read_freqs(int cpu, int *freqs, int max, int step_khz, int *is_range)
 			return count;
 	}
 
-	/* Path 2: CPPC continuous range */
+	/* Path 2: acpi_cppc perf levels */
+	int highest_perf, lowest_nl_perf, max_khz;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/acpi_cppc/highest_perf", cpu);
+	highest_perf = read_freq_khz(path);
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/acpi_cppc/"
+		 "lowest_nonlinear_perf", cpu);
+	lowest_nl_perf = read_freq_khz(path);
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+	max_khz = read_freq_khz(path);
+
+	if (highest_perf > 0 && lowest_nl_perf > 0 && max_khz > 0 &&
+	    lowest_nl_perf < highest_perf) {
+		int min_khz = (int)((long long)lowest_nl_perf *
+				    max_khz / highest_perf);
+		int count = gen_freq_range(freqs, max, min_khz, max_khz,
+					   step_khz);
+		if (count >= 2) {
+			*is_range = 1;
+			return count;
+		}
+	}
+
+	/* Path 3: cpuinfo_min/max range (legacy CPPC fallback) */
 	int fmin, fmax;
 
 	snprintf(path, sizeof(path),
@@ -175,23 +232,13 @@ static int read_freqs(int cpu, int *freqs, int max, int step_khz, int *is_range)
 		 cpu);
 	fmax = read_freq_khz(path);
 
-	if (fmin <= 0 || fmax <= 0 || fmin >= fmax)
-		return 0;
+	int count = gen_freq_range(freqs, max, fmin, fmax, step_khz);
+	if (count >= 2) {
+		*is_range = 1;
+		return count;
+	}
 
-	if (step_khz <= 0)
-		step_khz = 25000;   /* 25 MHz default step */
-
-	*is_range = 1;
-
-	int count = 0;
-	for (int f = fmin; f <= fmax && count < max; f += step_khz)
-		freqs[count++] = f;
-
-	/* ensure max is included */
-	if (count > 0 && freqs[count - 1] != fmax && count < max)
-		freqs[count++] = fmax;
-
-	return count;
+	return 0;
 }
 
 /*
@@ -499,9 +546,10 @@ int main(int argc, char **argv)
 	int nfreqs = read_freqs(cpu, freqs, MAX_FREQS, step_khz, &freq_is_range);
 	if (nfreqs < 2) {
 		dprintf("ERROR: need ≥2 frequencies, got %d.\n", nfreqs);
-		dprintf("       Checked both:\n");
-		dprintf("         scaling_available_frequencies (discrete list)\n");
-		dprintf("         cpuinfo_min/max_freq (CPPC range, step=%d kHz)\n",
+		dprintf("       Checked three paths:\n");
+		dprintf("         1. scaling_available_frequencies (discrete list)\n");
+		dprintf("         2. acpi_cppc highest/lowest_nonlinear_perf\n");
+		dprintf("         3. cpuinfo_min/max_freq (range, step=%d kHz)\n",
 			step_khz);
 		dprintf("       Is cpufreq configured on cpu%d?\n", cpu);
 		free(arr);
@@ -523,12 +571,15 @@ int main(int argc, char **argv)
 	dprintf("Chase     : %s\n", do_chase ? "enabled" : "disabled");
 	dprintf("Duration  : %d s × %d samples (median)\n",
 		test_secs, nsamples);
-	if (freq_is_range)
-		dprintf("Freq mode : CPPC range, step %d kHz\n", step_khz);
-	else
+	if (freq_is_range) {
+		dprintf("Freq mode : range, step %d kHz\n", step_khz);
+		dprintf("Freq range: %d – %d MHz\n",
+			freqs[0] / 1000, freqs[nfreqs - 1] / 1000);
+	} else {
 		dprintf("Freq mode : discrete list\n");
-	dprintf("Freq pts  : %d (%d – %d MHz)\n",
-		nfreqs, freqs[0] / 1000, freqs[nfreqs - 1] / 1000);
+	}
+	dprintf("Freq pts  : %d\n", nfreqs);
+	dprintf("Sweep     : high → low (max freq first = reference baseline)\n");
 	dprintf("\n");
 
 	/* ---- disable turbo ---- */
@@ -539,7 +590,14 @@ int main(int argc, char **argv)
 	struct result *results = calloc(nfreqs, sizeof(*results));
 	double *buf = malloc(nsamples * sizeof(*buf));
 
-	for (int fi = 0; fi < nfreqs; fi++) {
+	/*
+	 * Sweep from highest to lowest frequency.
+	 * First measurement at max freq establishes the reference baseline
+	 * with warm caches.  Subsequent lower freq measurements compare
+	 * against this baseline.
+	 */
+	int progress = 0;
+	for (int fi = nfreqs - 1; fi >= 0; fi--) {
 		results[fi].freq_khz = freqs[fi];
 		results[fi].valid = 0;
 
@@ -551,8 +609,9 @@ int main(int argc, char **argv)
 		/* let frequency settle */
 		usleep(100000);
 
+		progress++;
 		dprintf("\r[%2d/%2d]  %4d MHz ...   ",
-			fi + 1, nfreqs, freqs[fi] / 1000);
+			progress, nfreqs, freqs[fi] / 1000);
 		fflush(stderr);
 
 		results[fi].valid = 1;
