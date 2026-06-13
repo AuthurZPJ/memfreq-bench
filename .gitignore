@@ -3,3 +3,4 @@ memfreq_bench
 memfreq_results.json
 *.pyc
 __pycache__/
+.worktrees/
