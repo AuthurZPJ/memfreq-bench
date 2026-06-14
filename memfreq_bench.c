@@ -2548,6 +2548,51 @@ int main(int argc, char **argv)
 			else
 				printf("# %-8s plateau_breakpoint: \xe2\x80\x94  (no plateau; throughput keeps rising with frequency)\n",
 				       workloads[w].name);
+
+			/* Power at sweet spot: completes the DVFS thesis by
+			 * quantifying the energy savings achievable by running
+			 * at the sweet spot vs. max frequency. Requires both a
+			 * usable sweet spot (rc==0) and a power sensor. */
+			int    max_power_idx      = -1;
+			double max_power_w        = 0.0;
+			int    max_power_freq_khz = 0;
+			for (int fi = 0; fi < nfreqs; fi++) {
+				if (!results[fi].valid) continue;
+				if (results[fi].load_power_uw <= 0) continue;
+				max_power_idx      = fi;
+				max_power_w        = results[fi].load_power_uw / 1e6;
+				max_power_freq_khz = results[fi].freq_khz;
+			}
+			if (rc == 0 && max_power_idx >= 0) {
+				/* sweet_idx is into the compacted freqs_khz[] /
+				 * mops[] arrays. Walk results[] to find the row
+				 * whose freq_khz matches. */
+				int sweet_compact_idx = -1;
+				(void)find_sweet_spot(workloads[w].mops, freqs_khz,
+				                      n_valid, &sweet_compact_idx,
+				                      threshold);
+				int sweet_results_idx = -1;
+				for (int fi = 0; fi < nfreqs; fi++) {
+					if (!results[fi].valid) continue;
+					if (results[fi].freq_khz ==
+					    freqs_khz[sweet_compact_idx]) {
+						sweet_results_idx = fi;
+						break;
+					}
+				}
+				double sweet_power_w = results[sweet_results_idx].load_power_uw / 1e6;
+				double savings = (max_power_w - sweet_power_w)
+				                 / max_power_w * 100.0;
+				printf("# %-8s power: %.0fW at sweet spot (savings: %.0f%% vs %.0fW at %d MHz)\n",
+				       workloads[w].name, sweet_power_w, savings,
+				       max_power_w, max_power_freq_khz / 1000);
+			} else if (rc != 0) {
+				printf("# %-8s power: N/A (no plateau)\n",
+				       workloads[w].name);
+			} else {
+				printf("# %-8s power: N/A (no sensor)\n",
+				       workloads[w].name);
+			}
 		}
 	}
 
