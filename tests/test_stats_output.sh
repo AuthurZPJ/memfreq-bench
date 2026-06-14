@@ -93,16 +93,25 @@ check_contains "help mentions -r"       "$HELP" "-r"
 check_contains "help mentions -P"       "$HELP" "-P"
 
 echo "=== Test 2: --threshold validation ==="
-# Threshold validation runs after root check (so the binary can fail fast on
-# permission errors before parsing user input). When run unprivileged, expect
-# the root error; the actual range check is in the C code and unit-tested
-# separately in tests/test_stats.c.
+# Threshold and -m validation run after getopt but before the root check,
+# so we can test the message without sudo. (The root check used to fire
+# first; it was moved to after argument validation in the same change
+# that added the -m bounds check.)
 ERR=$($BIN -T 1.5 2>&1)
-check_contains "rejects -T 1.5 (root or threshold)" "$ERR" "ERROR"
+check_contains "rejects threshold > 1" "$ERR" "(0, 1]"
+
+ERR=$($BIN -m 0 2>&1)
+check_contains "rejects -m 0"          "$ERR" "out of range"
+
+ERR=$($BIN -m 100000 2>&1)
+check_contains "rejects -m 100000"     "$ERR" "out of range"
+
+ERR=$($BIN -m -5 2>&1)
+check_contains "rejects -m -5"         "$ERR" "out of range"
 
 echo "=== Test 3: --thresholds validation ==="
 ERR=$($BIN -L 0.5,1.5 2>&1)
-check_contains "rejects -L with out-of-range entry (root or threshold)" "$ERR" "ERROR"
+check_contains "rejects thresholds > 1" "$ERR" "(0, 1]"
 
 echo "=== Test 4: Python --compare with 3 fixture files ==="
 OUT=$($PY memfreq_sweep.py --compare \

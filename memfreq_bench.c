@@ -55,6 +55,7 @@
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
 #define MAX_NODES 16          /* max NUMA nodes                        */
 #define MAX_USER_THRESHOLDS 16 /* max entries in -L threshold list     */
+#define MAX_SIZE_MB 65536     /* max working set: 64 GB                */
 
 /* Convert ops/sec to MB/s for stride test (each op = 8 bytes) */
 #define OPS_TO_MBS(ops) ((ops) * 8.0 / 1048576.0)
@@ -1464,7 +1465,7 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 
 				/* allocate per-core array */
 				size_t array_bytes =
-					(size_t)size_mb * 1024 * 1024;
+					(size_t)size_mb * 1024UL * 1024UL;
 				size_t count = array_bytes / sizeof(uint64_t);
 
 				uint64_t *arr = NULL;
@@ -1735,24 +1736,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* ---- platform checks (must come before any sysfs write) ---- */
-	if (geteuid() != 0) {
-		dprintf("ERROR: this tool must be run as root (try: sudo %s ...)\n",
-			argv[0]);
-		dprintf("       It needs write access to /sys/devices/system/cpu/*/cpufreq/\n");
-		return 1;
-	}
-#ifndef __linux__
-	dprintf("ERROR: this tool is Linux-only (cpufreq sysfs required).\n");
-# if defined(__APPLE__)
-	dprintf("       On macOS use a Linux VM, a remote Linux box, or "
-		"Docker with --privileged + /sys mounted.\n");
-# else
-	dprintf("       No cpufreq sysfs interface is available on this platform.\n");
-# endif
-	return 1;
-#endif
-
 	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rPy")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
@@ -1803,6 +1786,41 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* ---- detect L3 cache (pre-root: doesn't need root) ---- */
+	long l3_bytes = detect_l3_size();
+	if (auto_size && l3_bytes > 0) {
+		size_mb = (int)((l3_bytes * 2) / (1024 * 1024));
+		if (size_mb < 16)
+			size_mb = 16;  /* minimum 16 MB */
+	}
+	/* Bound-check size_mb. The cast to size_t is deliberately BEFORE the
+	 * multiplication (1024UL * 1024UL keeps each factor explicitly unsigned
+	 * long) so the result is never computed in 32-bit int — that would
+	 * overflow at size_mb == 2048. */
+	if (size_mb < 1 || size_mb > MAX_SIZE_MB) {
+		dprintf("ERROR: -m %d out of range [1, %d] MB\n",
+			size_mb, MAX_SIZE_MB);
+		return 1;
+	}
+
+	/* ---- platform checks (must come before any sysfs write) ---- */
+	if (geteuid() != 0) {
+		dprintf("ERROR: this tool must be run as root (try: sudo %s ...)\n",
+			argv[0]);
+		dprintf("       It needs write access to /sys/devices/system/cpu/*/cpufreq/\n");
+		return 1;
+	}
+#ifndef __linux__
+	dprintf("ERROR: this tool is Linux-only (cpufreq sysfs required).\n");
+# if defined(__APPLE__)
+	dprintf("       On macOS use a Linux VM, a remote Linux box, or "
+		"Docker with --privileged + /sys mounted.\n");
+# else
+	dprintf("       No cpufreq sysfs interface is available on this platform.\n");
+# endif
+	return 1;
+#endif
+
 	/* ---- cpufreq sysfs check (post-getopt: needs `cpu` value) ---- */
 	char cpufreq_path[256];
 	snprintf(cpufreq_path, sizeof(cpufreq_path),
@@ -1819,13 +1837,7 @@ int main(int argc, char **argv)
 	}
 	closedir(cpufreq_dir);
 
-	/* ---- detect L3 cache ---- */
-	long l3_bytes = detect_l3_size();
-	if (auto_size && l3_bytes > 0) {
-		size_mb = (int)((l3_bytes * 2) / (1024 * 1024));
-		if (size_mb < 16)
-			size_mb = 16;  /* minimum 16 MB */
-	} else if (l3_bytes > 0 && (long)size_mb * 1024 * 1024 < l3_bytes) {
+	if (l3_bytes > 0 && (size_t)size_mb * 1024UL * 1024UL < (size_t)l3_bytes) {
 		dprintf("WARN: array size (%d MB) < L3 cache (%ld MB)\n",
 			size_mb, l3_bytes / (1024 * 1024));
 		dprintf("      Working set may fit in L3 → test may not be "
@@ -1863,7 +1875,7 @@ int main(int argc, char **argv)
 	}
 
 	/* ---- allocate ---- */
-	size_t array_bytes = (size_t)size_mb * 1024 * 1024;
+	size_t array_bytes = (size_t)size_mb * 1024UL * 1024UL;
 	size_t count       = array_bytes / sizeof(uint64_t);
 
 	uint64_t *arr = NULL;
