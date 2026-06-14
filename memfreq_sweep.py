@@ -40,6 +40,9 @@ _ANY_HEADER = re.compile(r"^# --- [^-].* ---$")
 #   "# chase    plateau_breakpoint: \u2014  (no plateau; throughput keeps rising ...)"
 _PLATEAU_VALUE = re.compile(r"^(\d+)\s*MHz\s*\(slope ratio ([0-9.]+)x,\s*"
                             r"95%\s*sweet spot (\d+)\s*MHz\)\s*$")
+# Power sub-row: "45W at sweet spot (savings: 36% vs 71W at 2600 MHz)"
+_POWER_VALUE = re.compile(r"^([0-9.]+)W\s+at sweet spot\s+"
+                          r"\(savings:\s+([0-9.]+)%")
 
 
 def run_bench(extra_args: list[str]) -> str:
@@ -131,14 +134,22 @@ def _parse_plateau_block(lines):
     Each row: `# <workload>  plateau_breakpoint: <value>  (annotation)`
     where value is either `N MHz  (slope ratio X.Xx, 95% sweet spot N MHz)`
     or the em-dash + `(no plateau; ...)` annotation.
+
+    Power sub-rows follow on the next line as
+    `# <workload>  power: NNNW at sweet spot (savings: NN% vs NNNW at NNNN MHz)`
+    or `# <workload>  power: N/A (...)`. We attach them to the matching workload
+    entry (None when absent).
     """
     rows = []
+    # First pass: collect all workload rows.
     for ln in lines:
         if not ln.startswith("#"):
             continue
         body = ln[1:].strip()
         if not body or body.startswith("---"):
             continue
+        if "power:" in body:
+            continue  # handled in second pass
         if "plateau_breakpoint:" not in body:
             continue
         # Split into "<workload>  plateau_breakpoint: <rest>"
@@ -155,6 +166,8 @@ def _parse_plateau_block(lines):
                 "slope_ratio": None,
                 "sweet_spot_mhz": None,
                 "has_plateau": False,
+                "power_w_or_null": None,
+                "savings_pct_or_null": None,
             })
             continue
         m = _PLATEAU_VALUE.match(rest)
@@ -165,6 +178,8 @@ def _parse_plateau_block(lines):
                 "slope_ratio": float(m.group(2)),
                 "sweet_spot_mhz": int(m.group(3)),
                 "has_plateau": True,
+                "power_w_or_null": None,
+                "savings_pct_or_null": None,
             })
         else:
             # Unrecognized annotation — record the em-dash fallback so the
@@ -175,7 +190,32 @@ def _parse_plateau_block(lines):
                 "slope_ratio": None,
                 "sweet_spot_mhz": None,
                 "has_plateau": False,
+                "power_w_or_null": None,
+                "savings_pct_or_null": None,
             })
+    # Second pass: attach power sub-rows to their workload.
+    for ln in lines:
+        if not ln.startswith("#") or "power:" not in ln:
+            continue
+        body = ln[1:].strip()
+        try:
+            wl_part, rest = body.split("power:", 1)
+        except ValueError:
+            continue
+        workload = wl_part.strip()
+        # Find the matching row.
+        for row in rows:
+            if row["workload"] != workload:
+                continue
+            if "N/A" in rest:
+                # No data — leave both fields None.
+                break
+            # Parse "NNNW at sweet spot (savings: NN% vs NNNW at NNNN MHz)".
+            m = _POWER_VALUE.match(rest.strip())
+            if m:
+                row["power_w_or_null"] = float(m.group(1))
+                row["savings_pct_or_null"] = float(m.group(2))
+            break
     return rows
 
 
@@ -449,7 +489,67 @@ def visualize(data: dict):
         print("  → CHASE sweet spot is high — possible prefetcher effect")
         print("    or L3 large enough to hold the working set.")
         print("    Try larger array (-m 512).")
-    print()
+
+    # --- Sweet-spot CI (only when -r was used) ---
+    if data.get("sweet_spot_ci"):
+        print("=" * 78)
+        print("  SWEET-SPOT CONFIDENCE INTERVAL  (bootstrap, B=1000, requires -r)")
+        print("=" * 78)
+        print(f"  {'workload':<10}  {'sweet':>7}  {'[low, high]':>16}  {'method':<15}")
+        for r in data["sweet_spot_ci"]:
+            sweet = r["sweet_mhz"]
+            low = r["low_mhz"]
+            high = r["high_mhz"]
+            if sweet is None:
+                rng = f"[{EMDASH}, {EMDASH}]"
+                sweet_s = EMDASH
+            else:
+                rng = f"[{low}, {high}]"
+                sweet_s = f"{sweet}"
+            print(f"  {r['workload']:<10}  {sweet_s:>7}  {rng:>16}  {r['method']:<15}")
+        print()
+
+    # --- Sensitivity (only when -L was used) ---
+    if data.get("sensitivity"):
+        print("=" * 78)
+        print("  THRESHOLD SENSITIVITY  (sweet spot at each threshold, requires -L)")
+        print("=" * 78)
+        # Find a workload to determine threshold list (assume all workloads share it).
+        for wl, rows in data["sensitivity"].items():
+            if not rows:
+                continue
+            print(f"\n  Workload: {wl}")
+            print(f"  {'threshold':>10}  {'sweet_MHz':>10}")
+            for row in rows:
+                spot = row["sweet_spot_mhz_or_null"]
+                spot_s = f"{spot}" if spot is not None else EMDASH
+                print(f"  {row['threshold']:>10.2f}  {spot_s:>10}")
+        print()
+
+    # --- Plateau (default on, suppressed by -P) ---
+    if data.get("plateau"):
+        print("=" * 78)
+        print("  PLATEAU DETECTION  (piecewise-linear breakpoint)")
+        print("=" * 78)
+        print(f"  {'workload':<10}  {'breakpoint':>11}  {'slope':>6}  "
+              f"{'power@ss':>9}  {'savings':>8}")
+        for r in data["plateau"]:
+            if r["has_plateau"]:
+                bp = f"{r['breakpoint_mhz_or_null']}"
+                slope = f"{r['slope_ratio']:.1f}x"
+            else:
+                bp = EMDASH
+                slope = EMDASH
+            pw = r.get("power_w_or_null")
+            sav = r.get("savings_pct_or_null")
+            pw_s = f"{pw:.0f}W" if pw is not None else EMDASH
+            sav_s = f"{sav:.0f}%" if sav is not None else EMDASH
+            print(f"  {r['workload']:<10}  {bp:>11}  {slope:>6}  "
+                  f"{pw_s:>9}  {sav_s:>8}")
+        print()
+        print("  → slope_ratio > 2.0 ⇒ real plateau (memory-bound signal).")
+        print("  → savings = power saved by running at sweet spot vs. max freq.")
+        print()
 
 
 def compare_runs(file_paths: list[str]) -> int:
