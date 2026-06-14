@@ -909,8 +909,8 @@ sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
 | `stats.c` / `stats.h` | 统计辅助函数（甜点、平台期、bootstrap CI） |
 | `memfreq_sweep.py` | Python 运行器 + ASCII 可视化 + JSON 导出 |
 | `Makefile` | 构建 `memfreq_bench` 和 `test_stats` |
-| `run_all_tests.sh` | 一键测试套件（7 个预定义场景，~15-40 分钟） |
-| `run_full_sweep.sh` | 全量扫描（stride × 核数 × NUMA × 缓存层次，~30 小时，`--quick` ~5 小时） |
+| `run_all_tests.sh` | 一键测试套件（7 个预定义场景，默认模式 ~2.5-5 小时，`--quick` 模式 ~20-45 分钟） |
+| `run_full_sweep.sh` | 全量扫描（stride × 核数 × NUMA × 缓存层次，默认 ~30 小时，`--quick` ~3 小时，只跑 Suites 1/3/5/7） |
 | `tests/test_stats.c` | stats.c 的 C 单元测试 |
 | `tests/test_stats_output.sh` | Shell 测试框架（77 个断言） |
 | `docs/memfreq-bench.md` | 本文档 |
