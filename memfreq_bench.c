@@ -54,6 +54,7 @@
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
 #define MAX_NODES 16          /* max NUMA nodes                        */
 #define MAX_USER_THRESHOLDS 16 /* max entries in -L threshold list     */
+#define MAX_SAMPLES 16        /* max samples per freq (bootstrap)      */
 
 /* Convert ops/sec to MB/s for stride test (each op = 8 bytes) */
 #define OPS_TO_MBS(ops) ((ops) * 8.0 / 1048576.0)
@@ -1743,7 +1744,7 @@ static void bootstrap_sweet_spot_ci(
     int *out_low_khz, int *out_high_khz)
 {
 	int sweets[1000];          /* B <= 1000, fixed-size */
-	double resample[16];       /* MAX_SAMPLES, fixed-size */
+	double resample[MAX_SAMPLES];   /* per-iteration resample buffer      */
 	double mops_b[MAX_FREQS];
 	unsigned int state = 42u;  /* deterministic seed */
 
