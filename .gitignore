@@ -1,4 +1,5 @@
 memfreq_bench
+test_stats
 *.o
 memfreq_results.json
 *.pyc
