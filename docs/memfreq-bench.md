@@ -254,6 +254,10 @@ sudo ./memfreq_bench -C
 | `-f` | — | 启用 cache flush（clflush/dc cvac） |
 | `-B NODE` | -1 | 将数组绑定到指定 NUMA 节点 |
 | `-F` | — | 强制运行（跳过系统空闲检查） |
+| `-T FRAC` | 0.95 | sweet-spot 阈值,(0, 1] 范围内 |
+| `-L LIST` | — | 多阈值扫描,逗号分隔,例如 `0.8,0.9,0.95,0.99`,最多 16 个 |
+| `-r` | — | 输出每样本原始数据(用于自定义分析) |
+| `-P` | — | 抑制 plateau 检测输出(默认开启) |
 
 ### 可视化
 
@@ -269,7 +273,12 @@ sudo python3 memfreq_sweep.py --json
 
 # 解析已有输出
 python3 memfreq_sweep.py --file results.txt
+
+# 跨 run 对比（多次 sweep 的甜点稳定性）
+python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 ```
+
+`--compare` 自动检测每个文件是 JSON 还是 TSV,输出每个 workload 的 mean / std / min / max / range across runs。JSON 来自 `memfreq_sweep.py --json`(单次 sweep 后自动产生)。
 
 ---
 
@@ -300,6 +309,73 @@ python3 memfreq_sweep.py --file results.txt
 - **stride_MBs**：显式带宽报告（MB/s），比 Mops 更直观
 - **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
 
+### 新增统计段
+
+数据行之后,会按顺序追加四类 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
+
+#### 1. `# --- per-freq stats (workload) ---`
+
+每个频率点的 min / max / median / IQR。IQR = Q3 − Q1。看 IQR 列判断测量噪声：
+
+```
+# --- per-freq stats (stride) ---
+# freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps
+# 800       140.1     142.5     141.3        1.2
+# 1200      155.0     157.2     156.0        1.5
+# ...
+```
+
+- IQR 全程 < 1% → 机器安静,数据可信
+- 低频点 IQR 突然变大 → 该频点测量置信度低,谨慎使用
+
+#### 2. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
+
+不同阈值下的甜点。判断决策鲁棒性：
+
+```
+# --- sensitivity (stride) ---
+# threshold  sweet_spot_MHz
+# 0.80       1800
+# 0.85       1900
+# 0.90       1950
+# 0.95       2000
+# 0.99       2400
+```
+
+- 0.80 和 0.99 给的甜点差 < 100 MHz → 决策鲁棒
+- 差 > 500 MHz → 工作负载对阈值敏感,挑高的阈值更安全
+
+#### 3. `# --- plateau ---`
+
+分段线性检测,给出 `plateau_breakpoint` 和 `slope ratio`：
+
+```
+# --- plateau ---
+# stride   plateau_breakpoint: 2050 MHz  (slope ratio 18.3x, 95% sweet spot 2000 MHz)
+# chase    plateau_breakpoint: 2100 MHz  (slope ratio 22.1x, 95% sweet spot 2000 MHz)
+# compute  plateau_breakpoint: —  (no plateau; throughput keeps rising with frequency)
+```
+
+- `slope ratio > 2.0` → 有明显平台期,mem-bound 信号强
+- `—`  → 无平台,吞吐随频率持续上升（典型 compute-bound）
+- 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
+
+#### 4. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
+
+每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）；Python `--compare` 不需要这个。
+
+```
+# --- raw_samples (stride) ---
+# freq_MHz  sample_idx  mops
+# 800       1           140.5
+# 800       2           141.2
+# 800       3           140.8
+# 1200      1           155.0
+# ...
+```
+
+行数 = `n_freqs × nsamples`。20 频点 × 5 样本 = 100 行/workload。
+
 ### 关键指标
 
 | 看什么 | 含义 |
@@ -318,7 +394,7 @@ python3 memfreq_sweep.py --file results.txt
 甜点在 80% 频率 → 功耗节省有限，工作负载对频率敏感
 ```
 
-95% 阈值可通过修改代码中的 `THRESHOLD` 常量调整。
+95% 阈值可通过 `-T FRAC` 调整（默认 0.95）。想看甜点对阈值的敏感度,加 `-L 0.8,0.9,0.95,0.99` 触发 `# --- sensitivity ---` 块。想知道这个 95% 甜点跟独立分段线性检测是否一致,看 `# --- plateau ---` 块里的 `plateau_breakpoint`;两个方法结论一致 = 强证据。判断测量噪声看 `# --- per-freq stats ---` 的 IQR 列。
 
 ### compute_% 作为 sanity check
 
@@ -673,6 +749,7 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 6. **chase 的 100K 内循环**：如果 DRAM 极快（如 HBM），100K 次 × 50ns = 5ms 就结束，外层 `now()` 的调用开销（~15ns/call）占比 ~0.3%，可忽略
 7. **TLB 噪音**：4KB page 下 chase 的测量延迟包含 page walk 开销（~40ns/access），绝对延迟被高估 ~40%。不影响频率-吞吐的相对比较，需要绝对值请用 hugepage
 8. **cpufreq 联动**：同 cluster 内的核可能频率联动（如 ARM 的 cpufreq policy 按 cluster 分组），设置 cpu0 的频率可能同时影响 cpu0-3
+9. **统计输出默认开启**：per-freq min/max/IQR 和 plateau 检测默认会输出到结果末尾（`#`-prefixed 块,不影响数据行）。想看 sweep 的甜点稳定性,配合 `memfreq_sweep.py --compare` 比较多次 JSON 结果
 
 ---
 
