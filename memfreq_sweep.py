@@ -14,11 +14,13 @@ Requires: root (for cpufreq writes), memfreq_bench compiled in same dir.
 import argparse
 import json
 import os
+import statistics
 import subprocess
 import sys
 
 BENCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memfreq_bench")
 BAR_W = 40
+EMDASH = "\u2014"  # em-dash for missing data (compute, n=1 std)
 
 
 def run_bench(extra_args: list[str]) -> str:
@@ -158,6 +160,58 @@ def visualize(data: dict):
     print()
 
 
+def compare_runs(file_paths: list[str]) -> int:
+    """Read N result files (JSON or TSV) and print cross-run sweet-spot stats.
+
+    Stdlib only. Each file is autodetected: JSON if the first non-whitespace
+    char is '{', else parsed as TSV via the existing parse_output(). For
+    n >= 2, std uses sample stdev (n-1 denominator). For n = 1, std is
+    reported as an em-dash (matching the C code's "no data" convention).
+    """
+    runs: list[dict] = []
+    for path in file_paths:
+        with open(path) as fh:
+            text = fh.read()
+        if text.lstrip().startswith("{"):
+            runs.append(json.loads(text))
+        else:
+            runs.append(parse_output(text))
+
+    if not runs:
+        print("ERROR: no input files", file=sys.stderr)
+        return 1
+
+    # Normalize: --json output uses key "sweet_spot_mhz"; parse_output uses
+    # "sweet". Pick whichever is present.
+    normalized: list[dict] = []
+    for r in runs:
+        sweet = r.get("sweet") or r.get("sweet_spot_mhz") or {}
+        normalized.append({"sweet": sweet})
+
+    workloads = ["stride", "chase", "random", "compute"]
+    print("=" * 78)
+    print(f"  Cross-run sweet-spot comparison ({len(normalized)} runs)")
+    print("=" * 78)
+    print(f"{'workload':<10} {'mean_MHz':>10} {'std_MHz':>10} "
+          f"{'min_MHz':>10} {'max_MHz':>10} {'range_MHz':>10}")
+    for w in workloads:
+        values = [n["sweet"].get(w) for n in normalized
+                  if isinstance(n["sweet"].get(w), (int, float))]
+        if not values:
+            print(f"{w:<10} {EMDASH:>10} {EMDASH:>10} {EMDASH:>10} "
+                  f"{EMDASH:>10} {EMDASH:>10}")
+            continue
+        mean_v = statistics.mean(values)
+        std_v = statistics.stdev(values) if len(values) >= 2 else None
+        min_v = min(values)
+        max_v = max(values)
+        std_cell = f"{std_v:>10.1f}" if std_v is not None else f"{EMDASH:>10}"
+        print(f"{w:<10} {mean_v:>10.0f} {std_cell} "
+              f"{min_v:>10.0f} {max_v:>10.0f} {max_v - min_v:>10.0f}")
+    print()
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run memfreq_bench and visualize sweet spot")
@@ -165,7 +219,13 @@ def main():
                         help="Parse existing output file instead of running")
     parser.add_argument("--json", "-j", action="store_true",
                         help="Also save results as JSON")
+    parser.add_argument("--compare", "-c", nargs="+", metavar="FILE",
+                        help="Compare N result files (JSON or TSV) and "
+                             "report cross-run sweet-spot statistics")
     args, extra = parser.parse_known_args()
+
+    if args.compare:
+        return compare_runs(args.compare)
 
     if args.file:
         with open(args.file) as fh:

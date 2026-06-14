@@ -1,0 +1,10 @@
+{
+  "meta": {"cpu": "0", "array": "128MB", "stride": "8", "duration": "1s"},
+  "sweet_spot_mhz": {"stride": 2050, "chase": 2000},
+  "data": [
+    {"freq_mhz": 800,  "stride_mops": 141.0, "stride_pct": 91.0, "chase_mops": 10.9, "chase_pct": 87.0, "compute_mops": 79.0, "compute_pct": 25.0},
+    {"freq_mhz": 1200, "stride_mops": 152.0, "stride_pct": 97.0, "chase_mops": 11.9, "chase_pct": 94.0, "compute_mops": 119.0, "compute_pct": 37.0},
+    {"freq_mhz": 1600, "stride_mops": 154.0, "stride_pct": 98.0, "chase_mops": 12.3, "chase_pct": 97.0, "compute_mops": 161.0, "compute_pct": 51.0},
+    {"freq_mhz": 2050, "stride_mops": 156.5, "stride_pct": 100.0, "chase_mops": 12.7, "chase_pct": 100.0, "compute_mops": 205.0, "compute_pct": 64.0}
+  ]
+}
