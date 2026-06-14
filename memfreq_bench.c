@@ -1724,6 +1724,32 @@ int main(int argc, char **argv)
 	int     no_plateau     = 0;     /* -P: suppress plateau block */
 	int   opt;
 
+	/* ---- help: short-circuit before any privilege check ---- */
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+			usage(argv[0]);
+			return 0;
+		}
+	}
+
+	/* ---- platform checks (must come before any sysfs write) ---- */
+	if (geteuid() != 0) {
+		dprintf("ERROR: this tool must be run as root (try: sudo %s ...)\n",
+			argv[0]);
+		dprintf("       It needs write access to /sys/devices/system/cpu/*/cpufreq/\n");
+		return 1;
+	}
+#ifndef __linux__
+	dprintf("ERROR: this tool is Linux-only (cpufreq sysfs required).\n");
+# if defined(__APPLE__)
+	dprintf("       On macOS use a Linux VM, a remote Linux box, or "
+		"Docker with --privileged + /sys mounted.\n");
+# else
+	dprintf("       No cpufreq sysfs interface is available on this platform.\n");
+# endif
+	return 1;
+#endif
+
 	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rP")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
@@ -1772,6 +1798,22 @@ int main(int argc, char **argv)
 		default:  usage(argv[0]); return 1;
 		}
 	}
+
+	/* ---- cpufreq sysfs check (post-getopt: needs `cpu` value) ---- */
+	char cpufreq_path[256];
+	snprintf(cpufreq_path, sizeof(cpufreq_path),
+	         "/sys/devices/system/cpu/cpu%d/cpufreq/", cpu);
+	DIR *cpufreq_dir = opendir(cpufreq_path);
+	if (!cpufreq_dir) {
+		dprintf("ERROR: cpufreq sysfs path not found for cpu %d: %s\n",
+			cpu, cpufreq_path);
+		dprintf("       Is the cpufreq driver loaded? Check:\n");
+		dprintf("         ls %s\n", cpufreq_path);
+		dprintf("         cat /sys/devices/system/cpu/cpu%d/cpufreq/scaling_driver\n",
+			cpu);
+		return 1;
+	}
+	closedir(cpufreq_dir);
 
 	/* ---- detect L3 cache ---- */
 	long l3_bytes = detect_l3_size();
