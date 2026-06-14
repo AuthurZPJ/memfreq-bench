@@ -1694,6 +1694,8 @@ static void usage(const char *prog)
 "  -L LIST     Multi-threshold sweep, e.g. 0.8,0.9,0.95,0.99 (max 16)\n"
 "  -r          Emit per-sample raw data (for custom analysis)\n"
 "  -P          Suppress plateau detection block\n"
+"  -y          Summary mode: data table + sweet-spot headlines only\n"
+"              (skips per-freq stats, CI, sensitivity, plateau, raw samples)\n"
 "  -h          This help\n", prog);
 }
 
@@ -1722,6 +1724,7 @@ int main(int argc, char **argv)
 	double  user_thresholds[MAX_USER_THRESHOLDS];
 	int     emit_raw       = 0;     /* -r: per-sample data in output */
 	int     no_plateau     = 0;     /* -P: suppress plateau block */
+	int     summary        = 0;     /* -y: summary mode (skip optional blocks) */
 	int   opt;
 
 	/* ---- help: short-circuit before any privilege check ---- */
@@ -1750,7 +1753,7 @@ int main(int argc, char **argv)
 	return 1;
 #endif
 
-	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rP")) != -1) {
+	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rPy")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'N': ncpu      = atoi(optarg); break;
@@ -1794,6 +1797,7 @@ int main(int argc, char **argv)
 		      }
 		case 'r': emit_raw   = 1;            break;
 		case 'P': no_plateau = 1;            break;
+		case 'y': summary    = 1;            break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
@@ -2357,6 +2361,7 @@ int main(int argc, char **argv)
 	printf("#   compute %% ≈ freq ratio                → sanity check (pure compute)\n");
 
 	/* ---- per-freq stats blocks ---- */
+	if (!summary) {
 	printf("#\n# --- per-freq stats (stride) ---\n");
 	printf("# freq_MHz  min_Mops  max_Mops  median_Mops  iqr_Mops\n");
 	for (int fi = 0; fi < nfreqs; fi++) {
@@ -2404,7 +2409,8 @@ int main(int argc, char **argv)
 		       results[fi].compute_max  / 1e6,
 		       results[fi].compute_tput / 1e6,
 		       results[fi].compute_iqr  / 1e6);
-	}
+		}
+	}  /* end if (!summary) */
 
 	/* ---- sweet-spot CI block ----
 	 * Quantifies run-to-run uncertainty on the 95% sweet spot by
@@ -2419,7 +2425,7 @@ int main(int argc, char **argv)
 	 * statistics, and a confidence interval on the sweet spot has
 	 * to propagate resampled medians, not raw IQR. The bootstrap
 	 * does this correctly. */
-	if (raw) {
+	if (raw && !summary) {
 		const char *ci_labels[] = {"stride", "chase", "random", "compute"};
 		double *ci_arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
 		int ci_enabled[]       = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
@@ -2484,7 +2490,7 @@ int main(int argc, char **argv)
 	 * user can see how sensitive the decision is to threshold choice.
 	 * Per workload: stride always; chase/random only if that workload ran.
 	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
-	if (n_user_thresholds > 0) {
+	if (n_user_thresholds > 0 && !summary) {
 		const char *labels[] = {"stride", "chase", "random", "compute"};
 		double *arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
 		int     enabled[]   = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
@@ -2510,7 +2516,7 @@ int main(int argc, char **argv)
 	 * piecewise-linear breakpoint that minimizes SSE and report
 	 * the slope ratio. slope_ratio > 2.0 ⇒ real plateau (mem-bound);
 	 * < 2.0 ⇒ throughput keeps rising with frequency (compute-bound). */
-	if (!no_plateau) {
+	if (!no_plateau && !summary) {
 		printf("#\n# --- plateau ---\n");
 		struct { const char *name; const double *mops; } workloads[] = {
 			{"stride",  stride_mops},
@@ -2584,7 +2590,7 @@ int main(int argc, char **argv)
 	}
 
 	/* ---- raw samples (only if --emit-raw / -r) ---- */
-	if (raw) {
+	if (raw && !summary) {
 		const char *raw_labels[] = {"stride", "chase", "random", "compute"};
 		int raw_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
 		for (int w = 0; w < 4; w++) {
