@@ -42,11 +42,11 @@ full flag list.
 ## Output
 
 ```
-freq_MHz  stride_Mops  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
-800       152.3        97.2      12.5        98.1     82.1          25.3
-1200      154.1        98.4      12.6        98.8     123.4         37.9
+target_MHz  actual_MHz  stride_Mops  stride_MBs  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
+800         800         152.3        1218.4      97.2      12.5        98.1     82.1          25.3
+1200        1200        154.1        1232.8      98.4      12.6        98.8     123.4         37.9
 ...
-3000      156.6        100.0     12.8        100.0    325.8         100.0
+3000        3000        156.6        1252.8      100.0     12.8        100.0    325.8         100.0
 
 # stride  sweet spot: 800 MHz  (27% of max 3000 MHz)
 # chase   sweet spot: 800 MHz  (27% of max 3000 MHz)
@@ -74,9 +74,9 @@ an issue.
    test is meaningless if the array fits in cache.
 
 2. **Running on macOS / Windows.** The tool needs `/sys/devices/system/cpu/cpu*/cpufreq/`,
-   which is Linux-only. On macOS you'll get a "sched_setaffinity: No such
-   file or directory" and silent zero-output. The fix is a Linux VM, a
-   remote Linux box, or Docker with `--privileged` + `/sys` mounted.
+   which is Linux-only. On macOS you'll get a clear error message:
+   "ERROR: this tool is Linux-only (cpufreq sysfs required)."
+   The fix is a Linux VM, a remote Linux box, or Docker with `--privileged` + `/sys` mounted.
 
 3. **"compute_% doesn't track the frequency ratio"** — the smoking gun
    that the frequency lock didn't take. If you ran with turbo enabled or
@@ -84,8 +84,8 @@ an issue.
    through and your sweet-spot numbers are noise. Re-run with
    `sudo ./memfreq_bench -F` (skip idle gate) and verify the compute_%
    column tracks e.g. f/3000 at each row. The tool will also print a
-   "WARN: compute throughput slope deviates..." at the end if it detects
-   this automatically.
+   "WARN: compute throughput does NOT scale linearly with frequency"
+   at the end if it detects this automatically.
 
 4. **"-r missing → no CI block in output"** — the `# --- sweet-spot CI ---`
    block only appears if you pass `-r` (it needs per-sample data to

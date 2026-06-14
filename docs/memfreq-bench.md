@@ -73,7 +73,7 @@ for (size_t i = 0; i < count; i += stride)
 ### 2. Chase（指针追踪）
 
 ```c
-for (size_t i = 0; i < 100000; i++)
+for (size_t i = 0; i < nnodes; i++)
     p = p->next;    // 必须等上一次 load 完成才能知道下一次的地址
 ```
 
@@ -706,15 +706,17 @@ L3 典型大小：4-64 MB
 ### 频率锁定机制
 
 ```c
-// 写 max 先于 min — 关键顺序！
+// 三步写入 — 关键顺序！
+// 1. 放宽 max 到硬件上限 → range 变成 [old_min, hw_max]（widened）
+// 2. 写 min=khz → range 变成 [khz, hw_max]（always valid since khz ≤ hw_max）
+// 3. 收紧 max=khz → range 变成 [khz, khz]（locked）
 // 如果先写 min=X（X > 当前 max），内核会拒绝：min > max
-// 先写 max=X → range 变成 [old_min, X]（widened）
-// 再写 min=X → range 变成 [X, X]（always valid since X ≤ X）
-sysfs_write("scaling_max_freq", khz);
-sysfs_write("scaling_min_freq", khz);
+sysfs_write("scaling_max_freq", hw_max);   // widen ceiling
+sysfs_write("scaling_min_freq", khz);      // set floor
+sysfs_write("scaling_max_freq", khz);      // tighten ceiling
 ```
 
-程序退出时恢复原始 min/max 范围（分别保存、分别恢复），不影响 governor 的后续行为。
+程序退出时恢复原始 min/max 范围（通过 `freq_cleanup()`，包括 signal handler 和 `atexit`），不影响 governor 的后续行为。
 
 ### Turbo/Boost 处理
 
@@ -843,11 +845,11 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 ## 限制和注意事项
 
 1. **需要 root**：写 cpufreq sysfs 需要 root 权限
-2. **需要 cpufreq 驱动**：如果没有 `scaling_available_frequencies`，程序会报错退出
+2. **需要 cpufreq 驱动**：程序会依次尝试三种频率枚举方式——`scaling_available_frequencies`（离散列表）、acpi_cppc 高低非线性性能值、`cpuinfo_min/max_freq`（范围模式）。三者都不可用时才报错退出
 3. **默认单核**：每个频率点默认只测一个 core，使用 `-N NCPU` 启用多核模式，测试多核访存的带宽饱和效应
 4. **功耗仅记录，不参与甜点判定**：程序会读取 RAPL / hwmon 功率传感器（如有），在 plateau 块输出甜点频率下的功耗和节能百分比。但甜点本身是纯性能角度的判定（95% 最大吞吐）。要更精确的功耗分析，配合 `turbostat`
 5. **stride 的 sum 有数据依赖**：`sum += arr[i]` 限制了流水线深度，但编译器可能展开为 partial sum，实际行为取决于 `-O2` 的优化策略。这不影响结论（仍然是 mem-bound 主导），但精确吞吐数值会因编译器而异
-6. **chase 的 100K 内循环**：如果 DRAM 极快（如 HBM），100K 次 × 50ns = 5ms 就结束，外层 `now()` 的调用开销（~15ns/call）占比 ~0.3%，可忽略
+6. **chase 的内循环**：每次遍历全部 `nnodes` 个节点（数组大小 / 64B），外层 `now()` 的调用开销（~15ns/call）占比极小，可忽略
 7. **TLB 噪音**：4KB page 下 chase 的测量延迟包含 page walk 开销（~40ns/access），绝对延迟被高估 ~40%。不影响频率-吞吐的相对比较，需要绝对值请用 hugepage
 8. **cpufreq 联动**：同 cluster 内的核可能频率联动（如 ARM 的 cpufreq policy 按 cluster 分组），设置 cpu0 的频率可能同时影响 cpu0-3
 9. **统计输出默认开启**：per-freq min/max/IQR 和 plateau 检测默认会输出到结果末尾（`#`-prefixed 块,不影响数据行）。想看 sweep 的甜点稳定性,配合 `memfreq_sweep.py --compare` 比较多次 JSON 结果
@@ -907,5 +909,12 @@ sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
 | 文件 | 说明 |
 |------|------|
 | `memfreq_bench.c` | C 基准测试（需 root + cpufreq） |
+| `stats.c` / `stats.h` | 统计辅助函数（甜点、平台期、bootstrap CI） |
 | `memfreq_sweep.py` | Python 运行器 + ASCII 可视化 + JSON 导出 |
+| `Makefile` | 构建 `memfreq_bench` 和 `test_stats` |
+| `run_all_tests.sh` | 一键测试套件（6 个预定义场景，~10-30 分钟） |
+| `run_full_sweep.sh` | 全量扫描（stride × 核数 × NUMA，~3-4 小时） |
+| `tests/test_stats.c` | stats.c 的 C 单元测试 |
+| `tests/test_stats_output.sh` | Shell 测试框架（77 个断言） |
 | `docs/memfreq-bench.md` | 本文档 |
+| `docs/memfreq-sweep.md` | Python 可视化工具使用说明 |
