@@ -44,7 +44,6 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 #include <ctype.h>
-#include <signal.h>
 #ifdef __linux__
 #include <linux/mempolicy.h>
 #endif
