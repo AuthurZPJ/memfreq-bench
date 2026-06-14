@@ -181,10 +181,7 @@ cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
 # 输出: 0,96  → cpu 0 和 cpu 96 共享同一物理核
 
 # 隔离 SMT 兄弟（关闭每个物理核的第二个 SMT 线程）
-for s in $(ls /sys/devices/system/cpu/cpu*/topology/thread_siblings_list \
-           | xargs -I{} sh -c 'cut -d, -f2 {}' | sort -u); do
-    echo 0 > /sys/devices/system/cpu/cpu$s/online
-done
+echo off > /sys/devices/system/cpu/smt/control
 
 # 测试完成后恢复
 echo on > /sys/devices/system/cpu/smt/control
