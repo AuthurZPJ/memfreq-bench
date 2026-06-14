@@ -568,7 +568,7 @@ bench_stride(const uint64_t *arr, size_t count, size_t stride, double secs)
 	}
 	double elapsed = now() - start;
 	/* "accesses per second" = total cache line loads / time */
-	return (double)iterations * (count / stride) / elapsed;
+	return (double)iterations * ((double)count / stride) / elapsed;
 }
 
 /* Flush-enabled stride: clflush/dc cvac after each read */
@@ -589,7 +589,7 @@ bench_stride_flush(const uint64_t *arr, size_t count, size_t stride,
 		iterations++;
 	}
 	double elapsed = now() - start;
-	return (double)iterations * (count / stride) / elapsed;
+	return (double)iterations * ((double)count / stride) / elapsed;
 }
 
 /* ------------------------------------------------------------------ */
