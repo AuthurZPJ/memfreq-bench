@@ -476,12 +476,20 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 ### 关键指标
 
-| 看什么 | 含义 |
-|--------|------|
-| stride_% 在低频时仍 ≥95% | 顺序内存访问是 mem-bound，降频几乎无损 |
-| chase_% 在低频时仍 ≥95% | 随机内存访问是 mem-bound，降频几乎无损 |
-| compute_% ≈ freq 比 | sanity check 通过，频率锁定正确 |
-| stride/chase_% 随频率线性增长 | 该工作负载有 compute 成分，降频需谨慎 |
+按输出顺序（数据行 → 5 个统计块）排列的速查表——每行都回答一个独立问题：
+
+| 看什么 | 含义 | 出现位置 |
+|--------|------|----------|
+| `*_%` 低频 ≥95% | 该 workload mem-bound | 数据行 |
+| `actual_MHz ≈ target_MHz` | 频率锁定成功 | 数据行 |
+| `compute_% ≈ freq_ratio` | sanity check 独立验证 | 数据行 |
+| `iqr_MOps < 1% of median` | 测量噪声低 | `# --- per-freq stats ---` |
+| `CI width < 200 MHz` | 甜点位置鲁棒 | `# --- sweet-spot CI ---`（`-r`）|
+| `0.80 vs 0.99 sweet 差 < 100 MHz` | 阈值选择不敏感 | `# --- sensitivity ---`（`-L`）|
+| `slope ratio > 2.0` | 平台期强 = 强 mem-bound | `# --- plateau ---` |
+| `power: savings: >30%` | **直接答 DVFS 节能量** | `# --- plateau ---` 的 `power:` 行 |
+
+**反向信号**：`stride_%` / `chase_%` 随频率线性增长（高%同频比），说明该 workload 有 compute 成分（不是纯 mem-bound），降频需谨慎——把 `95%` 阈值降到 `99%` 验证决策不会垮（用 `-L 0.95,0.99` 看 sensitivity）。
 
 ### 甜点判定
 
