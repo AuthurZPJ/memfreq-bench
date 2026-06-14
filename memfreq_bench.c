@@ -543,6 +543,19 @@ static int boost_enable(void)
 /* once the working set exceeds L3.  The CPU stalls on DRAM.           */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* The "sink" pattern: store the per-iteration sum/x to a volatile     */
+/* global to prevent the compiler from eliding the entire timing loop. */
+/*                                                                     */
+/* `static volatile double sink;` — every write is observable, so the  */
+/* compiler can't constant-fold or DCE the loop. This is the right     */
+/* pattern; the broken alternative `*(volatile T*)&local` (cast a      */
+/* non-volatile local to volatile and read through the pointer) is the */
+/* one that has known compiler bugs (gcc -O2 can still eliminate the    */
+/* load because the "volatile" qualifier is on the read, not the        */
+/* underlying object).                                                  */
+/* ------------------------------------------------------------------ */
+
 static volatile double sink;
 
 static double __attribute__((noinline))
@@ -659,6 +672,9 @@ static struct pnode *build_chase(size_t nnodes)
 {
 	struct pnode *nodes;
 
+	/* Returns NULL on failure (caller checks). The posix_memalign return
+	 * value is the only failure indicator; on success nodes is set, on
+	 * failure it is left unchanged but we return NULL without touching it. */
 	if (posix_memalign((void **)&nodes, CL, nnodes * sizeof(*nodes)))
 		return NULL;
 
@@ -1332,7 +1348,7 @@ struct mc_shared {
 		double compute[MAX_FREQS]; /* per-freq compute tput     */
 		int actual_khz[MAX_FREQS]; /* actual freq observed      */
 	} per_core[MAX_CPUS];
-	volatile int ready[MAX_CPUS];      /* 1 = child done            */
+	volatile int ready[MAX_CPUS];      /* 1 = child done (sync flag)        */
 };
 
 /*
