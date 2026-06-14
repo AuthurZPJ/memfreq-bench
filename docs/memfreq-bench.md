@@ -311,7 +311,9 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 ### 新增统计段
 
-数据行之后,会按顺序追加四类 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
+数据行之后,会按顺序追加 5 个 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
+
+> **注意：** `-f` 启用的 `bench_stride_flush` 工作负载（强制 L3 miss）**不会**出现在统计块里——它的数据只出现在原始数据行(没有单独的 `flush` 列,数据覆盖在 `stride` 行的同列里)。
 
 #### 1. `# --- per-freq stats (workload) ---`
 
@@ -328,49 +330,47 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - IQR 全程 < 1% → 机器安静,数据可信
 - 低频点 IQR 突然变大 → 该频点测量置信度低,谨慎使用
 
-#### 2. `# --- sweet-spot CI ---`
+#### 2. `# --- sweet-spot CI ---`（仅 `-r` 时出现）
 
-每次 sweep 的甜点是单点估计;这个块给出"如果我重跑这个实验,甜点会落在哪"的区间。保证 `low_MHz ≤ sweet_MHz ≤ high_MHz` 恒成立。
+每次 sweep 的甜点是单点估计;这个块给出"如果我重跑这个实验,甜点会落在哪"的区间。
 
 ```
 # --- sweet-spot CI ---
 # workload  sweet_MHz  low_MHz  high_MHz  method
-# stride    2000       1700     2050      iqr_1.96/sqrt(5)
-# chase     2000       1800     2050      iqr_1.96/sqrt(5)
-# random    1800       1700     2000      iqr_1.96/sqrt(5)
+# stride    2000       1500     2050      bootstrap_1000
+# chase     2000       1800     2050      bootstrap_1000
+# random    1800       1700     2000      bootstrap_1000
 # compute   —          —        —         no_plateau
 ```
 
 - `sweet_MHz` = 现有 95% 甜点(标题值,基于 raw median 吞吐)
-- `low_MHz` = 乐观下界(最优情况下能接受多低的频率)
-- `high_MHz` = 保守上界(最坏情况下需要的频率)
-- `method` = 使用的 CI 方法
+- `low_MHz` / `high_MHz` = bootstrap 2.5/97.5 百分位(B = 1000)。可以是 0(没有 resample 命中甜点)或越过 `sweet` 的一侧(重采样中位数偏向另一侧)— 都是真实信号,不再被夹回 headline
+- `method` = `bootstrap_1000`(本项目目前唯一支持的方法)
 
-**两种方法,自动选择:**
+**Bootstrap 法(`-r` 必选)**:有 raw per-sample 数据时使用。`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。方法标签为 `bootstrap_1000`。用确定性 LCG 种子(`state=42`),结果可复现。
 
-1. **IQR 法(默认,无 `-r`)**:对每个 freq 计算 `throughput ± α·IQR`,其中 `α = 1.96 / √N`(N = `nsamples`)。用 UPPER 曲线找乐观下界(高频点吞吐更乐观,可以降得更低),用 LOWER 曲线找保守上界(高频点吞吐更悲观,需要更高频率保安全)。方法标签为 `iqr_1.96/sqrt(N)`。
-
-2. **Bootstrap 法(带 `-r` / `--emit-raw`)**:有 raw per-sample 数据时使用。`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。方法标签为 `bootstrap_1000`。用确定性 LCG 种子(`state=42`),结果可复现。
+> **历史:** 早期版本还提供过 `iqr_1.96/sqrt(N)` IQR-based CI,但它把"per-sample 离散度"错当成"甜点位置离散度"做了 CI— 两者是不同统计量,后者必须传播 resampled medians。该方法已删除。如果想看 IQR 的影响,改用 `# --- per-freq stats ---` 块的 `iqr_MOps` 列。
 
 **解读:**
 - `low == sweet == high` → 数据噪声极小(IQR≈0 或只有 1 个样本),单点估计很可靠
 - `low < sweet < high` 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
 - 区间宽(> 500 MHz)→ 测量噪声大,或工作负载对频率敏感;考虑增加 `-n 5` 或更长 `-t`
+- `low > sweet` 或 `high < sweet` → bootstrap 发现 headline 可能偏乐观(或偏悲观)。考虑把甜点定在 `[low, high]` 区间内
 - `— / — / —` + `no_plateau` → 该 workload 无平台(典型 compute-bound),`find_sweet_spot` 返回 0
 
-**示例输出**(`-m 512 -t 3 -n 5`):
+**示例输出**(`-m 512 -t 3 -n 5 -r`):
 
 ```
 # --- sweet-spot CI ---
 # workload  sweet_MHz  low_MHz  high_MHz  method
-# stride    1600       1200     1600      iqr_1.96/sqrt(5)
-# chase     1200       1200     1200      iqr_1.96/sqrt(5)
+# stride    1600       1500     2000      bootstrap_1000
+# chase     1200       1200     1600      bootstrap_1000
 # compute   —          —        —         no_plateau
 ```
 
-`stride` 的乐观下界低于甜点(测量有 spread 时乐观地能降频),`chase` 完全 memory-bound 三者相同(测得完全平),`compute` 无甜点。
+`stride` 的下界比甜点低(测量有 spread 时乐观地能降频),`chase` 在三档不同频点间分布(因为它三档都接近 max),`compute` 无甜点。
 
-**JSON 字段**:每个 workload 一行 `{"workload": "stride", "sweet_mhz": 1600, "low_mhz": 1200, "high_mhz": 1600, "method": "iqr_1.96/sqrt(5)"}`,`null` 表示无数据(对应 em-dash)。
+**JSON 字段**:每个 workload 一行 `{"workload": "stride", "sweet_mhz": 1600, "low_mhz": 1500, "high_mhz": 2000, "method": "bootstrap_1000"}`,`null` 表示无数据(对应 em-dash)。
 
 #### 3. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
 
@@ -403,6 +403,18 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - `slope ratio > 2.0` → 有明显平台期,mem-bound 信号强
 - `—`  → 无平台,吞吐随频率持续上升（典型 compute-bound）
 - 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
+- 每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
+
+```
+# stride   power: 45W at sweet spot (savings: 36% vs 71W at 2600 MHz)
+```
+
+  - `45W` = 甜点频率下采样到的负载功率(RAPL 或 hwmon,µW → W)
+  - `savings: 36%` = (max_freq 功率 − sweet_spot 功率) / max_freq 功率
+  - `vs 71W at 2600 MHz` = 在最高频率点的功率(取最高频且有有效采样的点)
+  - 没有 plateau 时输出 `N/A (no plateau)`;没有功耗传感器时输出 `N/A (no sensor)`
+
+  **意义**：这条直接回答 DVFS 节能 thesis。memory-bound 工作负载的甜点频率低 + 甜点处功率远小于 max_freq 功率 = 实际节能空间。如果甜点处功率只比 max_freq 低 5%,即便频率降到甜点,节能效果也有限。
 
 #### 5. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
 
@@ -418,27 +430,11 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # ...
 ```
 
-行数 = `n_freqs × nsamples`。20 频点 × 5 样本 = 100 行/workload。
-
-#### 6. `# --- plateau ---` 中的 `power:` 行
-
-`# --- plateau ---` 块在每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
-
-```
-# stride   power: 45W at sweet spot (savings: 36% vs 71W at 2600 MHz)
-```
-
-- `45W` = 甜点频率下采样到的负载功率(RAPL 或 hwmon,µW → W)
-- `savings: 36%` = (max_freq 功率 − sweet_spot 功率) / max_freq 功率
-- `vs 71W at 2600 MHz` = 在最高频率点的功率(取最高频且有有效采样的点)
-
-如果该 workload 没有 plateau(compute-bound 典型情况)或机器没有功耗传感器,该行输出 `N/A (no plateau)` 或 `N/A (no sensor)`。
-
-**意义**：这条直接回答 DVFS 节能 thesis。memory-bound 工作负载的甜点频率低 + 甜点处功率远小于 max_freq 功率 = 实际节能空间。如果甜点处功率只比 max_freq 低 5%,即便频率降到甜点,节能效果也有限。
+行数 = `n_freqs × nsamples`。例如 20 频点 × 5 样本 = 100 行/workload。
 
 ### JSON 输出包含的新字段
 
-`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 6 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
+`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 5 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
 
 ```json
 {
@@ -467,9 +463,9 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
     "compute": [...]
   },
   "sweet_spot_ci": [
-    {"workload": "stride",  "sweet_mhz": 2000, "low_mhz": 1700, "high_mhz": 2050, "method": "iqr_1.96/sqrt(5)"},
-    {"workload": "chase",   "sweet_mhz": 2000, "low_mhz": 1800, "high_mhz": 2050, "method": "iqr_1.96/sqrt(5)"},
-    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "iqr_1.96/sqrt(5)"},
+    {"workload": "stride",  "sweet_mhz": 2000, "low_mhz": 1500, "high_mhz": 2050, "method": "bootstrap_1000"},
+    {"workload": "chase",   "sweet_mhz": 2000, "low_mhz": 1800, "high_mhz": 2050, "method": "bootstrap_1000"},
+    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "bootstrap_1000"},
     {"workload": "compute", "sweet_mhz": null, "low_mhz": null, "high_mhz": null, "method": "no_plateau"}
   ],
   "data": [{"freq_mhz": 800, "stride_mops": 141.3, ...}, ...]
