@@ -814,7 +814,7 @@ Usage: sudo ./run_full_sweep.sh [OPTIONS]
 Exhaustive memfreq_bench sweep for deep analysis.
 
 Options:
-  --quick      Run with reduced parameters (2s × 2 samples) for faster results
+  --quick      Suites 1/3/5/7 only, reduced params (2s × 2 samples)
   --yes        Skip confirmation prompt
   --duration N Seconds per test point (default: 5)
   --samples N  Samples per point (default: 5)
