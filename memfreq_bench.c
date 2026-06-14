@@ -50,6 +50,9 @@
 #endif
 
 #include "stats.h"  /* sweet-spot, plateau, bootstrap helpers + MAX_FREQS/MAX_SAMPLES */
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #define CL        64          /* cache line size (bytes)               */
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
@@ -529,6 +532,68 @@ static int boost_enable(void)
 			"0") == 0)
 		return 0;
 	return sysfs_write("/sys/devices/system/cpu/cpufreq/boost", "1");
+}
+/* ------------------------------------------------------------------ */
+/* ---- recovery state for freq/boost restore on abnormal exit ---- */
+static int rec_cpu = -1;            /* CPU whose freq was pinned; -1 = no cleanup needed */
+static int rec_min = -1;            /* saved scaling_min_freq */
+static int rec_max = -1;            /* saved scaling_max_freq */
+static int rec_boost = 0;           /* 1 = turbo was successfully disabled */
+static volatile sig_atomic_t rec_signal = 0; /* signal caught during critical section */
+
+/* Recovery / signal-safe exit                                          */
+/* ------------------------------------------------------------------ */
+static void freq_cleanup(void)
+{
+	if (rec_cpu < 0)
+		return;
+	if (rec_boost)
+		boost_enable();
+	if (rec_max > 0 || rec_min > 0)
+		restore_freq_range(rec_cpu, rec_min, rec_max);
+	rec_cpu = -1;
+}
+static void signal_handler(int sig)
+{
+	rec_signal = sig;
+}
+static void install_recovery_handlers(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = signal_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	atexit(freq_cleanup);
+}
+static void checked_signal(void)
+{
+	if (!rec_signal)
+		return;
+	int sig = rec_signal;
+	rec_signal = 0;
+	signal(sig, SIG_DFL);
+	freq_cleanup();
+	raise(sig);
+}
+/* ------------------------------------------------------------------ */
+/* Random seed (uses /dev/urandom to avoid 1-second granularity)       */
+/* ------------------------------------------------------------------ */
+static void seed_rand(unsigned int mixin)
+{
+	unsigned int rseed;
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0) {
+		if (read(fd, &rseed, sizeof(rseed)) == sizeof(rseed)) {
+			srand(rseed ^ mixin);
+			close(fd);
+			return;
+		}
+		close(fd);
+	}
+	srand((unsigned)(time(NULL) ^ mixin));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1429,10 +1494,16 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 	/* ---- save original frequency range ---- */
 	int orig_min, orig_max;
 	save_freq_range(selected_cpus[0], &orig_min, &orig_max);
+	/* set recovery state for signal handler / atexit */
+	rec_cpu = selected_cpus[0];
+	rec_min = orig_min;
+	rec_max = orig_max;
 
 	/* ---- disable turbo ---- */
 	if (boost_disable() < 0)
 		dprintf("WARN: could not disable turbo boost\n");
+	else
+		rec_boost = 1;
 
 	/* ---- banner ---- */
 	dprintf("=== memfreq_bench (multi-core) ===\n");
@@ -1494,7 +1565,7 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 
 				struct pnode *chase_nodes = NULL;
 				if (do_chase) {
-					srand((unsigned)time(NULL) ^ my_cpu);
+					seed_rand((unsigned int)my_cpu);
 					size_t nn = array_bytes / CL;
 					chase_nodes = build_chase(nn);
 				}
@@ -1547,14 +1618,17 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 		for (int c = 0; c < ncpu; c++) {
 			if (pids[c] > 0) {
 				int status;
-				waitpid(pids[c], &status, 0);
+				while (waitpid(pids[c], &status, 0) < 0 && errno == EINTR)
+					;
 			}
 		}
+		checked_signal();
 	}
 
 	/* ---- restore ---- */
 	boost_enable();
 	restore_freq_range(selected_cpus[0], orig_min, orig_max);
+	rec_cpu = -1;
 
 	/* ---- aggregate results (median across cores per freq) ---- */
 	printf("# %s\n", "memfreq_bench multi-core results");
@@ -1852,6 +1926,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	closedir(cpufreq_dir);
+	install_recovery_handlers();
 
 	if (l3_bytes > 0 && (size_t)size_mb * 1024UL * 1024UL < (size_t)l3_bytes) {
 		dprintf("WARN: array size (%d MB) < L3 cache (%ld MB)\n",
@@ -1914,7 +1989,7 @@ int main(int argc, char **argv)
 
 	struct pnode *chase_nodes = NULL;
 	if (do_chase) {
-		srand((unsigned)time(NULL));
+		seed_rand(0);
 		size_t nnodes = array_bytes / CL;
 		chase_nodes = build_chase(nnodes);
 		if (!chase_nodes) {
@@ -1952,6 +2027,10 @@ int main(int argc, char **argv)
 	/* ---- save original frequency range ---- */
 	int orig_min, orig_max;
 	save_freq_range(cpu, &orig_min, &orig_max);
+	/* set recovery state for signal handler / atexit */
+	rec_cpu = cpu;
+	rec_min = orig_min;
+	rec_max = orig_max;
 
 	/* ---- banner ---- */
 	int proc_nodes[MAX_NODES];
@@ -1998,8 +2077,8 @@ int main(int argc, char **argv)
 	/* ---- disable turbo ---- */
 	if (boost_disable() < 0)
 		dprintf("WARN: could not disable turbo boost\n");
-
-	/* ---- sweep ---- */
+	else
+		rec_boost = 1;
 	struct result *results = calloc(nfreqs, sizeof(*results));
 	double *buf = malloc(nsamples * sizeof(*buf));
 
@@ -2153,6 +2232,7 @@ int main(int argc, char **argv)
 						delta_uw * elapsed;
 			}
 		}
+		checked_signal();
 	}
 	dprintf("\r                                  \r");
 	fflush(stderr);
@@ -2167,6 +2247,7 @@ int main(int argc, char **argv)
 	/* ---- restore ---- */
 	boost_enable();
 	restore_freq_range(cpu, orig_min, orig_max);
+	rec_cpu = -1;
 
 	/* ---- find valid reference (highest successful freq) ---- */
 	int ref = -1;
