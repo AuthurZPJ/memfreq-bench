@@ -170,8 +170,9 @@ detect_topology() {
 
 create_output_dir() {
     if [[ -z "$OUTPUT_DIR" ]]; then
-        OUTPUT_DIR="${SCRIPT_DIR}/results_$(date +%Y%m%d_%H%M%S)"
+        OUTPUT_DIR="${SCRIPT_DIR}/output/results_$(date +%Y%m%d_%H%M%S)"
     fi
+    mkdir -p "${SCRIPT_DIR}/output"
     mkdir -p "$OUTPUT_DIR"
     log_success "Output directory: $OUTPUT_DIR"
 }

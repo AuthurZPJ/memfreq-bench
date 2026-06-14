@@ -15,6 +15,8 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 import statistics
 import subprocess
 import sys
@@ -604,6 +606,128 @@ def compare_runs(file_paths: list[str]) -> int:
     return 0
 
 
+
+def generate_report(dir_path: str, output_path: str | None = None) -> int:
+    """Scan a results directory and generate a Markdown report.
+
+    Args:
+        dir_path: Path to directory containing .txt result files
+        output_path: Path for the report .md file (default: dir/REPORT.md)
+
+    Returns:
+        0 on success, 1 on error
+    """
+    data_dir = Path(dir_path)
+    if not data_dir.is_dir():
+        print(f"ERROR: not a directory: {data_dir}", file=sys.stderr)
+        return 1
+
+    out_path = Path(output_path) if output_path else data_dir / "REPORT.md"
+
+    txt_files = sorted([
+        f for f in data_dir.glob("*.txt")
+        if f.stem not in ("SUMMARY", "COMPARISON", "FULL_REPORT")
+    ])
+    if not txt_files:
+        print(f"ERROR: no test files found in {data_dir}", file=sys.stderr)
+        return 1
+
+    def _ss(data):
+        s = data.get("sweet", {}) or {}
+        st = s.get("stride", None)
+        ch = s.get("chase", None)
+        return (f"{st} MHz" if st else "\u2014"), (f"{ch} MHz" if ch else "\u2014")
+
+    def _max_bw(data):
+        rows = data.get("rows", [])
+        if not rows:
+            return 0.0
+        peak = max((r.get("stride_mops", 0) for r in rows), default=0)
+        return peak * 8.0 / 1.048576
+
+    def _plateau(data):
+        for p in (data.get("plateau", []) or []):
+            if p.get("workload") == "stride" and p.get("breakpoint_mhz_or_null"):
+                return f'{p["breakpoint_mhz_or_null"]} MHz'
+        return "\u2014"
+
+    parsed = []
+    for f in txt_files:
+        try:
+            parsed.append((f.stem, parse_output(f.read_text(encoding="utf-8", errors="replace"))))
+        except Exception as exc:
+            parsed.append((f.stem, None))
+            print(f"  WARN: {f.name}: {exc}", file=sys.stderr)
+
+    groups = {"stride": [], "multicore": [], "numa": [], "special": [], "scale": [], "other": []}
+    for name, data in parsed:
+        if re.match(r'^s\d+$', name):
+            groups["stride"].append((name, data))
+        elif re.match(r'^mc\d+$', name):
+            groups["multicore"].append((name, data))
+        elif re.match(r'^n\d+c_m\d+mem_', name):
+            groups["numa"].append((name, data))
+        elif name in ("random", "flush", "randflush"):
+            groups["special"].append((name, data))
+        elif name.startswith("half_") or name.startswith("full_"):
+            groups["scale"].append((name, data))
+        else:
+            groups["other"].append((name, data))
+
+    lines = [
+        "# memfreq_bench 测试报告",
+        "",
+        f"> **测试目录**: {data_dir.resolve()}",
+        f"> **测试数量**: {len(txt_files)}",
+        f"> **报告生成**: {datetime.now():%Y-%m-%d %H:%M:%S}",
+        "",
+    ]
+
+    # Summary table
+    lines.append("## 测试总览")
+    lines.append("")
+    lines.append("| 测试 | Stride Sweet Spot | Chase Sweet Spot |")
+    lines.append("|------|-----|-----|")
+    for name, data in parsed:
+        if data is None:
+            lines.append(f"| {name} | (解析失败) | (解析失败) |")
+        else:
+            st, ch = _ss(data)
+            lines.append(f"| {name} | {st} | {ch} |")
+    lines.append("")
+
+    # Per-group tables
+    for gname, gtitle in [
+        ("stride", "Stride Grid — 不同 stride 的甜点"),
+        ("multicore", "多核扫描 — 核心数对带宽和甜点的影响"),
+        ("numa", "NUMA 矩阵 — 本地访问 vs 远程访问"),
+        ("special", "特殊访问模式 — Random / Flush"),
+        ("scale", "半核与全核对比"),
+        ("other", "其他测试"),
+    ]:
+        items = groups[gname]
+        if not items:
+            continue
+        lines.append(f"## {gtitle}")
+        lines.append("")
+        lines.append("| 测试 | 最大带宽 MB/s | Stride Spot | Chase Spot | 平台期 |")
+        lines.append("|------|-------------:|:-----------:|:----------:|:------:|")
+        for name, data in items:
+            if data is None:
+                lines.append(f"| {name} | \u2014 | \u2014 | \u2014 | \u2014 |")
+                continue
+            st, ch = _ss(data)
+            bw = _max_bw(data)
+            bp = _plateau(data)
+            lines.append(f"| {name} | {bw:.0f} | {st} | {ch} | {bp} |")
+        lines.append("")
+
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"报告已生成: {out_path}")
+    return 0
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run memfreq_bench and visualize sweet spot")
@@ -611,10 +735,15 @@ def main():
                         help="Parse existing output file instead of running")
     parser.add_argument("--json", "-j", action="store_true",
                         help="Also save results as JSON")
+    parser.add_argument("--report", metavar="DIR",
+                    help="Scan a results directory and generate a Markdown report")
     parser.add_argument("--compare", "-c", nargs="+", metavar="FILE",
                         help="Compare N result files (JSON or TSV) and "
                              "report cross-run sweet-spot statistics")
     args, extra = parser.parse_known_args()
+
+    if args.report:
+        return generate_report(args.report)
 
     if args.compare:
         return compare_runs(args.compare)
@@ -651,3 +780,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

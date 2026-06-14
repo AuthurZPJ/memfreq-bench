@@ -771,8 +771,9 @@ main() {
     detect_topology
 
     if [[ -z "$OUTPUT_DIR" ]]; then
-        OUTPUT_DIR="${SCRIPT_DIR}/full_sweep_$(date +%Y%m%d_%H%M%S)"
+        OUTPUT_DIR="${SCRIPT_DIR}/output/full_sweep_$(date +%Y%m%d_%H%M%S)"
     fi
+    mkdir -p "${SCRIPT_DIR}/output"
     mkdir -p "$OUTPUT_DIR"
 
     # In quick mode, reduce parameters
