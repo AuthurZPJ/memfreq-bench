@@ -1749,6 +1749,109 @@ static double percentile(const double *sorted, int n, double p)
 	return sorted[lo] * (1.0 - frac) + sorted[lo + 1] * frac;
 }
 
+/*
+ * Least-squares fit of y = slope*x + intercept.
+ * n must be >= 2. Returns 0 on success, -1 if input is degenerate
+ * (all x values equal → vertical line, no well-defined slope).
+ */
+static int fit_line(const double *x, const double *y, int n,
+                    double *out_slope, double *out_intercept)
+{
+	if (n < 2)
+		return -1;
+	double sx = 0, sy = 0, sxx = 0, sxy = 0;
+	for (int i = 0; i < n; i++) {
+		sx  += x[i];
+		sy  += y[i];
+		sxx += x[i] * x[i];
+		sxy += x[i] * y[i];
+	}
+	double denom = n * sxx - sx * sx;
+	if (denom == 0.0)
+		return -1;
+	*out_slope     = (n * sxy - sx * sy) / denom;
+	*out_intercept = (sy - (*out_slope) * sx) / n;
+	return 0;
+}
+
+/*
+ * SSE for a given piecewise fit at breakpoint index k.
+ * Fits line to x[0..k], y[0..k] and x[k+1..n-1], y[k+1..n-1].
+ * Returns total sum of squared residuals; -1.0 if any segment is too small.
+ */
+static double piecewise_sse(const double *x, const double *y, int n, int k)
+{
+	if (k < 1 || k >= n - 1)
+		return -1.0;
+	double s1, i1, s2, i2;
+	if (fit_line(x, y, k + 1, &s1, &i1) < 0) return -1.0;
+	if (fit_line(x, y + k + 1, n - k - 1, &s2, &i2) < 0) return -1.0;
+	double sse = 0.0;
+	for (int j = 0; j <= k; j++) {
+		double r = y[j] - (s1 * x[j] + i1);
+		sse += r * r;
+	}
+	for (int j = k + 1; j < n; j++) {
+		double r = y[j] - (s2 * x[j] + i2);
+		sse += r * r;
+	}
+	return sse;
+}
+
+/*
+ * Naive O(N^2) piecewise-linear plateau detection.
+ * Finds the breakpoint k that minimizes total SSE of a two-segment fit.
+ * Outputs:
+ *   out_breakpoint_mhz: the freq (in MHz) at the breakpoint, or 0 if none
+ *   out_slope_ratio:    |slope_left| / max(|slope_right|, 1e-9)
+ *   out_sweet_spot_mhz: the 95% sweet spot for context (0 if no plateau)
+ * Returns 0 if a plateau is detected (slope_ratio > 2.0), -1 otherwise.
+ */
+static int detect_plateau(const double *mops, const int *freqs_khz, int n,
+                          double threshold,
+                          int *out_breakpoint_mhz,
+                          double *out_slope_ratio,
+                          int *out_sweet_spot_mhz)
+{
+	if (n < 4)  /* need at least 2 points per segment */
+		return -1;
+
+	double x[MAX_FREQS], y[MAX_FREQS];
+	for (int i = 0; i < n; i++) {
+		x[i] = (double)freqs_khz[i] / 1000.0;  /* MHz */
+		y[i] = mops[i] / 1e6;                  /* Mops */
+	}
+
+	/* find breakpoint k minimizing SSE */
+	int best_k = -1;
+	double best_sse = INFINITY;
+	for (int k = 1; k < n - 1; k++) {
+		double sse = piecewise_sse(x, y, n, k);
+		if (sse >= 0.0 && sse < best_sse) {
+			best_sse = sse;
+			best_k = k;
+		}
+	}
+	if (best_k < 0)
+		return -1;
+
+	/* compute slopes of the two segments at the best breakpoint */
+	double s_left, i_left, s_right, i_right;
+	fit_line(x, y, best_k + 1, &s_left, &i_left);
+	fit_line(x + best_k + 1, y + best_k + 1,
+	         n - best_k - 1, &s_right, &i_right);
+
+	double slope_ratio = fabs(s_left) / fmax(fabs(s_right), 1e-9);
+	*out_breakpoint_mhz = (int)x[best_k];
+	*out_slope_ratio    = slope_ratio;
+
+	int sweet_idx = -1;
+	int sweet_khz = find_sweet_spot(mops, freqs_khz, n, &sweet_idx, threshold);
+	*out_sweet_spot_mhz = sweet_khz > 0 ? sweet_khz / 1000 : 0;
+
+	return slope_ratio > 2.0 ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
 	int   cpu       = 0;
@@ -1768,7 +1871,7 @@ int main(int argc, char **argv)
 	int     n_user_thresholds = 0;
 	double  user_thresholds[MAX_USER_THRESHOLDS];
 	int     emit_raw       __attribute__((unused)) = 0;     /* -r: per-sample data in output, used in Task 6 */
-	int     no_plateau     __attribute__((unused)) = 0;     /* -P: suppress plateau block, used in Task 5   */
+	int     no_plateau     = 0;     /* -P: suppress plateau block */
 	int   opt;
 
 	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rP")) != -1) {
@@ -2405,6 +2508,35 @@ int main(int argc, char **argv)
 				else
 					printf("# %.2f\t\xe2\x80\x94\n", user_thresholds[ti]);
 			}
+		}
+	}
+
+	/* ---- plateau block (one row per workload that ran) ----
+	 * Gated on -P / --no-plateau. For each workload, find the
+	 * piecewise-linear breakpoint that minimizes SSE and report
+	 * the slope ratio. slope_ratio > 2.0 ⇒ real plateau (mem-bound);
+	 * < 2.0 ⇒ throughput keeps rising with frequency (compute-bound). */
+	if (!no_plateau) {
+		printf("#\n# --- plateau ---\n");
+		struct { const char *name; const double *mops; } workloads[] = {
+			{"stride",  stride_mops},
+			{"chase",   chase_mops},
+			{"random",  random_mops},
+			{"compute", compute_mops},
+		};
+		int enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		for (int w = 0; w < 4; w++) {
+			if (!enabled[w]) continue;
+			int bp_mhz = 0, sweet_mhz = 0;
+			double ratio = 0.0;
+			int rc = detect_plateau(workloads[w].mops, freqs_khz, n_valid,
+			                        threshold, &bp_mhz, &ratio, &sweet_mhz);
+			if (rc == 0)
+				printf("# %-8s plateau_breakpoint: %d MHz  (slope ratio %.1fx, 95%% sweet spot %d MHz)\n",
+				       workloads[w].name, bp_mhz, ratio, sweet_mhz);
+			else
+				printf("# %-8s plateau_breakpoint: \xe2\x80\x94  (no plateau; throughput keeps rising with frequency)\n",
+				       workloads[w].name);
 		}
 	}
 
