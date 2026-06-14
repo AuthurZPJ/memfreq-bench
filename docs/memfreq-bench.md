@@ -314,7 +314,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 | 列 | 类型 | 计算 |
 |----|------|------|
 | `target_MHz` | int | 写到 `scaling_min/max_freq` 的目标频率 / 1000 |
-| `actual_MHz` | int | `verify_freq()` 从 `cpuinfo_cur_freq`（瞬时）读到的实际频率，失败回退 `cpuinfo_avg_freq`（`memfreq_bench.c:1433-1457`）|
+| `actual_MHz` | int | 频率切换 + 100ms 稳定后**单次**读 `cpuinfo_cur_freq`（瞬时值），失败回退 `cpuinfo_avg_freq`（`memfreq_bench.c:1433-1457`）|
 | `stride_Mops` | %.1f | stride workload 的 ops/sec 取 `nsamples` 次中位数 / 1e6 |
 | `stride_MBs` | %.1f | `stride_tput × 8 / 2^20`（`OPS_TO_MBS` 宏，`memfreq_bench.c:64`）—— 8 = `uint64_t` 元素字节数 |
 | `stride_%` | %.1f | `stride_tput / s_max × 100` |
