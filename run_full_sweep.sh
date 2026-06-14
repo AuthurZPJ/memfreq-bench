@@ -848,6 +848,7 @@ main() {
     log_info "  raw_data.csv     — all frequency points (for spreadsheet)"
     echo ""
 
+    if [[ $TESTS_RUN -eq 0 ]]; then log_warn "no tests selected"; exit 1; fi
     [[ $TESTS_FAIL -gt 0 ]] && exit 1
     exit 0
 }

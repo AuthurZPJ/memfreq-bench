@@ -525,8 +525,11 @@ static int set_freq(int cpu, int khz)
 		return -1;
 
 	/* clamp to hardware max so min/max writes don't fail on CPPC overshoot */
-	if (khz > max_limit)
+	if (khz > max_limit) {
+		dprintf("WARN: requested %d kHz exceeds hardware max %d kHz, clamping\n",
+		        khz, max_limit);
 		khz = max_limit;
+	}
 
 	/* three-step write: widen ceiling | set floor | tighten ceiling.
 	 * This order is safe for both increasing and decreasing freq. */
