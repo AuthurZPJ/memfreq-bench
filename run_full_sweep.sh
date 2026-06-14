@@ -25,6 +25,8 @@ set -uo pipefail
 
 QUICK_MODE=0
 NO_PROMPT=0
+SELECTED_SUITES=""   # --suite N[,N...]: run only the listed suite numbers
+RESUME_MODE=0        # --resume: skip tests whose output file already has a sweet-spot line
 OUTPUT_DIR=""
 TEST_DURATION=5
 TEST_SAMPLES=5
@@ -68,6 +70,14 @@ run_test() {
     local output_file="$OUTPUT_DIR/${test_name}.txt"
     TESTS_RUN=$((TESTS_RUN + 1))
 
+    # --resume: skip tests whose output file already has a valid sweet-spot line
+    if [[ $RESUME_MODE -eq 1 && -f "$output_file" ]] \
+        && grep -q "^# stride  sweet spot:" "$output_file" 2>/dev/null; then
+        log_info "[$TESTS_RUN] $test_name  (cached, skipping)"
+        TESTS_OK=$((TESTS_OK + 1))
+        return 0
+    fi
+
     log_info "[$TESTS_RUN] $test_name"
 
     {
@@ -86,6 +96,16 @@ run_test() {
         TESTS_FAIL=$((TESTS_FAIL + 1))
         log_warn "  ✗ $test_name"
     fi
+}
+
+# Suite selector for --suite N[,N...]. Returns 0 (run it) if the suite number
+# is in $SELECTED_SUITES, or if $SELECTED_SUITES is empty (run all).
+should_run_suite() {
+    local n="$1"
+    if [[ -z "$SELECTED_SUITES" ]]; then
+        return 0
+    fi
+    [[ ",$SELECTED_SUITES," == *",$n,"* ]]
 }
 
 detect_topology() {
@@ -683,6 +703,8 @@ Options:
   --samples N  Samples per point (default: 5)
   --cpu N      Pin single-core tests to CPU N (default: 0)
   --output DIR Output directory
+  --suite LIST Comma-separated suite numbers to run, e.g. 1,3,5 (default: all)
+  --resume     Skip tests whose output file already has a sweet-spot line
   --help       Show this help
 
 Environment:
@@ -690,13 +712,13 @@ Environment:
                    sensitivity sweep (default: 0.80,0.90,0.95,0.99).
                    Always-on flag: -r (raw samples → bootstrap CI).
 
-Test Suites:
-  A  Stride grid (1,2,4,8,16,32,64) — 7 tests
-  B  Random + Flush + RandomFlush — 3 tests
-  C  Multi-core sweep (1,2,4,8,12,16,24,32,48,64,96) — 11 tests
-  D  Multi-core × access modes — 14 tests
-  E  Full NUMA matrix + multi-core NUMA — ~10 tests
-  F  Half/full system with all modes — 7 tests
+Test Suites (--suite N picks one or more):
+  1  Stride grid (1,2,4,8,16,32,64) — 7 tests
+  2  Random + Flush + RandomFlush — 3 tests
+  3  Multi-core sweep (1,2,4,8,12,16,24,32,48,64,96) — 11 tests
+  4  Multi-core × access modes — 14 tests
+  5  Full NUMA matrix + multi-core NUMA — ~10 tests
+  6  Half/full system with all modes — 7 tests
 
 Output:
   FULL_REPORT.txt  — Analysis tables + DVFS recommendations
@@ -720,6 +742,8 @@ main() {
             --samples)  TEST_SAMPLES="$2"; shift 2 ;;
             --cpu)      CPU_PIN="$2"; shift 2 ;;
             --output)   OUTPUT_DIR="$2"; shift 2 ;;
+            --suite)    SELECTED_SUITES="$2"; shift 2 ;;
+            --resume)   RESUME_MODE=1; shift ;;
             --help|-h)  show_help; exit 0 ;;
             *)          log_error "Unknown option: $1"; show_help; exit 1 ;;
         esac
@@ -781,16 +805,16 @@ main() {
     # Run suites
     if [[ $QUICK_MODE -eq 1 ]]; then
         # Quick: stride grid + mc sweep + NUMA
-        suite_stride_grid
-        suite_multicore_sweep
-        [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
+        should_run_suite 1 && suite_stride_grid
+        should_run_suite 3 && suite_multicore_sweep
+        should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
     else
-        suite_stride_grid
-        suite_random_flush
-        suite_multicore_sweep
-        suite_multicore_modes
-        suite_numa_matrix
-        suite_stress_comparison
+        should_run_suite 1 && suite_stride_grid
+        should_run_suite 2 && suite_random_flush
+        should_run_suite 3 && suite_multicore_sweep
+        should_run_suite 4 && suite_multicore_modes
+        should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
+        should_run_suite 6 && suite_stress_comparison
     fi
 
     local end_time
