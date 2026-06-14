@@ -2388,7 +2388,6 @@ int main(int argc, char **argv)
 	 * Per workload: stride always; chase/random only if that workload ran.
 	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
 	if (n_user_thresholds > 0) {
-		printf("#\n# --- sensitivity ---\n");
 		const char *labels[] = {"stride", "chase", "random", "compute"};
 		double *arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
 		int     enabled[]   = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
