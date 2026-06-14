@@ -844,7 +844,7 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 
 1. **需要 root**：写 cpufreq sysfs 需要 root 权限
 2. **需要 cpufreq 驱动**：如果没有 `scaling_available_frequencies`，程序会报错退出
-3. **只测单核**：每个频率点只测一个 core，不测多核并行访存的带宽饱和效应
+3. **默认单核**：每个频率点默认只测一个 core，使用 `-N NCPU` 启用多核模式，测试多核访存的带宽饱和效应
 4. **不测功耗**：程序不读 RAPL / 电能计——甜点是纯性能角度的判定。要测实际节能效果，配合 `turbostat` 或 RAPL
 5. **stride 的 sum 有数据依赖**：`sum += arr[i]` 限制了流水线深度，但编译器可能展开为 partial sum，实际行为取决于 `-O2` 的优化策略。这不影响结论（仍然是 mem-bound 主导），但精确吞吐数值会因编译器而异
 6. **chase 的 100K 内循环**：如果 DRAM 极快（如 HBM），100K 次 × 50ns = 5ms 就结束，外层 `now()` 的调用开销（~15ns/call）占比 ~0.3%，可忽略

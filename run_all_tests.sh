@@ -36,12 +36,14 @@ MAX_MULTICORE=0       # 0 = auto (half physical cores)
 SUITES=""             # empty = run all
 
 # Colors
+if [[ -t 1 ]]; then
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+fi
 
 # Resolve script directory (so we can find memfreq_bench regardless of cwd)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +76,13 @@ log_error() {
 
 log_suite() {
     echo -e "\n${CYAN}━━━ $* ━━━${NC}\n"
+}
+
+check_numeric() {
+    if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Expected a number, got: $1" >&2
+        exit 1
+    fi
 }
 
 check_root() {
@@ -247,9 +256,9 @@ test_multi_core_bandwidth() {
     while [[ $n -le $MAX_MULTICORE ]]; do
         core_counts+=($n)
         if [[ $n -lt 4 ]]; then
-            n=$((n * 2))
+            n=$((n + 1))
         else
-            n=$((n * 2))
+            n=$((n + 1))
         fi
     done
     # Always include MAX_MULTICORE
@@ -406,9 +415,9 @@ generate_summary() {
 
             local stride_sweet chase_sweet max_mbs
             stride_sweet=$(grep "stride.*sweet spot" "$result_file" 2>/dev/null | \
-                           grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                           grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
             chase_sweet=$(grep "chase.*sweet spot" "$result_file" 2>/dev/null | \
-                          grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                          grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
 
             local max_line
             max_line=$(grep -E "^[0-9]" "$result_file" 2>/dev/null | tail -1 || true)

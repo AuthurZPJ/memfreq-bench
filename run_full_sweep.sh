@@ -41,12 +41,14 @@ SENS_THRESHOLDS="${SENS_THRESHOLDS:-0.80,0.90,0.95,0.99}"
 # "事后汇总看结果" so richer per-test data is the point.
 STATS_FLAGS=(-r -L "$SENS_THRESHOLDS")
 
+if [[ -t 1 ]]; then
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="${SCRIPT_DIR}/memfreq_bench"
@@ -113,8 +115,12 @@ detect_topology() {
     cores_per_socket=$(lscpu | grep "Core(s) per socket:" | awk '{print $NF}')
     sockets=$(lscpu | grep "Socket(s):" | awk '{print $NF}')
     NUM_PHYSICAL=$((cores_per_socket * sockets))
+    if [ "$NUM_PHYSICAL" -eq 0 ] 2>/dev/null; then
+        NUM_PHYSICAL=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || nproc 2>/dev/null || echo 1)
+    fi
     NUM_LOGICAL=$(nproc)
     NUM_SMT=$((NUM_LOGICAL / NUM_PHYSICAL))
+    if [ "$NUM_SMT" -eq 0 ] 2>/dev/null; then NUM_SMT=1; fi
 
     if command -v numactl &>/dev/null; then
         NUM_NUMA=$(numactl -H 2>/dev/null | grep "available:" | awk '{print $2}' || true)
@@ -154,8 +160,8 @@ extract_data() {
 
     # Extract sweet spots
     local stride_sweet chase_sweet
-    stride_sweet=$(grep "stride.*sweet spot" "$file" 2>/dev/null | grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
-    chase_sweet=$(grep "chase.*sweet spot" "$file" 2>/dev/null | grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+    stride_sweet=$(grep "stride.*sweet spot" "$file" 2>/dev/null | grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
+    chase_sweet=$(grep "chase.*sweet spot" "$file" 2>/dev/null | grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
 
     # Extract CI low/high (sweet-spot CI block; only present with -r)
     # Block format: "# workload  sweet_MHz  low_MHz  high_MHz  method"
@@ -174,8 +180,8 @@ extract_data() {
     # Extract plateau breakpoint (always present unless suppressed by -P).
     # Format: "# stride   plateau_breakpoint: 2050 MHz  (slope ratio ..., ...)"
     local stride_bp chase_bp
-    stride_bp=$(grep "stride.*plateau_breakpoint" "$file" 2>/dev/null | grep -oP '\d+ MHz' | head -1 | awk '{print $1}')
-    chase_bp=$(grep  "chase.*plateau_breakpoint"  "$file" 2>/dev/null | grep -oP '\d+ MHz' | head -1 | awk '{print $1}')
+    stride_bp=$(grep "stride.*plateau_breakpoint" "$file" 2>/dev/null | grep -oE '\d+ MHz' | head -1 | awk '{print $1}')
+    chase_bp=$(grep  "chase.*plateau_breakpoint"  "$file" 2>/dev/null | grep -oE '\d+ MHz' | head -1 | awk '{print $1}')
 
     # 11-field pipe-delimited row. Order is significant — see report code.
     # Fields 1-5 are the original baseline; 6-11 are the new statistical add-ons.
@@ -567,15 +573,15 @@ generate_full_report() {
         # Find single-core stride8 sweet spot
         local sc_sweet
         sc_sweet=$(grep "stride.*sweet spot" "$OUTPUT_DIR/s8.txt" 2>/dev/null | \
-                   grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                   grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
         # Find mc4 stride8 sweet spot
         local mc4_sweet
         mc4_sweet=$(grep "stride.*sweet spot" "$OUTPUT_DIR/mc4.txt" 2>/dev/null | \
-                    grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                    grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
         # Find half-system sweet spot
         local half_sweet
         half_sweet=$(grep "stride.*sweet spot" "$OUTPUT_DIR/half_s8.txt" 2>/dev/null | \
-                     grep -oP '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                     grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
 
         echo "  Based on test results:"
         echo ""

@@ -1,3 +1,27 @@
+// 20 changes applied
+// + M-1 dc civac
+// + C-1 set_freq
+// + C-2 L3 size
+// + C-3 error path
+// + C-3 normal exit
+// + M-3 AMD RAPL
+// + M-6 HAVE_CACHE_FLUSH
+// + M-6 flush warning
+// + M-5 avg dir
+// + M-5 input dir
+// + M-5 input break
+// + H-2 multi-core domain
+// + H-3 buf dynamic
+// + H-3 stride buf
+// + H-3 chase buf
+// + H-3 compute buf
+// + H-3 qsort buf
+// + H-3 median buf
+// + H-3 buf_mc free
+// + H-4 sparse NUMA
+// ! WARNING: MISSING: M-2 range parsing
+// ! WARNING: MISSING: M-5 avg break
+// ! WARNING: MISSING: H-3 fix double-rename
 /*
  * memfreq_bench.c — Memory-bound frequency sweet-spot finder
  *
@@ -72,13 +96,20 @@ static inline void flush_cacheline(const void *addr)
 #elif defined(__aarch64__)
 static inline void flush_cacheline(const void *addr)
 {
-	__asm__ volatile("dc cvac, %0" : : "r"(addr) : "memory");
+	__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
 }
 #else
 static inline void flush_cacheline(const void *addr)
 {
 	(void)addr;  /* no-op on unsupported platforms */
 }
+#endif
+
+/* Feature test: platform has cache-flush instruction? */
+#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
+#define HAVE_CACHE_FLUSH 1
+#else
+#define HAVE_CACHE_FLUSH 0
 #endif
 
 #define dprintf(...) fprintf(stderr, __VA_ARGS__)
@@ -142,7 +173,16 @@ static int detect_numa_nodes(struct numa_node *nodes)
 			nnodes++;
 	}
 	closedir(d);
-	return nnodes;
+		/* pack nodes contiguously for sparse node numbering */
+	int write_idx = 0;
+	for (int i = 0; i < MAX_NODES; i++) {
+		if (nodes[i].ncpus > 0) {
+			if (i != write_idx)
+				nodes[write_idx] = nodes[i];
+			write_idx++;
+		}
+	}
+	return write_idx;
 }
 
 static int detect_freq_domains(struct freq_domain *domains)
@@ -498,19 +538,34 @@ static void restore_freq_range(int cpu, int orig_min, int orig_max)
 static int set_freq(int cpu, int khz)
 {
 	char path[256], val[32];
+	int max_limit;
 
-	snprintf(val, sizeof(val), "%d", khz);
+	/* read hardware max to safely widen the range first */
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",
+		 cpu);
+	max_limit = read_freq_khz(path);
+	if (max_limit <= 0)
+		return -1;
 
-	/* max first (safe: widens range) */
+	/* three-step write: widen ceiling | set floor | tighten ceiling.
+	 * This order is safe for both increasing and decreasing freq. */
+	snprintf(val, sizeof(val), "%d", max_limit);
 	snprintf(path, sizeof(path),
 		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq",
 		 cpu);
 	if (sysfs_write(path, val) < 0)
 		return -1;
 
-	/* then min (safe: now max == khz, so min ≤ max always holds) */
+	snprintf(val, sizeof(val), "%d", khz);
 	snprintf(path, sizeof(path),
 		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq",
+		 cpu);
+	if (sysfs_write(path, val) < 0)
+		return -1;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq",
 		 cpu);
 	if (sysfs_write(path, val) < 0)
 		return -1;
@@ -916,7 +971,12 @@ static long detect_l3_size(void)
 			num_sharing = 1;
 
 		/* total L3 = per-core slice × number of cores sharing it */
-		long total_size = slice_size * num_sharing;
+		/* For shared caches (L3+), sysfs size is already the total */
+		long total_size;
+		if (level >= 3)
+			total_size = slice_size;
+		else
+			total_size = slice_size * num_sharing;
 
 		if (total_size > max_total)
 			max_total = total_size;
@@ -1246,7 +1306,7 @@ static void detect_power_sensors(void)
 		if (sysfs_read(name, namebuf, sizeof(namebuf)) < 0)
 			continue;
 
-		for (int p = 1; p <= 4 && npower_paths < MAX_POWER_PATHS; p++) {
+		for (int p = 4; p >= 1 && npower_paths < MAX_POWER_PATHS; p--) {
 			char path[256];
 			snprintf(path, sizeof(path),
 				 "%s/power%d_average", base, p);
@@ -1258,6 +1318,7 @@ static void detect_power_sensors(void)
 						 sizeof(power_paths[0]),
 						 "%s", path);
 					npower_paths++;
+					break;
 				}
 			}
 		}
@@ -1281,7 +1342,7 @@ static void detect_power_sensors(void)
 		if (sysfs_read(name, namebuf, sizeof(namebuf)) < 0)
 			continue;
 
-		for (int p = 1; p <= 4 && npower_paths < MAX_POWER_PATHS; p++) {
+		for (int p = 4; p >= 1 && npower_paths < MAX_POWER_PATHS; p--) {
 			char path[256];
 			snprintf(path, sizeof(path),
 				 "%s/power%d_input", base, p);
@@ -1304,6 +1365,7 @@ static void detect_power_sensors(void)
 	const char *rapl_paths[] = {
 		"/sys/class/powercap/intel-rapl:0/energy_uj",
 		"/sys/class/powercap/intel-rapl:0:0/energy_uj",
+		"/sys/class/powercap/amd-rapl:0/energy_uj",
 		NULL
 	};
 	for (int i = 0; rapl_paths[i] && npower_paths < MAX_POWER_PATHS; i++) {
@@ -1527,6 +1589,11 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 				target_khz);
 			continue;
 		}
+		/* set frequency on all freq domain leaders, not just the first */
+		for (int di = 0; di < ndomains; di++) {
+			if (domains[di].leader != selected_cpus[0])
+				set_freq(domains[di].leader, target_khz);
+		}
 		usleep(100000);
 
 		dprintf("  %4d MHz: forking %d children ...\n",
@@ -1576,37 +1643,39 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 					actual > 0 ? actual : target_khz;
 
 				/* run benchmarks */
-				double buf[16];
-				int ns = nsamples < 16 ? nsamples : 16;
+				double *buf_mc = malloc(nsamples * sizeof(double));
+				if (!buf_mc) { dprintf("WARN: mc buf alloc failed\n"); _exit(1); }
+				int ns = nsamples;
 
 				/* stride */
 				for (int s = 0; s < ns; s++)
-					buf[s] = bench_stride(arr, count,
+					buf_mc[s] = bench_stride(arr, count,
 							       stride,
 							       test_secs);
-				qsort(buf, ns, sizeof(double), cmp_double);
-				shm->per_core[c].stride[fi] = buf[ns / 2];
+				qsort(buf_mc, ns, sizeof(double), cmp_double);
+				shm->per_core[c].stride[fi] = buf_mc[ns / 2];
 
 				/* chase */
 				if (do_chase && chase_nodes) {
 					for (int s = 0; s < ns; s++)
-						buf[s] = bench_chase(
+						buf_mc[s] = bench_chase(
 							chase_nodes,
 							test_secs);
-					qsort(buf, ns, sizeof(double),
+					qsort(buf_mc, ns, sizeof(double),
 					      cmp_double);
 					shm->per_core[c].chase[fi] =
-						buf[ns / 2];
+						buf_mc[ns / 2];
 				}
 
 				/* compute */
 				for (int s = 0; s < ns; s++)
-					buf[s] = bench_compute(test_secs);
-				qsort(buf, ns, sizeof(double), cmp_double);
-				shm->per_core[c].compute[fi] = buf[ns / 2];
+					buf_mc[s] = bench_compute(test_secs);
+				qsort(buf_mc, ns, sizeof(double), cmp_double);
+				shm->per_core[c].compute[fi] = buf_mc[ns / 2];
 
 				free(arr);
 				free(chase_nodes);
+				free(buf_mc);
 
 				shm->ready[c] = 1;
 				_exit(0);
@@ -1807,6 +1876,8 @@ int main(int argc, char **argv)
 	int   do_chase  = 1;
 	int   do_random = 0;  /* -R: random permutation test */
 	int   do_flush  = 0;  /* -f: flush cache line after each access */
+	if (do_flush && !HAVE_CACHE_FLUSH)
+		dprintf("WARN: -f (cache flush) has no effect on this platform\n");
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   force_run = 0;
 	int   numa_node = -1;  /* -1 = no binding */
@@ -2021,6 +2092,7 @@ int main(int argc, char **argv)
 		dprintf("       Is cpufreq configured on cpu%d?\n", cpu);
 		free(arr);
 		free(chase_nodes);
+		free(random_idx);
 		return 1;
 	}
 
@@ -2776,5 +2848,7 @@ int main(int argc, char **argv)
 	free(results);
 	free(arr);
 	free(chase_nodes);
+	free(random_idx);
 	return 0;
 }
+
