@@ -149,7 +149,7 @@ for (size_t i = 0; i < count; i += stride) {
 ### 编译
 
 ```bash
-gcc -O2 -o memfreq_bench memfreq_bench.c -lm
+gcc -O2 -o memfreq_bench memfreq_bench.c stats.c -lm
 ```
 
 ### 运行前：环境准备

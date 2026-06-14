@@ -41,7 +41,7 @@ _ANY_HEADER = re.compile(r"^# --- [^-].* ---$")
 #   "# stride   plateau_breakpoint: 2050 MHz  (slope ratio 18.3x, 95% sweet spot 2000 MHz)"
 #   "# chase    plateau_breakpoint: \u2014  (no plateau; throughput keeps rising ...)"
 _PLATEAU_VALUE = re.compile(r"^(\d+)\s*MHz\s*\(slope ratio ([0-9.]+)x,\s*"
-                            r"95%\s*sweet spot (\d+)\s*MHz\)\s*$")
+                            r"(\d+)%\s*sweet spot (\d+)\s*MHz\)\s*$")
 # Power sub-row: "45W at sweet spot (savings: 36% vs 71W at 2600 MHz)"
 _POWER_VALUE = re.compile(r"^([0-9.]+)W\s+at sweet spot\s+"
                           r"\(savings:\s+([0-9.]+)%")
@@ -50,7 +50,7 @@ _POWER_VALUE = re.compile(r"^([0-9.]+)W\s+at sweet spot\s+"
 def run_bench(extra_args: list[str]) -> str:
     if not os.path.isfile(BENCH):
         print(f"ERROR: {BENCH} not found.  Compile first:", file=sys.stderr)
-        print(f"  gcc -O2 -o memfreq_bench memfreq_bench.c -lm", file=sys.stderr)
+        print(f"  gcc -O2 -o memfreq_bench memfreq_bench.c stats.c -lm", file=sys.stderr)
         sys.exit(1)
     cmd = [BENCH] + extra_args
     print(f"$ {' '.join(cmd)}\n", file=sys.stderr)
@@ -178,7 +178,8 @@ def _parse_plateau_block(lines):
                 "workload": workload,
                 "breakpoint_mhz_or_null": int(m.group(1)),
                 "slope_ratio": float(m.group(2)),
-                "sweet_spot_mhz": int(m.group(3)),
+                "threshold_pct": int(m.group(3)),
+                "sweet_spot_mhz": int(m.group(4)),
                 "has_plateau": True,
                 "power_w_or_null": None,
                 "savings_pct_or_null": None,
@@ -259,11 +260,11 @@ def _parse_sweet_spot_ci_block(lines):
         body = ln[1:].strip()
         if not body or body.startswith("---") or "workload" in body.lower():
             continue
-        parts = body.split("\t")
+        parts = body.split()
         if len(parts) < 5:
             continue
         wl = parts[0].strip()
-        method = parts[4].strip()
+        method = parts[-1].strip()
         def _int_or_none(s):
             s = s.strip()
             if s in ("\u2014", "-", ""):
@@ -296,6 +297,21 @@ def parse_output(text: str) -> dict:
     plateau: list = []
     raw_samples: dict[str, list] = {}
     sweet_spot_ci: list = []
+
+    # Column header mapping: built from the "# target_MHz ..." line emitted
+    # by print_column_header() in the C code. Maps column names to their
+    # tab-separated index so we handle all 6 output variants (3 power modes
+    # × 2 chase modes) without hardcoding column counts.
+    _COL_MAP = {
+        "target_MHz":   "freq_mhz",
+        "stride_Mops":  "stride_mops",
+        "stride_%":     "stride_pct",
+        "chase_Mops":   "chase_mops",
+        "chase_%":      "chase_pct",
+        "compute_Mops": "compute_mops",
+        "compute_%":    "compute_pct",
+    }
+    col_indices: dict[str, int] = {}  # field_name → column index
 
     i = 0
     n = len(lines)
@@ -373,30 +389,25 @@ def parse_output(text: str) -> dict:
             continue
 
         if line.startswith("#"):
-            # Other comment lines (preamble, interpretation guide, etc.)
+            # Detect column header: "# target_MHz\tactual_MHz\t..."
+            if line.startswith("# target_MHz") and not col_indices:
+                header_cols = line[2:].split("\t")
+                for idx, name in enumerate(header_cols):
+                    field = _COL_MAP.get(name.strip())
+                    if field:
+                        col_indices[field] = idx
             i += 1
             continue
 
-        if line.strip():
+        if line.strip() and col_indices and "freq_mhz" in col_indices:
             parts = line.split("\t")
-            if len(parts) == 7:
-                rows.append({
-                    "freq_mhz": int(parts[0]),
-                    "stride_mops": float(parts[1]),
-                    "stride_pct": float(parts[2]),
-                    "chase_mops": float(parts[3]),
-                    "chase_pct": float(parts[4]),
-                    "compute_mops": float(parts[5]),
-                    "compute_pct": float(parts[6]),
-                })
-            elif len(parts) == 5:
-                rows.append({
-                    "freq_mhz": int(parts[0]),
-                    "stride_mops": float(parts[1]),
-                    "stride_pct": float(parts[2]),
-                    "compute_mops": float(parts[3]),
-                    "compute_pct": float(parts[4]),
-                })
+            row = {}
+            for field, idx in col_indices.items():
+                if idx < len(parts):
+                    val = parts[idx].strip()
+                    row[field] = int(val) if field == "freq_mhz" else float(val)
+            if "freq_mhz" in row:
+                rows.append(row)
         i += 1
 
     return {
@@ -731,13 +742,13 @@ def generate_report(dir_path: str, output_path: str | None = None) -> int:
 def main():
     parser = argparse.ArgumentParser(
         description="Run memfreq_bench and visualize sweet spot")
-    parser.add_argument("--file", "-f",
+    parser.add_argument("--file",
                         help="Parse existing output file instead of running")
     parser.add_argument("--json", "-j", action="store_true",
                         help="Also save results as JSON")
     parser.add_argument("--report", metavar="DIR",
                     help="Scan a results directory and generate a Markdown report")
-    parser.add_argument("--compare", "-c", nargs="+", metavar="FILE",
+    parser.add_argument("--compare", nargs="+", metavar="FILE",
                         help="Compare N result files (JSON or TSV) and "
                              "report cross-run sweet-spot statistics")
     args, extra = parser.parse_known_args()

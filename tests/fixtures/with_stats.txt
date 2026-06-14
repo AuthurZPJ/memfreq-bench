@@ -1,10 +1,11 @@
 # cpu=0 array=128MB stride=8 duration=1s samples=5
 # stride  sweet spot: 1200 MHz
 # chase   sweet spot: 2000 MHz
-800	140.0	90.0	11.0	88.0	80.0	25.0
-1200	150.0	96.0	12.0	95.0	120.0	38.0
-1600	155.0	99.0	12.4	98.0	160.0	50.0
-2000	156.0	100.0	12.6	100.0	200.0	62.0
+# target_MHz	actual_MHz	stride_Mops	stride_MBs	stride_%	chase_Mops	chase_%	compute_Mops	compute_%
+800	800	140.0	1120.0	90.0	11.0	88.0	80.0	25.0
+1200	1200	150.0	1200.0	96.0	12.0	95.0	120.0	38.0
+1600	1600	155.0	1240.0	99.0	12.4	98.0	160.0	50.0
+2000	2000	156.0	1248.0	100.0	12.6	100.0	200.0	62.0
 #
 # How to read:
 #   interpretation guide etc.
@@ -31,10 +32,10 @@
 # 2000	198.0	202.0	200.0	2.00
 #
 # --- sweet-spot CI ---
-# workload	sweet_MHz	low_MHz	high_MHz	method
-# stride	1200	1200	1200	bootstrap_1000
-# chase	2000	2000	2000	bootstrap_1000
-# compute	—	—	—	no_plateau
+# workload  sweet_MHz  low_MHz  high_MHz  method
+# stride    1200       1200      1200       bootstrap_1000
+# chase     2000       2000      2000       bootstrap_1000
+# compute   —          —         —          no_plateau
 #
 # --- sensitivity (stride) ---
 # threshold  sweet_spot_MHz

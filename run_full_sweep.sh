@@ -41,6 +41,8 @@ SENS_THRESHOLDS="${SENS_THRESHOLDS:-0.80,0.90,0.95,0.99}"
 # "事后汇总看结果" so richer per-test data is the point.
 STATS_FLAGS=(-r -L "$SENS_THRESHOLDS")
 
+# Colors (default to empty so set -u doesn't crash when stdout is not a TTY)
+RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''
 if [[ -t 1 ]]; then
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -845,6 +847,9 @@ main() {
     log_info "  data.csv         — per-test summary"
     log_info "  raw_data.csv     — all frequency points (for spreadsheet)"
     echo ""
+
+    [[ $TESTS_FAIL -gt 0 ]] && exit 1
+    exit 0
 }
 
 main "$@"

@@ -35,7 +35,8 @@ CPU_PIN=0
 MAX_MULTICORE=0       # 0 = auto (half physical cores)
 SUITES=""             # empty = run all
 
-# Colors
+# Colors (default to empty so set -u doesn't crash when stdout is not a TTY)
+RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''
 if [[ -t 1 ]]; then
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -259,7 +260,7 @@ test_multi_core_bandwidth() {
         if [[ $n -lt 4 ]]; then
             n=$((n + 1))
         else
-            n=$((n + 1))
+            n=$((n * 2))
         fi
     done
     # Always include MAX_MULTICORE
@@ -631,6 +632,9 @@ main() {
     log_info "Summary    : $OUTPUT_DIR/SUMMARY.txt"
     log_info "Comparison : $OUTPUT_DIR/COMPARISON.txt"
     echo ""
+
+    [[ $TESTS_FAIL -gt 0 ]] && exit 1
+    exit 0
 }
 
 main "$@"

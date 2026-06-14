@@ -524,6 +524,10 @@ static int set_freq(int cpu, int khz)
 	if (max_limit <= 0)
 		return -1;
 
+	/* clamp to hardware max so min/max writes don't fail on CPPC overshoot */
+	if (khz > max_limit)
+		khz = max_limit;
+
 	/* three-step write: widen ceiling | set floor | tighten ceiling.
 	 * This order is safe for both increasing and decreasing freq. */
 	snprintf(val, sizeof(val), "%d", max_limit);
@@ -2309,8 +2313,6 @@ int main(int argc, char **argv)
 	int   do_chase  = 1;
 	int   do_random = 0;  /* -R: random permutation test */
 	int   do_flush  = 0;  /* -f: flush cache line after each access */
-	if (do_flush && !HAVE_CACHE_FLUSH)
-		dprintf("WARN: -f (cache flush) has no effect on this platform\n");
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   force_run = 0;
 	int   numa_node = -1;  /* -1 = no binding */
@@ -2379,6 +2381,9 @@ int main(int argc, char **argv)
 		default:  usage(argv[0]); return 1;
 		}
 	}
+
+	if (do_flush && !HAVE_CACHE_FLUSH)
+		dprintf("WARN: -f (cache flush) has no effect on this platform\n");
 
 	/* ---- detect L3 cache (pre-root: doesn't need root) ---- */
 	long l3_bytes = detect_l3_size();
