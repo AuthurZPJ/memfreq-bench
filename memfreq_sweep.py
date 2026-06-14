@@ -14,6 +14,7 @@ Requires: root (for cpufreq writes), memfreq_bench compiled in same dir.
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -21,6 +22,23 @@ import sys
 BENCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memfreq_bench")
 BAR_W = 40
 EMDASH = "\u2014"  # em-dash for missing data (compute, n=1 std)
+
+# Regexes for the new "# --- NAME (workload) ---" block headers emitted
+# by memfreq_bench.c. Each block has a header line of the form
+# `# --- <name> (<workload>) ---` (or `# --- plateau ---`, no workload).
+_PERFREQ_HEADER = re.compile(r"^# --- per-freq stats \(([^)]+)\) ---$")
+_SENS_HEADER = re.compile(r"^# --- sensitivity \(([^)]+)\) ---$")
+_RAW_HEADER = re.compile(r"^# --- raw_samples \(([^)]+)\) ---$")
+_PLATEAU_HEADER = re.compile(r"^# --- plateau ---$")
+# Generic catch-all so we can detect end-of-block before falling through.
+_ANY_HEADER = re.compile(r"^# --- [^-].* ---$")
+
+# Plateau row: "# <workload>  plateau_breakpoint: <value>  (annotation)"
+# Examples (note the value after the colon can be an em-dash or a number):
+#   "# stride   plateau_breakpoint: 2050 MHz  (slope ratio 18.3x, 95% sweet spot 2000 MHz)"
+#   "# chase    plateau_breakpoint: \u2014  (no plateau; throughput keeps rising ...)"
+_PLATEAU_VALUE = re.compile(r"^(\d+)\s*MHz\s*\(slope ratio ([0-9.]+)x,\s*"
+                            r"95%\s*sweet spot (\d+)\s*MHz\)\s*$")
 
 
 def run_bench(extra_args: list[str]) -> str:
@@ -37,23 +55,240 @@ def run_bench(extra_args: list[str]) -> str:
     return result.stdout
 
 
+def _parse_per_freq_stats_block(lines):
+    """Parse a `per-freq stats (X)` block.
+
+    Header row may use either `Mops` or `MOps` (the C source has minor
+    capitalization drift between stride/chase and random/compute blocks);
+    we tolerate both. Data rows are tab-separated:
+        freq_MHz  min_Mops  max_MOps  median_MOps  iqr_MOps
+    """
+    rows = []
+    for ln in lines:
+        if not ln.startswith("#"):
+            continue
+        # Skip comment/blank header lines within the block.
+        body = ln[1:].strip()
+        if not body or body.startswith("---") or "min" in body.lower():
+            continue
+        parts = body.split("\t")
+        if len(parts) < 5:
+            continue
+        try:
+            freq = int(parts[0])
+            mn = float(parts[1])
+            mx = float(parts[2])
+            med = float(parts[3])
+            iqr = float(parts[4])
+        except ValueError:
+            continue
+        rows.append({
+            "freq_mhz": freq,
+            "min": mn,
+            "max": mx,
+            "median": med,
+            "iqr": iqr,
+        })
+    return rows
+
+
+def _parse_sensitivity_block(lines):
+    """Parse a `sensitivity (X)` block.
+
+    Data rows: `threshold<TAB>sweet_spot_MHz`, where sweet spot is either
+    an integer (MHz) or an em-dash ("no plateau").
+    """
+    rows = []
+    for ln in lines:
+        if not ln.startswith("#"):
+            continue
+        body = ln[1:].strip()
+        if not body or body.startswith("---") or "threshold" in body.lower():
+            continue
+        parts = body.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            thr = float(parts[0])
+        except ValueError:
+            continue
+        spot_raw = parts[1].strip()
+        if spot_raw == EMDASH or spot_raw == "":
+            spot = None
+        else:
+            try:
+                spot = int(spot_raw)
+            except ValueError:
+                spot = None
+        rows.append({"threshold": thr, "sweet_spot_mhz_or_null": spot})
+    return rows
+
+
+def _parse_plateau_block(lines):
+    """Parse the `plateau` block (one row per workload).
+
+    Each row: `# <workload>  plateau_breakpoint: <value>  (annotation)`
+    where value is either `N MHz  (slope ratio X.Xx, 95% sweet spot N MHz)`
+    or the em-dash + `(no plateau; ...)` annotation.
+    """
+    rows = []
+    for ln in lines:
+        if not ln.startswith("#"):
+            continue
+        body = ln[1:].strip()
+        if not body or body.startswith("---"):
+            continue
+        if "plateau_breakpoint:" not in body:
+            continue
+        # Split into "<workload>  plateau_breakpoint: <rest>"
+        try:
+            wl_part, rest = body.split("plateau_breakpoint:", 1)
+        except ValueError:
+            continue
+        workload = wl_part.strip()
+        rest = rest.strip()
+        if rest.startswith(EMDASH):
+            rows.append({
+                "workload": workload,
+                "breakpoint_mhz_or_null": None,
+                "slope_ratio": None,
+                "sweet_spot_mhz": None,
+                "has_plateau": False,
+            })
+            continue
+        m = _PLATEAU_VALUE.match(rest)
+        if m:
+            rows.append({
+                "workload": workload,
+                "breakpoint_mhz_or_null": int(m.group(1)),
+                "slope_ratio": float(m.group(2)),
+                "sweet_spot_mhz": int(m.group(3)),
+                "has_plateau": True,
+            })
+        else:
+            # Unrecognized annotation — record the em-dash fallback so the
+            # block still surfaces in the JSON output.
+            rows.append({
+                "workload": workload,
+                "breakpoint_mhz_or_null": None,
+                "slope_ratio": None,
+                "sweet_spot_mhz": None,
+                "has_plateau": False,
+            })
+    return rows
+
+
+def _parse_raw_samples_block(lines):
+    """Parse a `raw_samples (X)` block.
+
+    Data rows: `freq_MHz<TAB>sample_idx<TAB>mops`.
+    """
+    rows = []
+    for ln in lines:
+        if not ln.startswith("#"):
+            continue
+        body = ln[1:].strip()
+        if not body or body.startswith("---") or "freq_mhz" in body.lower():
+            continue
+        parts = body.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            freq = int(parts[0])
+            idx = int(parts[1])
+            mops = float(parts[2])
+        except ValueError:
+            continue
+        rows.append({"freq_mhz": freq, "sample_idx": idx, "mops": mops})
+    return rows
+
+
 def parse_output(text: str) -> dict:
     meta = {}
     rows = []
     sweet = {}
 
-    for line in text.splitlines():
+    # Split into lines once; iterate as a list so we can pull header
+    # boundaries for the new statistical blocks.
+    lines = text.splitlines()
+
+    per_freq_stats: dict[str, list] = {}
+    sensitivity: dict[str, list] = {}
+    plateau: list = []
+    raw_samples: dict[str, list] = {}
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+
+        # Existing meta + sweet-spot parsing (preamble).
         if line.startswith("# cpu="):
             for kv in line[2:].split():
                 k, v = kv.split("=", 1)
                 meta[k] = v
-        elif line.startswith("# stride  sweet spot:"):
-            sweet["stride"] = int(line.split(":")[1].strip().split()[0])
-        elif line.startswith("# chase   sweet spot:"):
-            sweet["chase"] = int(line.split(":")[1].strip().split()[0])
-        elif line.startswith("#"):
+            i += 1
             continue
-        elif line.strip():
+        if line.startswith("# stride  sweet spot:"):
+            sweet["stride"] = int(line.split(":")[1].strip().split()[0])
+            i += 1
+            continue
+        if line.startswith("# chase   sweet spot:"):
+            sweet["chase"] = int(line.split(":")[1].strip().split()[0])
+            i += 1
+            continue
+
+        # New block headers — collect lines until next "# ---" header or EOF,
+        # then dispatch to the appropriate sub-parser.
+        m_perfreq = _PERFREQ_HEADER.match(line)
+        if m_perfreq:
+            wl = m_perfreq.group(1)
+            j = i + 1
+            block_lines = []
+            while j < n and not _ANY_HEADER.match(lines[j]):
+                block_lines.append(lines[j])
+                j += 1
+            per_freq_stats[wl] = _parse_per_freq_stats_block(block_lines)
+            i = j
+            continue
+        m_sens = _SENS_HEADER.match(line)
+        if m_sens:
+            wl = m_sens.group(1)
+            j = i + 1
+            block_lines = []
+            while j < n and not _ANY_HEADER.match(lines[j]):
+                block_lines.append(lines[j])
+                j += 1
+            sensitivity[wl] = _parse_sensitivity_block(block_lines)
+            i = j
+            continue
+        if _PLATEAU_HEADER.match(line):
+            j = i + 1
+            block_lines = []
+            while j < n and not _ANY_HEADER.match(lines[j]):
+                block_lines.append(lines[j])
+                j += 1
+            plateau = _parse_plateau_block(block_lines)
+            i = j
+            continue
+        m_raw = _RAW_HEADER.match(line)
+        if m_raw:
+            wl = m_raw.group(1)
+            j = i + 1
+            block_lines = []
+            while j < n and not _ANY_HEADER.match(lines[j]):
+                block_lines.append(lines[j])
+                j += 1
+            raw_samples[wl] = _parse_raw_samples_block(block_lines)
+            i = j
+            continue
+
+        if line.startswith("#"):
+            # Other comment lines (preamble, interpretation guide, etc.)
+            i += 1
+            continue
+
+        if line.strip():
             parts = line.split("\t")
             if len(parts) == 7:
                 rows.append({
@@ -73,8 +308,17 @@ def parse_output(text: str) -> dict:
                     "compute_mops": float(parts[3]),
                     "compute_pct": float(parts[4]),
                 })
+        i += 1
 
-    return {"meta": meta, "rows": rows, "sweet": sweet}
+    return {
+        "meta": meta,
+        "rows": rows,
+        "sweet": sweet,
+        "per_freq_stats": per_freq_stats,
+        "sensitivity": sensitivity,
+        "plateau": plateau,
+        "raw_samples": raw_samples,
+    }
 
 
 def bar(pct: float, width: int = BAR_W) -> str:
@@ -244,6 +488,10 @@ def main():
         out = {
             "meta": data["meta"],
             "sweet_spot_mhz": data["sweet"],
+            "per_freq_stats": data.get("per_freq_stats", {}),
+            "sensitivity": data.get("sensitivity", {}),
+            "plateau": data.get("plateau", []),
+            "raw_samples": data.get("raw_samples", {}),
             "data": data["rows"],
         }
         jpath = "memfreq_results.json"

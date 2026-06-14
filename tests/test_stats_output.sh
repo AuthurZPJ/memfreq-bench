@@ -91,6 +91,72 @@ OUT=$($PY memfreq_sweep.py --compare \
     tests/fixtures/compare_run1.json 2>&1)
 check_contains "1-file compare does not crash" "$OUT" "Cross-run sweet-spot comparison (1 runs)"
 
+echo "=== Test 6: Python parser extracts new statistical blocks ==="
+# parse_output() on the fixture TSV should yield a dict that contains
+# all four new top-level keys. Use a tiny Python harness via $PY -c.
+PARSE_OUT=$($PY -c "
+import sys
+sys.path.insert(0, '.')
+from memfreq_sweep import parse_output
+with open('tests/fixtures/with_stats.txt') as fh:
+    data = parse_output(fh.read())
+keys = sorted(data.keys())
+print(' '.join(keys))
+print('pfs_workloads=' + ','.join(sorted(data.get('per_freq_stats', {}).keys())))
+print('sens_workloads=' + ','.join(sorted(data.get('sensitivity', {}).keys())))
+print('plateau_rows=' + str(len(data.get('plateau', []))))
+print('raw_workloads=' + ','.join(sorted(data.get('raw_samples', {}).keys())))
+" 2>&1)
+check_contains "parse_output returns per_freq_stats"  "$PARSE_OUT" "per_freq_stats"
+check_contains "parse_output returns sensitivity"    "$PARSE_OUT" "sensitivity"
+check_contains "parse_output returns plateau"        "$PARSE_OUT" "plateau"
+check_contains "parse_output returns raw_samples"    "$PARSE_OUT" "raw_samples"
+check_contains "per_freq_stats has stride workload"  "$PARSE_OUT" "pfs_workloads=chase,compute,stride"
+check_contains "sensitivity has stride workload"     "$PARSE_OUT" "sens_workloads=chase,compute,stride"
+check_contains "plateau has 3 rows"                  "$PARSE_OUT" "plateau_rows=3"
+check_contains "raw_samples has stride workload"     "$PARSE_OUT" "raw_workloads=compute,stride"
+
+echo "=== Test 7: --json writes the new blocks to memfreq_results.json ==="
+# Run the Python parser against the fixture TSV with --json and verify
+# the saved JSON file contains all four new top-level keys. We invoke
+# the script via $PY from $ROOT_DIR so the relative paths match.
+JSON_OUT=$($PY memfreq_sweep.py --file tests/fixtures/with_stats.txt --json 2>&1)
+JSON_FILE="memfreq_results.json"
+if [ ! -f "$JSON_FILE" ]; then
+    fail "--json output file written"
+    echo "    expected $JSON_FILE to exist"
+else
+    pass "--json output file written"
+    KEYS=$($PY -c "import json; print(' '.join(sorted(json.load(open('$JSON_FILE')).keys())))" 2>&1)
+    check_contains "JSON has per_freq_stats key" "$KEYS" "per_freq_stats"
+    check_contains "JSON has sensitivity key"    "$KEYS" "sensitivity"
+    check_contains "JSON has plateau key"        "$KEYS" "plateau"
+    check_contains "JSON has raw_samples key"    "$KEYS" "raw_samples"
+    check_contains "JSON preserves meta key"     "$KEYS" "meta"
+    check_contains "JSON preserves data key"     "$KEYS" "data"
+    check_contains "JSON preserves sweet_spot_mhz" "$KEYS" "sweet_spot_mhz"
+    # Spot-check that an em-dash was serialized as JSON null.
+    NULL_OUT=$($PY -c "
+import json
+d = json.load(open('$JSON_FILE'))
+sens = d.get('sensitivity', {}).get('stride', [])
+nulls = [r for r in sens if r.get('sweet_spot_mhz_or_null') is None]
+print(len(nulls))
+" 2>&1)
+    check_contains "JSON has null for em-dash sensitivity value" "$NULL_OUT" "1"
+    # Spot-check that the plateau block survived.
+    PLATEAU_OUT=$($PY -c "
+import json
+d = json.load(open('$JSON_FILE'))
+rows = d.get('plateau', [])
+stride = [r for r in rows if r.get('workload') == 'stride']
+print('OK' if stride and stride[0].get('breakpoint_mhz_or_null') == 2050 else 'BAD')
+" 2>&1)
+    check_contains "JSON plateau row has breakpoint 2050" "$PLATEAU_OUT" "OK"
+    # Clean up so the test is idempotent.
+    rm -f "$JSON_FILE"
+fi
+
 # --- The remaining checks require Linux + cpufreq. ---
 if [ "$CPUFREQ_OK" -eq 0 ]; then
     echo
