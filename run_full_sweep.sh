@@ -134,7 +134,37 @@ detect_topology() {
     FMIN_MHZ=$((FMIN / 1000))
     FMAX_MHZ=$((FMAX / 1000))
 
+    # Cache hierarchy detection (L1d, L2, L3)
+    CACHE_L1D_KB=0
+    CACHE_L2_KB=0
+    CACHE_L3_KB=0
+    for idx in $(seq 0 9); do
+        local level_file="/sys/devices/system/cpu/cpu0/cache/index${idx}/level"
+        local size_file="/sys/devices/system/cpu/cpu0/cache/index${idx}/size"
+        [[ -r "$level_file" && -r "$size_file" ]] || break
+        local level size_str size_kb
+        level=$(cat "$level_file")
+        size_str=$(cat "$size_file")
+        # Parse "128K", "1M", "32M" etc.
+        local num unit
+        num=$(echo "$size_str" | sed 's/[^0-9]//g')
+        unit=$(echo "$size_str" | sed 's/[0-9]//g')
+        if [[ "$unit" == "K" || "$unit" == "k" ]]; then
+            size_kb=$num
+        elif [[ "$unit" == "M" || "$unit" == "m" ]]; then
+            size_kb=$((num * 1024))
+        else
+            size_kb=0
+        fi
+        case $level in
+            1) [[ "$size_kb" -gt "$CACHE_L1D_KB" ]] && CACHE_L1D_KB=$size_kb ;;
+            2) [[ "$size_kb" -gt "$CACHE_L2_KB" ]] && CACHE_L2_KB=$size_kb ;;
+            3) [[ "$size_kb" -gt "$CACHE_L3_KB" ]] && CACHE_L3_KB=$size_kb ;;
+        esac
+    done
+
     log_success "Topology: ${NUM_PHYSICAL}P/${NUM_LOGICAL}T, SMT=${NUM_SMT}, NUMA=${NUM_NUMA}, ${FMIN_MHZ}-${FMAX_MHZ} MHz"
+    log_info "Cache: L1d=${CACHE_L1D_KB}KB, L2=${CACHE_L2_KB}KB, L3=${CACHE_L3_KB}KB"
 }
 
 get_numa_cpu() {
@@ -338,6 +368,85 @@ suite_stress_comparison() {
     # Full system with key modes
     run_test "full_s8"  -N "$NUM_PHYSICAL" -s 8  "${common[@]}"
     run_test "full_R"   -N "$NUM_PHYSICAL" -R    "${common[@]}"
+}
+
+suite_cache_hierarchy() {
+    log_suite "Suite G: Cache Hierarchy Sweep"
+    log_info "Testing memory-bound behavior across cache boundaries"
+
+    local common=(-c "$CPU_PIN" -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+
+    # Calculate array sizes at different cache boundaries
+    local -a sizes_mb=()
+    local -a labels=()
+
+    # Helper: convert KB to MB (integer division, minimum 1MB)
+    kb_to_mb() {
+        local kb=$1
+        local mb=$((kb / 1024))
+        [[ $mb -lt 1 ]] && mb=1
+        echo $mb
+    }
+
+    # ½× L2 (if L2 detected and >= 2MB)
+    if [[ $CACHE_L2_KB -gt 0 ]]; then
+        local half_l2_kb=$((CACHE_L2_KB / 2))
+        local half_l2_mb=$(kb_to_mb $half_l2_kb)
+        if [[ $half_l2_mb -ge 1 ]]; then
+            sizes_mb+=($half_l2_mb)
+            labels+=("half_L2_${half_l2_mb}MB")
+        fi
+    fi
+
+    # 2× L2 (if L2 detected)
+    if [[ $CACHE_L2_KB -gt 0 ]]; then
+        local double_l2_kb=$((CACHE_L2_KB * 2))
+        local double_l2_mb=$(kb_to_mb $double_l2_kb)
+        sizes_mb+=($double_l2_mb)
+        labels+=("double_L2_${double_l2_mb}MB")
+    fi
+
+    # ½× L3 (if L3 detected and >= 2MB)
+    if [[ $CACHE_L3_KB -gt 0 ]]; then
+        local half_l3_kb=$((CACHE_L3_KB / 2))
+        local half_l3_mb=$(kb_to_mb $half_l3_kb)
+        if [[ $half_l3_mb -ge 1 ]]; then
+            sizes_mb+=($half_l3_mb)
+            labels+=("half_L3_${half_l3_mb}MB")
+        fi
+    fi
+
+    # 2× L3 (if L3 detected) — this is what -A would do
+    if [[ $CACHE_L3_KB -gt 0 ]]; then
+        local double_l3_kb=$((CACHE_L3_KB * 2))
+        local double_l3_mb=$(kb_to_mb $double_l3_kb)
+        sizes_mb+=($double_l3_mb)
+        labels+=("double_L3_${double_l3_mb}MB")
+    fi
+
+    # 4× L3 (if L3 detected) — deep DRAM-bound
+    if [[ $CACHE_L3_KB -gt 0 ]]; then
+        local quad_l3_kb=$((CACHE_L3_KB * 4))
+        local quad_l3_mb=$(kb_to_mb $quad_l3_kb)
+        sizes_mb+=($quad_l3_mb)
+        labels+=("quad_L3_${quad_l3_mb}MB")
+    fi
+
+    # Fallback if no cache info
+    if [[ ${#sizes_mb[@]} -eq 0 ]]; then
+        log_warn "Cache sizes not detected, using default sizes: 4MB, 16MB, 64MB, 256MB, 512MB"
+        sizes_mb=(4 16 64 256 512)
+        labels=("4MB" "16MB" "64MB" "256MB" "512MB")
+    fi
+
+    log_info "Cache hierarchy test sizes: ${sizes_mb[*]} MB"
+    log_info "Labels: ${labels[*]}"
+
+    for i in "${!sizes_mb[@]}"; do
+        local size=${sizes_mb[$i]}
+        local label=${labels[$i]}
+        run_test "cache_${label}" -m "$size" "${common[@]}"
+    done
 }
 
 # ============================================================================
@@ -705,7 +814,7 @@ Usage: sudo ./run_full_sweep.sh [OPTIONS]
 Exhaustive memfreq_bench sweep for deep analysis.
 
 Options:
-  --quick      Run a reduced subset (~30 min instead of ~3-4 hours)
+  --quick      Run with reduced parameters (2s × 2 samples) for faster results
   --yes        Skip confirmation prompt
   --duration N Seconds per test point (default: 5)
   --samples N  Samples per point (default: 5)
@@ -727,6 +836,7 @@ Test Suites (--suite N picks one or more):
   4  Multi-core × access modes — 14 tests
   5  Full NUMA matrix + multi-core NUMA — ~10 tests
   6  Half/full system with all modes — 7 tests
+  7  Cache hierarchy sweep (½×L2, 2×L2, ½×L3, 2×L3, 4×L3) — ~5 tests
 
 Output:
   FULL_REPORT.txt  — Analysis tables + DVFS recommendations
@@ -788,9 +898,14 @@ main() {
     # Estimate
     local est_tests
     if [[ $QUICK_MODE -eq 1 ]]; then
-        est_tests=15  # reduced subset
+        # Quick runs suites 1,3,5,7 with reduced parameters
+        est_tests=0
+        est_tests=$((est_tests + 7))  # Suite A: stride grid
+        est_tests=$((est_tests + 11)) # Suite C: multi-core sweep
+        [[ $NUM_NUMA -ge 2 ]] && est_tests=$((est_tests + NUM_NUMA * 2 + 4))  # Suite E: NUMA
+        est_tests=$((est_tests + 5))  # Suite G: cache hierarchy
     else
-        est_tests=52  # full sweep
+        est_tests=57  # full sweep (on 2-NUMA system)
     fi
     local est_min=$(( est_tests * TEST_DURATION * 4 / 60 ))
 
@@ -813,10 +928,11 @@ main() {
 
     # Run suites
     if [[ $QUICK_MODE -eq 1 ]]; then
-        # Quick: stride grid + mc sweep + NUMA
+        # Quick: stride grid + mc sweep + NUMA + cache hierarchy
         should_run_suite 1 && suite_stride_grid
         should_run_suite 3 && suite_multicore_sweep
         should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
+        should_run_suite 7 && suite_cache_hierarchy
     else
         should_run_suite 1 && suite_stride_grid
         should_run_suite 2 && suite_random_flush
@@ -824,6 +940,7 @@ main() {
         should_run_suite 4 && suite_multicore_modes
         should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
         should_run_suite 6 && suite_stress_comparison
+        should_run_suite 7 && suite_cache_hierarchy
     fi
 
     local end_time

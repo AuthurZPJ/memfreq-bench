@@ -582,7 +582,7 @@ chase 内循环编译后（arm64, `-O2`）：
 .Lloop:
     ldr   x0, [x0]        ; p = p->next  (LOAD, ~300 cycles 等 DRAM)
     add   x1, x1, #1      ; i++          (1 cycle, 可并行)
-    cmp   x1, x2          ; i < 100000   (1 cycle, 可并行)
+    cmp   x1, x2          ; i < nnodes   (1 cycle, 可并行)
     b.ne  .Lloop          ; branch       (1 cycle, 分支预测器命中)
 ```
 
@@ -909,7 +909,7 @@ sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
 | `stats.c` / `stats.h` | 统计辅助函数（甜点、平台期、bootstrap CI） |
 | `memfreq_sweep.py` | Python 运行器 + ASCII 可视化 + JSON 导出 |
 | `Makefile` | 构建 `memfreq_bench` 和 `test_stats` |
-| `run_all_tests.sh` | 一键测试套件（6 个预定义场景，~10-30 分钟） |
+| `run_all_tests.sh` | 一键测试套件（7 个预定义场景，~15-40 分钟） |
 | `run_full_sweep.sh` | 全量扫描（stride × 核数 × NUMA，~3-4 小时） |
 | `tests/test_stats.c` | stats.c 的 C 单元测试 |
 | `tests/test_stats_output.sh` | Shell 测试框架（77 个断言） |

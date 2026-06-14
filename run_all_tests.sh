@@ -9,6 +9,7 @@
 #   4. Random permutation (Fisher-Yates)
 #   5. Cache flush (forced L3 miss)
 #   6. NUMA binding (local vs remote)
+#   7. Cache hierarchy sweep (½×L2, 2×L2, ½×L3, 2×L3, 4×L3)
 #
 # Usage:
 #   sudo ./run_all_tests.sh              # Run all tests
@@ -161,10 +162,41 @@ detect_topology() {
         fi
     fi
 
+    # Cache hierarchy (L1d, L2, L3) — read from sysfs
+    CACHE_L1D_MB=0
+    CACHE_L2_MB=0
+    CACHE_L3_MB=0
+    for idx in $(seq 0 9); do
+        local level_file="/sys/devices/system/cpu/cpu0/cache/index${idx}/level"
+        local size_file="/sys/devices/system/cpu/cpu0/cache/index${idx}/size"
+        local type_file="/sys/devices/system/cpu/cpu0/cache/index${idx}/type"
+        [[ -r "$level_file" && -r "$size_file" ]] || break
+        local level size_str size_mb
+        level=$(cat "$level_file")
+        size_str=$(cat "$size_file")
+        # Parse "128K", "1M", "32M" etc.
+        local num unit
+        num=$(echo "$size_str" | sed 's/[^0-9]//g')
+        unit=$(echo "$size_str" | sed 's/[0-9]//g')
+        if [[ "$unit" == "K" || "$unit" == "k" ]]; then
+            size_mb=0  # < 1MB, treat as 0 for our purposes
+        elif [[ "$unit" == "M" || "$unit" == "m" ]]; then
+            size_mb=$num
+        else
+            size_mb=0
+        fi
+        case $level in
+            1) [[ "$size_mb" -gt "$CACHE_L1D_MB" ]] && CACHE_L1D_MB=$size_mb ;;
+            2) [[ "$size_mb" -gt "$CACHE_L2_MB" ]] && CACHE_L2_MB=$size_mb ;;
+            3) [[ "$size_mb" -gt "$CACHE_L3_MB" ]] && CACHE_L3_MB=$size_mb ;;
+        esac
+    done
+
     log_success "Topology detected:"
     log_info "  Physical cores : $NUM_PHYSICAL_CORES (${cores_per_socket:-?}/socket × ${sockets:-?})"
     log_info "  SMT threads    : $NUM_SMT_THREADS (total logical: $NUM_LOGICAL_CORES)"
     log_info "  NUMA nodes     : $NUM_NUMA_NODES"
+    log_info "  Cache          : L1d=${CACHE_L1D_MB}MB, L2=${CACHE_L2_MB}MB, L3=${CACHE_L3_MB}MB"
     log_info "  Frequency range: ${FREQ_MIN_MHZ} – ${FREQ_MAX_MHZ} MHz"
     log_info "  Max multi-core : $MAX_MULTICORE cores"
 }
@@ -330,6 +362,73 @@ test_combined_modes() {
     fi
 }
 
+test_cache_hierarchy() {
+    should_run_suite 7 || return 0
+    log_suite "Suite 7: Cache Hierarchy Sweep"
+
+    local common=(-c "$CPU_PIN" -t "$TEST_DURATION" -n "$TEST_SAMPLES")
+
+    # Calculate array sizes at different cache boundaries
+    # We want: ½×L2, 2×L2, ½×L3, 2×L3, 4×L3
+    local -a sizes_mb=()
+    local -a labels=()
+
+    # ½× L2 (if L2 detected)
+    if [[ $CACHE_L2_MB -gt 0 ]]; then
+        local half_l2=$((CACHE_L2_MB / 2))
+        if [[ $half_l2 -ge 1 ]]; then
+            sizes_mb+=($half_l2)
+            labels+=("half_L2_${half_l2}MB")
+        fi
+    fi
+
+    # 2× L2 (if L2 detected)
+    if [[ $CACHE_L2_MB -gt 0 ]]; then
+        local double_l2=$((CACHE_L2_MB * 2))
+        sizes_mb+=($double_l2)
+        labels+=("double_L2_${double_l2}MB")
+    fi
+
+    # ½× L3 (if L3 detected)
+    if [[ $CACHE_L3_MB -gt 0 ]]; then
+        local half_l3=$((CACHE_L3_MB / 2))
+        if [[ $half_l3 -ge 1 ]]; then
+            sizes_mb+=($half_l3)
+            labels+=("half_L3_${half_l3}MB")
+        fi
+    fi
+
+    # 2× L3 (if L3 detected) — this is what -A would do
+    if [[ $CACHE_L3_MB -gt 0 ]]; then
+        local double_l3=$((CACHE_L3_MB * 2))
+        sizes_mb+=($double_l3)
+        labels+=("double_L3_${double_l3}MB")
+    fi
+
+    # 4× L3 (if L3 detected) — deep DRAM-bound
+    if [[ $CACHE_L3_MB -gt 0 ]]; then
+        local quad_l3=$((CACHE_L3_MB * 4))
+        sizes_mb+=($quad_l3)
+        labels+=("quad_L3_${quad_l3}MB")
+    fi
+
+    # Fallback if no cache info
+    if [[ ${#sizes_mb[@]} -eq 0 ]]; then
+        log_warn "Cache sizes not detected, using default sizes: 4MB, 16MB, 64MB, 256MB, 512MB"
+        sizes_mb=(4 16 64 256 512)
+        labels=("4MB" "16MB" "64MB" "256MB" "512MB")
+    fi
+
+    log_info "Cache hierarchy test sizes: ${sizes_mb[*]} MB"
+    log_info "Labels: ${labels[*]}"
+
+    for i in "${!sizes_mb[@]}"; do
+        local size=${sizes_mb[$i]}
+        local label=${labels[$i]}
+        run_test "cache_${label}" -m "$size" "${common[@]}"
+    done
+}
+
 # ============================================================================
 # Summary Generation
 # ============================================================================
@@ -489,6 +588,7 @@ Test Suites (use --suite to select):
   4  Multi-core bandwidth saturation (1,2,4,...,N cores)
   5  NUMA binding (local vs remote, requires ≥2 NUMA nodes)
   6  Combined modes (multi-core+random, multi-core+flush, NUMA+flush)
+  7  Cache hierarchy sweep (½×L2, 2×L2, ½×L3, 2×L3, 4×L3)
 
 Examples:
   sudo ./run_all_tests.sh                    # Run everything
@@ -582,6 +682,13 @@ main() {
         est_tests=$((est_tests + NUM_NUMA_NODES * 2))
     fi
     if should_run_suite 6; then est_tests=$((est_tests + 3)); fi
+    if should_run_suite 7; then
+        local n=0
+        [[ $CACHE_L2_MB -gt 0 ]] && n=$((n + 2))
+        [[ $CACHE_L3_MB -gt 0 ]] && n=$((n + 3))
+        [[ $n -eq 0 ]] && n=5
+        est_tests=$((est_tests + n))
+    fi
 
     local est_secs=$((est_tests * TEST_DURATION * 4))
     local est_min=$((est_secs / 60))
@@ -613,6 +720,7 @@ main() {
     test_multi_core_bandwidth
     test_numa_binding
     test_combined_modes
+    test_cache_hierarchy
 
     local end_time
     end_time=$(date +%s)

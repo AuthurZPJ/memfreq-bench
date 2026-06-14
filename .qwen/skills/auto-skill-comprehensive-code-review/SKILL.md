@@ -59,6 +59,76 @@ Each agent must categorize findings by severity (Critical/High/Medium/Low) and p
 3. Re-rank severity based on verified impact, not agent claims.
 4. Group by module for clarity.
 
+## Phase 5: User-corrected verification — Present findings for independent review
+
+**This phase is essential when the user has domain expertise.** After producing the severity-graded report, present it to the user and ask them to independently verify each finding. Users often catch errors that both agents and the verification phase miss.
+
+### What to expect from user corrections:
+
+1. **"不成立" (not valid) markings with specific reasoning** — The user may mark findings as incorrect and provide technical justification. Common patterns:
+   - **Wrong target file/function**: Agent confused shell script code with C code, or checked the wrong file (e.g., Makefile vs docs compile command)
+   - **Theoretical risk vs practical reality**: Agent flagged a division-by-zero that can't occur because an earlier guard prevents it
+   - **Correct behavior misidentified as bug**: Agent didn't understand the domain semantics (e.g., strtok with multi-char delimiter set working as intended for the actual input format)
+
+2. **"部分确认" (partially confirmed) markings** — The user accepts the core finding but narrows the impact scope.
+
+### How to handle user corrections:
+
+1. **For each "不成立" marking**: Re-read the actual code at the exact location the user referenced. Do NOT assume the user is right or wrong — verify independently.
+2. **Produce a correction table** showing: original finding → user's assessment → your re-verification → final status.
+3. **Accept corrections gracefully**: If the user is right, mark the finding as "不成立" in the final report. If you find the user is wrong after re-verification, explain why with code evidence.
+
+### Common agent errors that users catch:
+
+- **File confusion**: Agent verifies finding against the wrong file (e.g., C `gen_freq_range` vs shell script loop)
+- **Checking wrong location**: Agent says "Makefile is correct" when the finding was about docs/error-message
+- **Over-caution**: Agent flags theoretical edge cases that are guarded elsewhere in the code
+- **Misunderstanding domain APIs**: Agent doesn't know that `strtok(buf, ",-")` splits on BOTH characters as a set
+
+### Final status table format:
+
+```markdown
+| # | Severity | Final Status | Notes |
+|---|----------|-------------|-------|
+| C1 | Critical | ✅ Confirmed | Parser column count mismatch |
+| M2 | Medium | ❌ Not valid | c_max division-by-zero cannot occur |
+| M6 | Medium | ✅ Confirmed | User checked wrong file (Makefile, not docs) |
+```
+
+## Phase 6: Execute fixes — Prioritized defect remediation
+
+After findings are confirmed, execute fixes in a disciplined order.
+
+### Fix ordering strategy:
+
+1. **Simple surgical fixes first** (1-3 line changes): flag removal, guard addition, order swap. These build confidence and are easy to review.
+2. **Medium-complexity fixes next** (regex updates, initialization changes): require understanding but not rewriting.
+3. **Parser/logic rewrites last** (the hardest changes): require fixture updates and may cascade to test assertions.
+
+### Procedure for each fix:
+
+```
+1. Edit the code
+2. Compile (for C) or syntax-check (for Python)
+3. Run full test suite
+4. If tests fail, fix the test/fixture before proceeding
+```
+
+### Commit strategy:
+
+- **One commit for all related fixes** when they share a root cause (e.g., "parser and fixture both wrong")
+- **Separate commits for unrelated fix categories** (e.g., "C code fixes" vs "shell script fixes") when they touch different files
+- **Commit message format**: Lead with the severity counts, then list each fix with a one-line description
+
+### Parser rewrite pattern (for C1-type bugs):
+
+When a Python parser uses hardcoded column counts to match C output:
+
+1. **Replace fixed-count matching with header-based mapping**: Parse the column header line (`# target_MHz\tactual_MHz\t...`) to build a `{field_name: column_index}` dictionary, then use it for all data rows.
+2. **Replace tab-split with whitespace-split** for space-padded fields: Use `body.split()` instead of `body.split("\t")` when C uses `printf("%-8s")` formatting.
+3. **Regenerate test fixtures** to match the actual C output format. The fixture must be a byte-exact copy of what the C tool produces, not a hand-crafted approximation.
+4. **Update test assertions** that reference fixture-specific values if the fixture format changed.
+
 ## Output format
 
 Produce a severity-graded report:
@@ -92,3 +162,8 @@ Each finding: **Location → Problem → Impact → Fix suggestion**.
 
 ### Multi-process state tracking
 12. **Per-core vs per-freq ready flags** — if `shm->ready[c]` is a single boolean per core (not per frequency point), and it's cleared at the start of each freq loop, then a fork failure on the *last* frequency point wipes all previously-successful data for that core. Use per-frequency-per-core ready flags, or aggregate immediately after each freq loop.
+
+### User-corrected verification patterns
+13. **Users catch file-confusion errors that agents miss** — An agent may verify a finding against the wrong file (e.g., check Makefile when the finding was about docs/error-message, or check C code when the finding was about a shell script). Always include the *exact file and line number* in each finding so the user can verify efficiently.
+14. **Theoretical vs practical edge cases** — Agents tend to flag "what if X is zero?" without checking whether an earlier code path guarantees X > 0. Users with domain knowledge dismiss these instantly. Before flagging, grep for guards that prevent the condition.
+15. **Parser rewrites must include fixture regeneration** — Fixing the parser alone is insufficient if the test fixture was hand-crafted to match the old parser's wrong assumptions. The fixture must be regenerated from actual C output, and any test assertions that reference fixture-specific values must be updated. This is a 3-step process: fix parser → regenerate fixture → update assertions.

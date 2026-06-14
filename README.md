@@ -99,18 +99,18 @@ an issue.
    in the header and look at the data rows.
 
 6. **The two wrapper scripts:**
-   - `run_all_tests.sh` — 6 predefined suites, **~10-30 min**. Use for a
+   - `run_all_tests.sh` — 7 predefined suites, **~15-40 min**. Use for a
      quick health check.
-   - `run_full_sweep.sh` — 52 tests across stride × core-count × NUMA,
+   - `run_full_sweep.sh` — 57 tests across stride × core-count × NUMA × cache hierarchy,
      **~3-4 h**. Use for deep analysis. See `docs/run_full_sweep.md`.
 
 ## One-Click Wrappers
 
 ```bash
-sudo ./run_all_tests.sh                  # 6 suites, 10-30 min
+sudo ./run_all_tests.sh                  # 7 suites, 15-40 min
 sudo ./run_all_tests.sh --suite 1,4      # just suites 1 and 4
-sudo ./run_full_sweep.sh                 # 52 tests, 3-4 hours
-sudo ./run_full_sweep.sh --quick         # 15 tests, ~30 min
+sudo ./run_full_sweep.sh                 # 57 tests, 3-4 hours
+sudo ./run_full_sweep.sh --quick         # 57 tests, ~1-2 hours (2s × 2 samples)
 sudo python3 memfreq_sweep.py            # run + ASCII bar charts
 sudo python3 memfreq_sweep.py --file results.txt   # re-parse saved output
 sudo python3 memfreq_sweep.py --json     # also write memfreq_results.json
@@ -120,7 +120,7 @@ sudo python3 memfreq_sweep.py --json     # also write memfreq_results.json
 
 - `docs/memfreq-bench.md` — full design rationale, microarchitecture, noise
   model, high-core-count tuning. The single best reference for "why".
-- `docs/run_full_sweep.md` — complete guide to the 52-test deep sweep and
+- `docs/run_full_sweep.md` — complete guide to the 57-test deep sweep and
   how to read the FULL_REPORT.txt it generates.
 
 ## Requirements

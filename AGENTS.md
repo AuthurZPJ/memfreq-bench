@@ -22,7 +22,7 @@ make test_stats && ./test_stats
 sudo ./memfreq_bench -m 512       # array must exceed L3 cache
 
 # One-click wrappers
-sudo ./run_all_tests.sh           # 6 predefined suites, ~10–30 min
+sudo ./run_all_tests.sh           # 7 predefined suites, ~15–40 min
 sudo ./run_full_sweep.sh          # exhaustive grid, ~3–4 h
 
 # Visualization
@@ -46,8 +46,8 @@ There is one lightweight test suite (`bash tests/test_stats_output.sh`,
 | `tests/test_stats.c` | C unit tests for the stats helpers (no Linux/cpufreq required). |
 | `tests/test_stats_output.sh` | Shell test harness: 77 assertions over Python parser, JSON output, compare mode, plus runs `test_stats`. |
 | `tests/fixtures/` | TSV/JSON fixtures used by the shell harness. |
-| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA). |
-| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA matrix. |
+| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA, cache hierarchy). |
+| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (57 tests). |
 | `docs/memfreq-bench.md` | Full design rationale, microarchitectural analysis, noise model, tuning guide. **The single best reference for "why" questions.** |
 | `README.md` | Quick-start only. |
 

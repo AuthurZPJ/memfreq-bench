@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -22,7 +22,7 @@ make test_stats && ./test_stats
 sudo ./memfreq_bench -m 512       # array must exceed L3 cache
 
 # One-click wrappers
-sudo ./run_all_tests.sh           # 6 predefined suites, ~10–30 min
+sudo ./run_all_tests.sh           # 7 predefined suites, ~15–40 min
 sudo ./run_full_sweep.sh          # exhaustive grid, ~3–4 h
 
 # Visualization
@@ -32,22 +32,22 @@ python3 memfreq_sweep.py --json                # also write memfreq_results.json
 ```
 
 There is one lightweight test suite (`bash tests/test_stats_output.sh`,
-76 assertions, runs anywhere POSIX) plus the e2e `run_*.sh` scripts.
+77 assertions, runs anywhere POSIX) plus the e2e `run_*.sh` scripts.
 
 ## Repository layout
 
 | File | Role |
 |------|------|
-| `memfreq_bench.c` | Main C benchmark (~85 KB, ~2600 lines). Workloads, sysfs, topology, fork-based multicore coordinator, output formatting. |
-| `stats.c` | Statistical helpers (~195 lines): `find_sweet_spot`, `bootstrap_sweet_spot_ci`, `detect_plateau`, `percentile`, `cmp_double`. |
+| `memfreq_bench.c` | Main C benchmark (~90 KB, ~2930 lines). Workloads, sysfs, topology, fork-based multicore coordinator, output formatting. |
+| `stats.c` | Statistical helpers (~213 lines): `find_sweet_spot`, `bootstrap_sweet_spot_ci`, `detect_plateau`, `percentile`, `cmp_double`. |
 | `stats.h` | Public API for stats.c plus `MAX_FREQS` / `MAX_SAMPLES` constants. |
 | `memfreq_sweep.py` | Python runner + TSV parser + ASCII chart visualizer. |
 | `Makefile` | Build for `memfreq_bench` and `test_stats`. |
 | `tests/test_stats.c` | C unit tests for the stats helpers (no Linux/cpufreq required). |
-| `tests/test_stats_output.sh` | Shell test harness: 76 assertions over Python parser, JSON output, compare mode, plus runs `test_stats`. |
+| `tests/test_stats_output.sh` | Shell test harness: 77 assertions over Python parser, JSON output, compare mode, plus runs `test_stats`. |
 | `tests/fixtures/` | TSV/JSON fixtures used by the shell harness. |
-| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA). |
-| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA matrix. |
+| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA, cache hierarchy). |
+| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (57 tests). |
 | `docs/memfreq-bench.md` | Full design rationale, microarchitectural analysis, noise model, tuning guide. **The single best reference for "why" questions.** |
 | `README.md` | Quick-start only. |
 
@@ -71,11 +71,12 @@ numbers drift with edits — use the banners, not line refs, to find things):
    `scaling_min_freq`/`scaling_max_freq` range mode (generates a stepped grid
    via `gen_freq_range`). The `step_khz` CLI flag controls CPPC step size.
 
-4. **Frequency control** (`set_freq`): the **write-max-before-min order** is
-   load-bearing — if you write min first when it exceeds current max, the
-   kernel rejects it. Save originals on entry, restore on exit. Boost is
-   disabled before the run via `boost_disable` and re-enabled in the cleanup
-   path.
+4. **Frequency control** (`set_freq`): a **three-step write** is
+   load-bearing — (1) widen max to hardware limit, (2) set min to target,
+   (3) tighten max to target. Writing min first when it exceeds current max
+   would be rejected by the kernel. The target is clamped to hardware max
+   to prevent CPPC overshoot. `freq_lock()` handles setup, `freq_cleanup()`
+   handles teardown (including signal-safe exit via `atexit`).
 
 5. **Workloads** (all `__attribute__((noinline))` so the compiler keeps the
    loop intact):
@@ -165,8 +166,8 @@ Sweet-spot threshold is the literal constant `THRESHOLD` (= 0.95) in the C sourc
 - **`-m` must exceed L3** or the benchmark measures cache, not DRAM. Use `-A`.
 - **chase is the latency-bound test, stride is moderate, compute is the control.** Don't conflate their sweet spots — they answer different questions.
 - **`compute_%` is a sanity check on freq locking**, not a result. If it doesn't track the freq ratio, the measurement is invalid.
-- The main C file is `memfreq_bench.c` (~85 KB, ~2600 lines); statistical
-  helpers live in `stats.c` (~195 lines) + `stats.h` (~84 lines). All
+- The main C file is `memfreq_bench.c` (~90 KB, ~2930 lines); statistical
+  helpers live in `stats.c` (~213 lines) + `stats.h` (~84 lines). All
   files are cleanly sectioned by `/* --- */` banners — find-by-section
   is faster than find-by-symbol, and line numbers drift with edits.
 
