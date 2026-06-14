@@ -328,7 +328,51 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - IQR 全程 < 1% → 机器安静,数据可信
 - 低频点 IQR 突然变大 → 该频点测量置信度低,谨慎使用
 
-#### 2. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
+#### 2. `# --- sweet-spot CI ---`
+
+每次 sweep 的甜点是单点估计;这个块给出"如果我重跑这个实验,甜点会落在哪"的区间。保证 `low_MHz ≤ sweet_MHz ≤ high_MHz` 恒成立。
+
+```
+# --- sweet-spot CI ---
+# workload  sweet_MHz  low_MHz  high_MHz  method
+# stride    2000       1700     2050      iqr_1.96/sqrt(5)
+# chase     2000       1800     2050      iqr_1.96/sqrt(5)
+# random    1800       1700     2000      iqr_1.96/sqrt(5)
+# compute   —          —        —         no_plateau
+```
+
+- `sweet_MHz` = 现有 95% 甜点(标题值,基于 raw median 吞吐)
+- `low_MHz` = 乐观下界(最优情况下能接受多低的频率)
+- `high_MHz` = 保守上界(最坏情况下需要的频率)
+- `method` = 使用的 CI 方法
+
+**两种方法,自动选择:**
+
+1. **IQR 法(默认,无 `-r`)**:对每个 freq 计算 `throughput ± α·IQR`,其中 `α = 1.96 / √N`(N = `nsamples`)。用 UPPER 曲线找乐观下界(高频点吞吐更乐观,可以降得更低),用 LOWER 曲线找保守上界(高频点吞吐更悲观,需要更高频率保安全)。方法标签为 `iqr_1.96/sqrt(N)`。
+
+2. **Bootstrap 法(带 `-r` / `--emit-raw`)**:有 raw per-sample 数据时使用。`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。方法标签为 `bootstrap_1000`。用确定性 LCG 种子(`state=42`),结果可复现。
+
+**解读:**
+- `low == sweet == high` → 数据噪声极小(IQR≈0 或只有 1 个样本),单点估计很可靠
+- `low < sweet < high` 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
+- 区间宽(> 500 MHz)→ 测量噪声大,或工作负载对频率敏感;考虑增加 `-n 5` 或更长 `-t`
+- `— / — / —` + `no_plateau` → 该 workload 无平台(典型 compute-bound),`find_sweet_spot` 返回 0
+
+**示例输出**(`-m 512 -t 3 -n 5`):
+
+```
+# --- sweet-spot CI ---
+# workload  sweet_MHz  low_MHz  high_MHz  method
+# stride    1600       1200     1600      iqr_1.96/sqrt(5)
+# chase     1200       1200     1200      iqr_1.96/sqrt(5)
+# compute   —          —        —         no_plateau
+```
+
+`stride` 的乐观下界低于甜点(测量有 spread 时乐观地能降频),`chase` 完全 memory-bound 三者相同(测得完全平),`compute` 无甜点。
+
+**JSON 字段**:每个 workload 一行 `{"workload": "stride", "sweet_mhz": 1600, "low_mhz": 1200, "high_mhz": 1600, "method": "iqr_1.96/sqrt(5)"}`,`null` 表示无数据(对应 em-dash)。
+
+#### 3. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
 
 不同阈值下的甜点。判断决策鲁棒性：
 
@@ -345,7 +389,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - 0.80 和 0.99 给的甜点差 < 100 MHz → 决策鲁棒
 - 差 > 500 MHz → 工作负载对阈值敏感,挑高的阈值更安全
 
-#### 3. `# --- plateau ---`
+#### 4. `# --- plateau ---`
 
 分段线性检测,给出 `plateau_breakpoint` 和 `slope ratio`：
 
@@ -360,7 +404,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - `—`  → 无平台,吞吐随频率持续上升（典型 compute-bound）
 - 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
 
-#### 4. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
+#### 5. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
 
 每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）；Python `--compare` 不需要这个。
 
@@ -376,7 +420,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 行数 = `n_freqs × nsamples`。20 频点 × 5 样本 = 100 行/workload。
 
-#### 5. `# --- plateau ---` 中的 `power:` 行
+#### 6. `# --- plateau ---` 中的 `power:` 行
 
 `# --- plateau ---` 块在每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
 
@@ -394,7 +438,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 ### JSON 输出包含的新字段
 
-`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 4 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
+`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 6 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
 
 ```json
 {
@@ -422,6 +466,12 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
     "random":  [...],
     "compute": [...]
   },
+  "sweet_spot_ci": [
+    {"workload": "stride",  "sweet_mhz": 2000, "low_mhz": 1700, "high_mhz": 2050, "method": "iqr_1.96/sqrt(5)"},
+    {"workload": "chase",   "sweet_mhz": 2000, "low_mhz": 1800, "high_mhz": 2050, "method": "iqr_1.96/sqrt(5)"},
+    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "iqr_1.96/sqrt(5)"},
+    {"workload": "compute", "sweet_mhz": null, "low_mhz": null, "high_mhz": null, "method": "no_plateau"}
+  ],
   "data": [{"freq_mhz": 800, "stride_mops": 141.3, ...}, ...]
 }
 ```
