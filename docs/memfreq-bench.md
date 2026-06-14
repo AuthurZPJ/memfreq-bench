@@ -309,6 +309,50 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - **stride_MBs**：显式带宽报告（MB/s），比 Mops 更直观
 - **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
 
+#### 数据行每列含义
+
+| 列 | 类型 | 计算 |
+|----|------|------|
+| `target_MHz` | int | 写到 `scaling_min/max_freq` 的目标频率 / 1000 |
+| `actual_MHz` | int | `verify_freq()` 从 `cpuinfo_cur_freq`（瞬时）读到的实际频率，失败回退 `cpuinfo_avg_freq`（`memfreq_bench.c:1433-1457`）|
+| `stride_Mops` | %.1f | stride workload 的 ops/sec 取 `nsamples` 次中位数 / 1e6 |
+| `stride_MBs` | %.1f | `stride_tput × 8 / 2^20`（`OPS_TO_MBS` 宏，`memfreq_bench.c:64`）—— 8 = `uint64_t` 元素字节数 |
+| `stride_%` | %.1f | `stride_tput / s_max × 100` |
+| `chase_Mops` | %.1f | chase workload 的 ops/sec 中位数 / 1e6 |
+| `chase_%` | %.1f | `chase_tput / c_max × 100` |
+| `compute_Mops` | %.1f | compute workload 的 ops/sec 中位数 / 1e6 |
+| `compute_%` | %.1f | `compute_tput / p_max × 100` |
+
+**分母 `s_max` / `c_max` / `p_max` 的定义**：取**最高有效频率点**（`ref = highest valid freq`，`memfreq_bench.c:2754-2759`）的对应 workload 吞吐，**不是扫到的全局最大值**。因此最高频点行的 `*_%` 定义上 = 100.0；高频点采样失败或频率没锁住时 `*_%` 会被低估。
+
+**几个隐含的工程细节**：
+
+- **TAB 分隔**：实际是 TSV（本节用空格展示是为了可读性；AGENTS.md 写的是真实格式）
+- **`actual_MHz ≠ target_MHz` 是诊断信号**：差超过 ±2% 警惕 CPPC 拒步 / turbo 漏过
+- **中位数 vs 平均值**：每个 freq 跑 `nsamples` 次取**中位数**，对单次中断异常不敏感
+- **有功耗传感器时追加列**：见下方 "数据行功耗列含义"
+
+#### 数据行功耗列含义
+
+仅当检测到功耗传感器时追加。两种模式物理意义不同：
+
+| 列 | 类型 | 计算 |
+|----|------|------|
+| `idle_W` | %.2f | 频率切换 + 1.1s 稳定后、测试**前** `read_power()` 采样（µW / 1e6）。仅 HWMON |
+| `load_W` | %.2f | 所有 workload 跑**完**后 `read_power()` 采样（µW / 1e6）。仅 HWMON |
+| `delta_W` | %.2f | `load_W - idle_W`（SoC 增量功耗，去掉 baseline）。仅 HWMON |
+| `energy_J` | %.3f | RAPL: 累积 µJ 差 / 1e6（`power_after - power_before`）；HWMON: `(load - idle) µW × elapsed_sec / 1e6` |
+
+**RAPL vs HWMON**：
+
+- **RAPL**（Intel/AMD x86，`/sys/class/powercap/intel-rapl:0/energy_uj`）：硬件积分的累积 µJ，直接差分 = 本次测试消耗的能量。**只输出 `energy_J`，无 `idle_W` / `load_W`**
+- **HWMON**（ARM 等无 RAPL 系统，`/sys/class/hwmon/*/power1_input`）：瞬时 µW。`energy_J = (P_load - P_idle) × elapsed` 去掉 SoC baseline，只算测试本身的贡献。读取前 sleep 1.1s（`memfreq_bench.c:2632-2633`）让平均窗口稳定
+
+**几个注意点**：
+
+- `energy_J` 覆盖**整个测试窗口**（`t_energy_start` → `t_energy_end`，`memfreq_bench.c:2647-2736`）——所有 4 个 workload（stride / chase / random / compute）共用一行，不是单 workload
+- 传感器未检测到（`npower_paths == 0`）时这 1-4 列直接不输出，header 也不带这些字段
+
 ### 新增统计段
 
 数据行之后,会按顺序追加 5 个 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
