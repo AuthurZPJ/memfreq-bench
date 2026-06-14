@@ -1870,7 +1870,7 @@ int main(int argc, char **argv)
 	double  threshold      = 0.95;  /* user-overridable sweet-spot threshold */
 	int     n_user_thresholds = 0;
 	double  user_thresholds[MAX_USER_THRESHOLDS];
-	int     emit_raw       __attribute__((unused)) = 0;     /* -r: per-sample data in output, used in Task 6 */
+	int     emit_raw       = 0;     /* -r: per-sample data in output */
 	int     no_plateau     = 0;     /* -P: suppress plateau block */
 	int   opt;
 
@@ -2079,6 +2079,13 @@ int main(int argc, char **argv)
 	struct result *results = calloc(nfreqs, sizeof(*results));
 	double *buf = malloc(nsamples * sizeof(*buf));
 
+	/* Raw sample storage: only allocated when --emit-raw is set.
+	 * Layout: [freq_idx][workload][sample_idx], where workload order is
+	 * 0=stride, 1=chase, 2=random, 3=compute. */
+	double *raw = NULL;
+	if (emit_raw)
+		raw = calloc((size_t)nfreqs * 4 * nsamples, sizeof(double));
+
 	/*
 	 * Sweep from highest to lowest frequency.
 	 * First measurement at max freq establishes the reference baseline
@@ -2146,6 +2153,7 @@ int main(int argc, char **argv)
 						      test_secs);
 		}
 		qsort(buf, nsamples, sizeof(double), cmp_double);
+		if (raw) memcpy(raw + ((size_t)fi * 4 + 0) * nsamples, buf, nsamples * sizeof(double));
 		results[fi].stride_tput = buf[nsamples / 2];
 		results[fi].stride_min = buf[0];
 		results[fi].stride_max = buf[nsamples - 1];
@@ -2160,6 +2168,7 @@ int main(int argc, char **argv)
 			for (int s = 0; s < nsamples; s++)
 				buf[s] = bench_chase(chase_nodes, test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
+			if (raw) memcpy(raw + ((size_t)fi * 4 + 1) * nsamples, buf, nsamples * sizeof(double));
 			results[fi].chase_tput = buf[nsamples / 2];
 			results[fi].chase_min  = buf[0];
 			results[fi].chase_max  = buf[nsamples - 1];
@@ -2174,6 +2183,7 @@ int main(int argc, char **argv)
 				buf[s] = bench_random(arr, random_idx, count,
 						      test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
+			if (raw) memcpy(raw + ((size_t)fi * 4 + 2) * nsamples, buf, nsamples * sizeof(double));
 			results[fi].random_tput = buf[nsamples / 2];
 			results[fi].random_min  = buf[0];
 			results[fi].random_max  = buf[nsamples - 1];
@@ -2186,6 +2196,7 @@ int main(int argc, char **argv)
 		for (int s = 0; s < nsamples; s++)
 			buf[s] = bench_compute(test_secs);
 		qsort(buf, nsamples, sizeof(double), cmp_double);
+		if (raw) memcpy(raw + ((size_t)fi * 4 + 3) * nsamples, buf, nsamples * sizeof(double));
 		results[fi].compute_tput = buf[nsamples / 2];
 		results[fi].compute_min = buf[0];
 		results[fi].compute_max = buf[nsamples - 1];
@@ -2540,7 +2551,27 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* ---- raw samples (only if --emit-raw / -r) ---- */
+	if (raw) {
+		const char *raw_labels[] = {"stride", "chase", "random", "compute"};
+		int raw_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		for (int w = 0; w < 4; w++) {
+			if (!raw_enabled[w]) continue;
+			printf("#\n# --- raw_samples (%s) ---\n", raw_labels[w]);
+			printf("# freq_MHz  sample_idx  mops\n");
+			for (int fi = 0; fi < nfreqs; fi++) {
+				if (!results[fi].valid) continue;
+				for (int s = 0; s < nsamples; s++) {
+					printf("# %d\t%d\t%.1f\n",
+					       results[fi].freq_khz / 1000, s + 1,
+					       raw[((size_t)fi * 4 + w) * nsamples + s] / 1e6);
+				}
+			}
+		}
+	}
+
 	free(buf);
+	free(raw);
 	free(results);
 	free(arr);
 	free(chase_nodes);
