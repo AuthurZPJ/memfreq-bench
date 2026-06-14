@@ -58,6 +58,33 @@ if [ -d /sys/devices/system/cpu/cpu0/cpufreq ] && \
     CPUFREQ_OK=1
 fi
 
+# --- C unit tests for stats.c ---
+# These run on any POSIX system (no root / no cpufreq). They cover
+# the math correctness fixes (P0 issues 1, 2, 6) and the edge
+# cases that the e2e Python fixtures can't reach. The C binary
+# prints one PASS/FAIL line per check; the shell harness counts them
+# via grep.
+echo "=== Test 0: C unit tests for stats.c (no cpufreq required) ==="
+make test_stats >/dev/null 2>&1
+TEST_STATS_BIN="$ROOT_DIR/test_stats"
+if [ ! -x "$TEST_STATS_BIN" ]; then
+    skip "test_stats binary not built"
+else
+    UNIT_OUT=$("$TEST_STATS_BIN" 2>&1)
+    UNIT_RC=$?
+    # Each PASS/FAIL line in the C output becomes one assertion here.
+    while IFS= read -r line; do
+        if [[ "$line" == *"  PASS: "* ]]; then
+            pass "${line#*PASS: }"
+        elif [[ "$line" == *"  FAIL: "* ]]; then
+            fail "${line#*FAIL: }"
+        fi
+    done <<< "$UNIT_OUT"
+    if [ $UNIT_RC -ne 0 ] && ! grep -q FAIL <<< "$UNIT_OUT"; then
+        fail "test_stats exited with rc=$UNIT_RC"
+    fi
+fi
+
 echo "=== Test 1: --help shows new flags ==="
 HELP=$($BIN -h 2>&1)
 check_contains "help mentions -T FRAC"  "$HELP" "-T FRAC"
