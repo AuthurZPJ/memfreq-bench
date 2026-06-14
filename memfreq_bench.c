@@ -668,8 +668,9 @@ bench_stride(const uint64_t *arr, size_t count, size_t stride, double secs)
 		iterations++;
 	}
 	double elapsed = now() - start;
-	/* "accesses per second" = total cache line loads / time */
-	return (double)iterations * ((double)count / stride) / elapsed;
+	/* ops/sec = inner_loop_iterations × outer_iterations / time */
+	size_t inner_iters = (count + stride - 1) / stride;
+	return (double)iterations * (double)inner_iters / elapsed;
 }
 
 /* Flush-enabled stride: clflush/dc cvac after each read */
@@ -690,7 +691,8 @@ bench_stride_flush(const uint64_t *arr, size_t count, size_t stride,
 		iterations++;
 	}
 	double elapsed = now() - start;
-	return (double)iterations * ((double)count / stride) / elapsed;
+	size_t inner_iters = (count + stride - 1) / stride;
+	return (double)iterations * (double)inner_iters / elapsed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -794,19 +796,19 @@ static struct pnode *build_chase(size_t nnodes)
 }
 
 static double __attribute__((noinline))
-bench_chase(struct pnode *start, double secs)
+bench_chase(struct pnode *start, size_t nnodes, double secs)
 {
 	struct pnode *p = start;
 	size_t iterations = 0;
 	double t0 = now();
 
 	while (now() - t0 < secs) {
-		for (size_t i = 0; i < 100000; i++)
+		for (size_t i = 0; i < nnodes; i++)
 			p = p->next;
 		iterations++;
 	}
 	double elapsed = now() - t0;
-	return (double)iterations * 100000.0 / elapsed;
+	return (double)iterations * (double)nnodes / elapsed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1607,9 +1609,10 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 					arr[i] = i * 2654435761ULL;
 
 				struct pnode *chase_nodes = NULL;
+				size_t nn = 0;
 				if (do_chase) {
 					seed_rand((unsigned int)my_cpu);
-					size_t nn = array_bytes / CL;
+					nn = array_bytes / CL;
 					chase_nodes = build_chase(nn);
 				}
 
@@ -1635,7 +1638,7 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 				if (do_chase && chase_nodes) {
 					for (int s = 0; s < ns; s++)
 						buf_mc[s] = bench_chase(
-							chase_nodes,
+							chase_nodes, nn,
 							test_secs);
 					qsort(buf_mc, ns, sizeof(double),
 					      cmp_double);
@@ -2035,9 +2038,10 @@ int main(int argc, char **argv)
 	}
 
 	struct pnode *chase_nodes = NULL;
+	size_t nnodes = 0;
 	if (do_chase) {
 		seed_rand(0);
-		size_t nnodes = array_bytes / CL;
+		nnodes = array_bytes / CL;
 		chase_nodes = build_chase(nnodes);
 		if (!chase_nodes) {
 			dprintf("WARN: chase alloc failed, skipping\n");
@@ -2217,7 +2221,7 @@ int main(int argc, char **argv)
 		/* chase */
 		if (do_chase) {
 			for (int s = 0; s < nsamples; s++)
-				buf[s] = bench_chase(chase_nodes, test_secs);
+				buf[s] = bench_chase(chase_nodes, nnodes, test_secs);
 			qsort(buf, nsamples, sizeof(double), cmp_double);
 			if (raw) memcpy(raw + ((size_t)fi * 4 + 1) * nsamples, buf, nsamples * sizeof(double));
 			results[fi].chase_tput = buf[nsamples / 2];
@@ -2827,4 +2831,6 @@ int main(int argc, char **argv)
 	free(random_idx);
 	return 0;
 }
+
+
 
