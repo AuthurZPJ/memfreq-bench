@@ -572,6 +572,20 @@ static int rec_max = -1;            /* saved scaling_max_freq */
 static int rec_boost = 0;           /* 1 = turbo was successfully disabled */
 static volatile sig_atomic_t rec_signal = 0; /* signal caught during critical section */
 
+/*
+ * Save original freq range, set recovery state, disable turbo boost.
+ * Call freq_cleanup() (defined below) to restore on exit.
+ */
+static void freq_lock(int cpu)
+{
+	save_freq_range(cpu, &rec_min, &rec_max);
+	rec_cpu = cpu;
+	if (boost_disable() < 0)
+		dprintf("WARN: could not disable turbo boost\n");
+	else
+		rec_boost = 1;
+}
+
 /* Recovery / signal-safe exit                                          */
 /* ------------------------------------------------------------------ */
 static void freq_cleanup(void)
@@ -1217,6 +1231,20 @@ static int check_system_idle(int *online_cpus)
 	return 0;
 }
 
+/*
+ * Idle gate: refuse to run if system is too busy.
+ * Returns online CPU count on success, -1 if benchmark should abort.
+ */
+static int idle_gate_check(int force_run)
+{
+	int ncpus_online = 0;
+	if (!force_run && check_system_idle(&ncpus_online) < 0)
+		return -1;
+	if (ncpus_online == 0)
+		ncpus_online = sysconf(_SC_NPROCESSORS_ONLN);
+	return ncpus_online;
+}
+
 /* ------------------------------------------------------------------ */
 /* Power / energy measurement                                          */
 /*                                                                     */
@@ -1456,6 +1484,14 @@ struct mc_shared {
 	volatile int ready[MAX_CPUS];      /* 1 = child done (sync flag)        */
 };
 
+/* Forward declarations for output helpers used by both run_multicore()
+ * and main().  Definitions follow run_multicore(). */
+enum power_mode { PWR_NONE, PWR_RAPL, PWR_HWMON };
+static void print_column_header(int do_chase, enum power_mode pm);
+static void print_data_rows(const struct result *results, int nfreqs,
+                            double s_max, double c_max, double p_max,
+                            int do_chase, enum power_mode pm);
+
 /*
  * Run benchmark on multiple cores in parallel using fork().
  *
@@ -1467,7 +1503,7 @@ struct mc_shared {
  */
 static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 			 int nsamples, int do_chase, int step_khz,
-			 int force_run)
+			 int force_run, double threshold)
 {
 	/* ---- detect topology ---- */
 	struct numa_node nodes[MAX_NODES];
@@ -1499,11 +1535,9 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 	}
 
 	/* ---- system idle check ---- */
-	int ncpus_online = 0;
-	if (!force_run && check_system_idle(&ncpus_online) < 0)
+	int ncpus_online = idle_gate_check(force_run);
+	if (ncpus_online < 0)
 		return 1;
-	if (ncpus_online == 0)
-		ncpus_online = sysconf(_SC_NPROCESSORS_ONLN);
 
 	/* ---- read frequencies (use first selected CPU) ---- */
 	int freqs[MAX_FREQS];
@@ -1531,19 +1565,8 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 	memcpy(shm->freqs, freqs, nfreqs * sizeof(int));
 	memset((void *)shm->ready, 0, sizeof(shm->ready));
 
-	/* ---- save original frequency range ---- */
-	int orig_min, orig_max;
-	save_freq_range(selected_cpus[0], &orig_min, &orig_max);
-	/* set recovery state for signal handler / atexit */
-	rec_cpu = selected_cpus[0];
-	rec_min = orig_min;
-	rec_max = orig_max;
-
-	/* ---- disable turbo ---- */
-	if (boost_disable() < 0)
-		dprintf("WARN: could not disable turbo boost\n");
-	else
-		rec_boost = 1;
+	/* ---- lock frequency + disable turbo ---- */
+	freq_lock(selected_cpus[0]);
 
 	/* ---- banner ---- */
 	dprintf("=== memfreq_bench (multi-core) ===\n");
@@ -1674,9 +1697,7 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 	}
 
 	/* ---- restore ---- */
-	boost_enable();
-	restore_freq_range(selected_cpus[0], orig_min, orig_max);
-	rec_cpu = -1;
+	freq_cleanup();
 
 	/* ---- aggregate results (median across cores per freq) ---- */
 	printf("# %s\n", "memfreq_bench multi-core results");
@@ -1686,32 +1707,15 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 		printf("%d ", selected_cpus[i]);
 	printf("\n#\n");
 
-	if (do_chase) {
-		printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		     "target_MHz", "actual_MHz",
-		     "stride_Mops", "stride_MBs", "stride_%",
-		     "chase_Mops", "chase_%",
-		     "compute_Mops", "compute_%");
-	} else {
-		printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		     "target_MHz", "actual_MHz",
-		     "stride_Mops", "stride_MBs", "stride_%",
-		     "compute_Mops", "compute_%");
-	}
-
 	/* find reference (highest freq) */
 	double *stride_buf = calloc(ncpu, sizeof(double));
 	double *chase_buf = calloc(ncpu, sizeof(double));
 	double *compute_buf = calloc(ncpu, sizeof(double));
 
-	/* collect per-freq median across cores */
-	struct {
-		int target_khz;
-		int actual_khz;
-		double stride_median;
-		double chase_median;
-		double compute_median;
-	} agg[MAX_FREQS];
+	/* collect per-freq median across cores into struct result[]
+	 * so we can reuse print_column_header() and print_data_rows(). */
+	struct result mc_results[MAX_FREQS];
+	memset(mc_results, 0, sizeof(mc_results));
 
 	for (int fi = 0; fi < nfreqs; fi++) {
 		int nc = 0;
@@ -1726,79 +1730,90 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 				nc++;
 			}
 		}
-		if (nc == 0)
+		if (nc == 0) {
+			mc_results[fi].valid = 0;
 			continue;
+		}
 
 		qsort(stride_buf, nc, sizeof(double), cmp_double);
-		agg[fi].stride_median = stride_buf[nc / 2];
 		if (do_chase) {
 			qsort(chase_buf, nc, sizeof(double), cmp_double);
-			agg[fi].chase_median = chase_buf[nc / 2];
+			mc_results[fi].chase_tput = chase_buf[nc / 2];
 		}
 		qsort(compute_buf, nc, sizeof(double), cmp_double);
-		agg[fi].compute_median = compute_buf[nc / 2];
-		agg[fi].target_khz = freqs[fi];
-		agg[fi].actual_khz = shm->per_core[0].actual_khz[fi];
+		mc_results[fi].valid = 1;
+		mc_results[fi].freq_khz = freqs[fi];
+		mc_results[fi].actual_khz = shm->per_core[0].actual_khz[fi];
+		mc_results[fi].stride_tput = stride_buf[nc / 2];
+		mc_results[fi].compute_tput = compute_buf[nc / 2];
 	}
 
 	/* reference = highest freq */
-	double s_max = agg[nfreqs - 1].stride_median;
-	double c_max = do_chase ? agg[nfreqs - 1].chase_median : 0;
-	double p_max = agg[nfreqs - 1].compute_median;
+	int mc_ref = -1;
+	for (int fi = nfreqs - 1; fi >= 0; fi--) {
+		if (mc_results[fi].valid) { mc_ref = fi; break; }
+	}
+	if (mc_ref < 0) {
+		dprintf("ERROR: no frequency point succeeded in multi-core mode\n");
+		free(stride_buf); free(chase_buf); free(compute_buf);
+		munmap(shm, shm_size);
+		return 1;
+	}
+	double s_max = mc_results[mc_ref].stride_tput;
+	double c_max = do_chase ? mc_results[mc_ref].chase_tput : 0;
+	double p_max = mc_results[mc_ref].compute_tput;
 
-	double THRESHOLD = 0.95;
-	int stride_sweet = 0, chase_sweet = 0;
-
+	/* build ascending-freq arrays for find_sweet_spot() */
+	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], compute_mops[MAX_FREQS];
+	int    freqs_khz[MAX_FREQS];
+	int    n_valid = 0;
 	for (int fi = 0; fi < nfreqs; fi++) {
-		if (agg[fi].stride_median <= 0)
-			continue;
-		if (!stride_sweet &&
-		    agg[fi].stride_median >= s_max * THRESHOLD)
-			stride_sweet = agg[fi].target_khz;
-		if (do_chase && !chase_sweet &&
-		    agg[fi].chase_median >= c_max * THRESHOLD)
-			chase_sweet = agg[fi].target_khz;
+		if (!mc_results[fi].valid) continue;
+		stride_mops[n_valid]  = mc_results[fi].stride_tput;
+		chase_mops[n_valid]   = mc_results[fi].chase_tput;
+		compute_mops[n_valid] = mc_results[fi].compute_tput;
+		freqs_khz[n_valid]    = mc_results[fi].freq_khz;
+		n_valid++;
 	}
 
-	/* output rows */
-	for (int fi = 0; fi < nfreqs; fi++) {
-		if (agg[fi].stride_median <= 0)
-			continue;
-		int t_mhz = agg[fi].target_khz / 1000;
-		int a_mhz = agg[fi].actual_khz / 1000;
-		double s_pct = agg[fi].stride_median / s_max * 100.0;
-		double p_pct = agg[fi].compute_median / p_max * 100.0;
-		double s_mbs = OPS_TO_MBS(agg[fi].stride_median);
+	int stride_sweet_idx = -1, chase_sweet_idx = -1;
+	int stride_sweet = find_sweet_spot(stride_mops, freqs_khz, n_valid,
+	                                   &stride_sweet_idx, threshold);
+	int chase_sweet  = do_chase
+		? find_sweet_spot(chase_mops, freqs_khz, n_valid,
+		                  &chase_sweet_idx, threshold)
+		: 0;
 
-		if (do_chase) {
-			double c_pct = agg[fi].chase_median / c_max * 100.0;
-			printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
-			       t_mhz, a_mhz,
-			       agg[fi].stride_median / 1e6, s_mbs, s_pct,
-			       agg[fi].chase_median / 1e6, c_pct,
-			       agg[fi].compute_median / 1e6, p_pct);
-		} else {
-			printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
-			       t_mhz, a_mhz,
-			       agg[fi].stride_median / 1e6, s_mbs, s_pct,
-			       agg[fi].compute_median / 1e6, p_pct);
-		}
-	}
+	/* column header + data rows (reuse single-core helpers, PWR_NONE) */
+	print_column_header(do_chase, PWR_NONE);
+	print_data_rows(mc_results, nfreqs, s_max, c_max, p_max,
+	                do_chase, PWR_NONE);
 
 	/* summary */
 	printf("#\n");
 	printf("# === Sweet spot (lowest freq ≥ %.0f%% of max throughput) ===\n",
-	       THRESHOLD * 100);
+	       threshold * 100);
+
 	if (stride_sweet)
-		printf("# stride  sweet spot: %d MHz (%d%% of max %d MHz)\n",
+		printf("# stride  sweet spot: %d MHz  (%d%% of max %d MHz)\n",
 		       stride_sweet / 1000,
 		       stride_sweet * 100 / freqs[nfreqs - 1],
 		       freqs[nfreqs - 1] / 1000);
 	if (do_chase && chase_sweet)
-		printf("# chase   sweet spot: %d MHz (%d%% of max %d MHz)\n",
+		printf("# chase   sweet spot: %d MHz  (%d%% of max %d MHz)\n",
 		       chase_sweet / 1000,
 		       chase_sweet * 100 / freqs[nfreqs - 1],
 		       freqs[nfreqs - 1] / 1000);
+	printf("# compute sweet spot: — (scales linearly, always needs max freq)\n");
+
+	/* Interpretation guide */
+	printf("#\n");
+	printf("# How to read:\n");
+	printf("#   stride/chase %% stays high at low freq → workload is memory-bound\n");
+	printf("#     → sweet spot is low, you can save energy by dropping freq\n");
+	printf("#   stride/chase %% drops with freq        → workload has compute component\n");
+	printf("#     → sweet spot is higher, be careful with aggressive DVFS\n");
+	printf("#   compute %% ≈ freq ratio                → sanity check (pure compute)\n");
 
 	free(stride_buf);
 	free(chase_buf);
@@ -1814,8 +1829,6 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 /* passes the data it needs; no function touches global state beyond   */
 /* the power-path globals already read by detect_power_sensors().      */
 /* ------------------------------------------------------------------ */
-
-enum power_mode { PWR_NONE, PWR_RAPL, PWR_HWMON };
 
 static enum power_mode get_power_mode(void)
 {
@@ -2431,7 +2444,8 @@ int main(int argc, char **argv)
 	/* ---- multi-core mode ---- */
 	if (ncpu > 1) {
 		return run_multicore(ncpu, size_mb, stride, test_secs,
-				     nsamples, do_chase, step_khz, force_run);
+				     nsamples, do_chase, step_khz, force_run,
+				     threshold);
 	}
 
 	/* ---- validate ---- */
@@ -2441,11 +2455,9 @@ int main(int argc, char **argv)
 	}
 
 	/* ---- system idle gate (from sbc-bench) ---- */
-	int ncpus_online = 0;
-	if (!force_run && check_system_idle(&ncpus_online) < 0)
+	int ncpus_online = idle_gate_check(force_run);
+	if (ncpus_online < 0)
 		return 1;
-	if (ncpus_online == 0)
-		ncpus_online = sysconf(_SC_NPROCESSORS_ONLN);
 
 	/* ---- detect power sensors ---- */
 	detect_power_sensors();
@@ -2517,13 +2529,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* ---- save original frequency range ---- */
-	int orig_min, orig_max;
-	save_freq_range(cpu, &orig_min, &orig_max);
-	/* set recovery state for signal handler / atexit */
-	rec_cpu = cpu;
-	rec_min = orig_min;
-	rec_max = orig_max;
+	/* ---- lock frequency + disable turbo ---- */
+	freq_lock(cpu);
 
 	/* ---- banner ---- */
 	int proc_nodes[MAX_NODES];
@@ -2567,11 +2574,6 @@ int main(int argc, char **argv)
 	dprintf("Sweep     : high → low (max freq first = reference baseline)\n");
 	dprintf("\n");
 
-	/* ---- disable turbo ---- */
-	if (boost_disable() < 0)
-		dprintf("WARN: could not disable turbo boost\n");
-	else
-		rec_boost = 1;
 	struct result *results = calloc(nfreqs, sizeof(*results));
 	double *buf = malloc(nsamples * sizeof(*buf));
 
@@ -2738,9 +2740,7 @@ int main(int argc, char **argv)
 			temp_after / 1000, (temp_after % 1000) / 100);
 
 	/* ---- restore ---- */
-	boost_enable();
-	restore_freq_range(cpu, orig_min, orig_max);
-	rec_cpu = -1;
+	freq_cleanup();
 
 	/* ---- find valid reference (highest successful freq) ---- */
 	int ref = -1;
@@ -2867,12 +2867,14 @@ int main(int argc, char **argv)
 	 * statistics, and a confidence interval on the sweet spot has
 	 * to propagate resampled medians, not raw IQR. The bootstrap
 	 * does this correctly. */
+	/* workload-enabled flags: stride always, chase/random if enabled, compute always */
+	int wl_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+
 	if (raw && !summary) {
 		const double *ci_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
-		int ci_enabled[]  = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
 		int headline_khz[] = {stride_sweet, chase_sweet, 0, 0};
 		print_sweet_spot_ci(raw, nsamples, ci_mops, freqs_khz, n_valid,
-		                    threshold, headline_khz, ci_enabled,
+		                    threshold, headline_khz, wl_enabled,
 		                    compact_to_results);
 	}
 
@@ -2883,9 +2885,8 @@ int main(int argc, char **argv)
 	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
 	if (n_user_thresholds > 0 && !summary) {
 		const double *sens_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
-		int sens_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
 		print_sensitivity(n_user_thresholds, user_thresholds,
-		                  sens_mops, freqs_khz, n_valid, sens_enabled);
+		                  sens_mops, freqs_khz, n_valid, wl_enabled);
 	}
 
 	/* ---- plateau block (one row per workload that ran) ----
@@ -2895,16 +2896,13 @@ int main(int argc, char **argv)
 	 * < 2.0 ⇒ throughput keeps rising with frequency (compute-bound). */
 	if (!no_plateau && !summary) {
 		const double *plat_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
-		int plat_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
 		print_plateau(plat_mops, freqs_khz, n_valid, threshold,
-		              results, nfreqs, plat_enabled, compact_to_results);
+		              results, nfreqs, wl_enabled, compact_to_results);
 	}
 
 	/* ---- raw samples (only if --emit-raw / -r) ---- */
-	if (raw && !summary) {
-		int raw_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
-		print_raw_samples(raw, nsamples, nfreqs, results, raw_enabled);
-	}
+	if (raw && !summary)
+		print_raw_samples(raw, nsamples, nfreqs, results, wl_enabled);
 
 	/* ---- freq-lock sanity check ---- */
 	print_freq_lock_sanity(results, nfreqs);
