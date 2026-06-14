@@ -30,6 +30,12 @@
 # 1600	158.0	162.0	160.0	2.00
 # 2000	198.0	202.0	200.0	2.00
 #
+# --- sweet-spot CI ---
+# workload	sweet_MHz	low_MHz	high_MHz	method
+# stride	1200	1200	1200	iqr_1.96/sqrt(5)
+# chase	2000	2000	2000	iqr_1.96/sqrt(5)
+# compute	—	—	—	no_plateau
+#
 # --- sensitivity (stride) ---
 # threshold  sweet_spot_MHz
 # 0.80	800

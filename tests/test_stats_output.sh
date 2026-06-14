@@ -106,15 +106,26 @@ print('pfs_workloads=' + ','.join(sorted(data.get('per_freq_stats', {}).keys()))
 print('sens_workloads=' + ','.join(sorted(data.get('sensitivity', {}).keys())))
 print('plateau_rows=' + str(len(data.get('plateau', []))))
 print('raw_workloads=' + ','.join(sorted(data.get('raw_samples', {}).keys())))
+print('ci_workloads=' + ','.join(sorted({r['workload'] for r in data.get('sweet_spot_ci', [])})))
+print('ci_method=' + (data.get('sweet_spot_ci', [{}])[0].get('method', '?')))
+print('ci_sweet=' + str(data.get('sweet_spot_ci', [{}])[0].get('sweet_mhz', '?')))
+print('ci_low=' + str(data.get('sweet_spot_ci', [{}])[0].get('low_mhz', '?')))
+print('ci_high=' + str(data.get('sweet_spot_ci', [{}])[0].get('high_mhz', '?')))
 " 2>&1)
 check_contains "parse_output returns per_freq_stats"  "$PARSE_OUT" "per_freq_stats"
 check_contains "parse_output returns sensitivity"    "$PARSE_OUT" "sensitivity"
 check_contains "parse_output returns plateau"        "$PARSE_OUT" "plateau"
 check_contains "parse_output returns raw_samples"    "$PARSE_OUT" "raw_samples"
+check_contains "parse_output returns sweet_spot_ci"  "$PARSE_OUT" "sweet_spot_ci"
 check_contains "per_freq_stats has stride workload"  "$PARSE_OUT" "pfs_workloads=chase,compute,stride"
 check_contains "sensitivity has stride workload"     "$PARSE_OUT" "sens_workloads=chase,compute,stride"
 check_contains "plateau has 3 rows"                  "$PARSE_OUT" "plateau_rows=3"
 check_contains "raw_samples has stride workload"     "$PARSE_OUT" "raw_workloads=compute,stride"
+check_contains "sweet_spot_ci has stride workload"   "$PARSE_OUT" "ci_workloads=chase,compute,stride"
+check_contains "CI method label is iqr_1.96/sqrt(5)" "$PARSE_OUT" "ci_method=iqr_1.96/sqrt(5)"
+check_contains "CI sweet_MHz parses as int"          "$PARSE_OUT" "ci_sweet=1200"
+check_contains "CI low_MHz parses as int"            "$PARSE_OUT" "ci_low=1200"
+check_contains "CI high_MHz parses as int"           "$PARSE_OUT" "ci_high=1200"
 
 echo "=== Test 7: --json writes the new blocks to memfreq_results.json ==="
 # Run the Python parser against the fixture TSV with --json and verify
@@ -132,6 +143,7 @@ else
     check_contains "JSON has sensitivity key"    "$KEYS" "sensitivity"
     check_contains "JSON has plateau key"        "$KEYS" "plateau"
     check_contains "JSON has raw_samples key"    "$KEYS" "raw_samples"
+    check_contains "JSON has sweet_spot_ci key"  "$KEYS" "sweet_spot_ci"
     check_contains "JSON preserves meta key"     "$KEYS" "meta"
     check_contains "JSON preserves data key"     "$KEYS" "data"
     check_contains "JSON preserves sweet_spot_mhz" "$KEYS" "sweet_spot_mhz"

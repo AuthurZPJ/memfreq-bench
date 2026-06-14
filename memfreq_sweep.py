@@ -30,6 +30,7 @@ _PERFREQ_HEADER = re.compile(r"^# --- per-freq stats \(([^)]+)\) ---$")
 _SENS_HEADER = re.compile(r"^# --- sensitivity \(([^)]+)\) ---$")
 _RAW_HEADER = re.compile(r"^# --- raw_samples \(([^)]+)\) ---$")
 _PLATEAU_HEADER = re.compile(r"^# --- plateau ---$")
+_CI_HEADER = re.compile(r"^# --- sweet-spot CI ---$")
 # Generic catch-all so we can detect end-of-block before falling through.
 _ANY_HEADER = re.compile(r"^# --- [^-].* ---$")
 
@@ -203,6 +204,42 @@ def _parse_raw_samples_block(lines):
     return rows
 
 
+def _parse_sweet_spot_ci_block(lines):
+    """Parse a `sweet-spot CI` block.
+
+    Data rows: `workload<TAB>sweet_MHz<TAB>low_MHz<TAB>high_MHz<TAB>method`
+    where any of the MHz columns may be an em-dash ("no plateau").
+    """
+    rows = []
+    for ln in lines:
+        if not ln.startswith("#"):
+            continue
+        body = ln[1:].strip()
+        if not body or body.startswith("---") or "workload" in body.lower():
+            continue
+        parts = body.split("\t")
+        if len(parts) < 5:
+            continue
+        wl = parts[0].strip()
+        method = parts[4].strip()
+        def _int_or_none(s):
+            s = s.strip()
+            if s in ("\u2014", "-", ""):
+                return None
+            try:
+                return int(s)
+            except ValueError:
+                return None
+        rows.append({
+            "workload": wl,
+            "sweet_mhz": _int_or_none(parts[1]),
+            "low_mhz":   _int_or_none(parts[2]),
+            "high_mhz":  _int_or_none(parts[3]),
+            "method":    method,
+        })
+    return rows
+
+
 def parse_output(text: str) -> dict:
     meta = {}
     rows = []
@@ -216,6 +253,7 @@ def parse_output(text: str) -> dict:
     sensitivity: dict[str, list] = {}
     plateau: list = []
     raw_samples: dict[str, list] = {}
+    sweet_spot_ci: list = []
 
     i = 0
     n = len(lines)
@@ -282,6 +320,15 @@ def parse_output(text: str) -> dict:
             raw_samples[wl] = _parse_raw_samples_block(block_lines)
             i = j
             continue
+        if _CI_HEADER.match(line):
+            j = i + 1
+            block_lines = []
+            while j < n and not _ANY_HEADER.match(lines[j]):
+                block_lines.append(lines[j])
+                j += 1
+            sweet_spot_ci = _parse_sweet_spot_ci_block(block_lines)
+            i = j
+            continue
 
         if line.startswith("#"):
             # Other comment lines (preamble, interpretation guide, etc.)
@@ -318,6 +365,7 @@ def parse_output(text: str) -> dict:
         "sensitivity": sensitivity,
         "plateau": plateau,
         "raw_samples": raw_samples,
+        "sweet_spot_ci": sweet_spot_ci,
     }
 
 
@@ -492,6 +540,7 @@ def main():
             "sensitivity": data.get("sensitivity", {}),
             "plateau": data.get("plateau", []),
             "raw_samples": data.get("raw_samples", {}),
+            "sweet_spot_ci": data.get("sweet_spot_ci", []),
             "data": data["rows"],
         }
         jpath = "memfreq_results.json"
