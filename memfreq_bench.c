@@ -2382,6 +2382,33 @@ int main(int argc, char **argv)
 		       results[fi].compute_iqr  / 1e6);
 	}
 
+	/* ---- sensitivity blocks (only if --thresholds / -L was given) ----
+	 * Re-runs sweet-spot detection at each user-supplied threshold so the
+	 * user can see how sensitive the decision is to threshold choice.
+	 * Per workload: stride always; chase/random only if that workload ran.
+	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
+	if (n_user_thresholds > 0) {
+		printf("#\n# --- sensitivity ---\n");
+		const char *labels[] = {"stride", "chase", "random", "compute"};
+		double *arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
+		int     enabled[]   = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		for (int w = 0; w < 4; w++) {
+			if (!enabled[w]) continue;
+			printf("#\n# --- sensitivity (%s) ---\n", labels[w]);
+			printf("# threshold  sweet_spot_MHz\n");
+			for (int ti = 0; ti < n_user_thresholds; ti++) {
+				int idx = -1;
+				int khz = find_sweet_spot(arrs[w], freqs_khz, n_valid,
+				                          &idx, user_thresholds[ti]);
+				if (khz > 0)
+					printf("# %.2f\t%d\n",
+					       user_thresholds[ti], khz / 1000);
+				else
+					printf("# %.2f\t\xe2\x80\x94\n", user_thresholds[ti]);
+			}
+		}
+	}
+
 	free(buf);
 	free(results);
 	free(arr);
