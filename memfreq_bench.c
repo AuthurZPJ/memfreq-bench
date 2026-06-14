@@ -1808,6 +1808,447 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 }
 
 /* ------------------------------------------------------------------ */
+/* Output formatting helpers                                           */
+/*                                                                     */
+/* Each function prints one section of the TSV output.  The caller     */
+/* passes the data it needs; no function touches global state beyond   */
+/* the power-path globals already read by detect_power_sensors().      */
+/* ------------------------------------------------------------------ */
+
+enum power_mode { PWR_NONE, PWR_RAPL, PWR_HWMON };
+
+static enum power_mode get_power_mode(void)
+{
+	if (npower_paths > 0 && !power_is_uj)
+		return PWR_HWMON;
+	if (npower_paths > 0)
+		return PWR_RAPL;
+	return PWR_NONE;
+}
+
+/*
+ * Column header row.  The column set depends on power mode and whether
+ * the chase workload is enabled — 6 branches in the original code,
+ * collapsed to one function here.
+ */
+static void print_column_header(int do_chase, enum power_mode pm)
+{
+	if (pm == PWR_HWMON) {
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%",
+			     "idle_W", "load_W", "delta_W", "energy_J");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "compute_Mops", "compute_%",
+			     "idle_W", "load_W", "delta_W", "energy_J");
+		}
+	} else if (pm == PWR_RAPL) {
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%",
+			     "energy_J");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "compute_Mops", "compute_%",
+			     "energy_J");
+		}
+	} else {
+		if (do_chase) {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "chase_Mops",   "chase_%",
+			     "compute_Mops", "compute_%");
+		} else {
+			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			     "target_MHz", "actual_MHz",
+			     "stride_Mops", "stride_MBs", "stride_%",
+			     "compute_Mops", "compute_%");
+		}
+	}
+}
+
+/*
+ * Data rows: one TSV line per valid frequency point.
+ * Power columns are appended when a sensor is available.
+ */
+static void print_data_rows(const struct result *results, int nfreqs,
+                            double s_max, double c_max, double p_max,
+                            int do_chase, enum power_mode pm)
+{
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid)
+			continue;
+		int target_mhz = results[fi].freq_khz / 1000;
+		int actual_mhz = results[fi].actual_khz / 1000;
+		double s_pct = results[fi].stride_tput / s_max * 100.0;
+		double p_pct = results[fi].compute_tput / p_max * 100.0;
+
+		if (pm == PWR_HWMON) {
+			double idle_w = results[fi].idle_power_uw / 1e6;
+			double load_w = results[fi].load_power_uw / 1e6;
+			double delta_w = load_w - idle_w;
+			double e_j = results[fi].energy_uj / 1e6;
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       idle_w, load_w, delta_w, e_j);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       idle_w, load_w, delta_w, e_j);
+			}
+		} else if (pm == PWR_RAPL) {
+			double e_j = results[fi].energy_uj / 1e6;
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       e_j);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct,
+				       e_j);
+			}
+		} else {
+			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
+			if (do_chase) {
+				double c_pct =
+					results[fi].chase_tput / c_max * 100.0;
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].chase_tput / 1e6, c_pct,
+				       results[fi].compute_tput / 1e6, p_pct);
+			} else {
+				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+				       target_mhz, actual_mhz,
+				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
+				       results[fi].compute_tput / 1e6, p_pct);
+			}
+		}
+	}
+}
+
+/*
+ * Per-freq stats blocks: min/max/median/IQR for each workload at each
+ * frequency point.  Header label uses "Mops" for stride/chase and
+ * "MOps" for random/compute — matches the original C source casing.
+ *
+ * Accessor functions extract the four stats from a result row so we
+ * can iterate workloads without offsetof gymnastics.
+ */
+typedef void (*stat_accessors)(const struct result *,
+                               double *mn, double *mx, double *md, double *iq);
+
+static void stride_stats(const struct result *r,
+                         double *mn, double *mx, double *md, double *iq)
+{ *mn = r->stride_min; *mx = r->stride_max;
+  *md = r->stride_tput; *iq = r->stride_iqr; }
+
+static void chase_stats(const struct result *r,
+                        double *mn, double *mx, double *md, double *iq)
+{ *mn = r->chase_min; *mx = r->chase_max;
+  *md = r->chase_tput; *iq = r->chase_iqr; }
+
+static void random_stats(const struct result *r,
+                         double *mn, double *mx, double *md, double *iq)
+{ *mn = r->random_min; *mx = r->random_max;
+  *md = r->random_tput; *iq = r->random_iqr; }
+
+static void compute_stats(const struct result *r,
+                          double *mn, double *mx, double *md, double *iq)
+{ *mn = r->compute_min; *mx = r->compute_max;
+  *md = r->compute_tput; *iq = r->compute_iqr; }
+
+static void print_one_per_freq_stats(const char *workload, const char *unit,
+                                     const struct result *results, int nfreqs,
+                                     stat_accessors get)
+{
+	printf("#\n# --- per-freq stats (%s) ---\n", workload);
+	printf("# freq_MHz  min_%s  max_%s  median_%s  iqr_%s\n",
+	       unit, unit, unit, unit);
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid) continue;
+		double mn, mx, md, iq;
+		get(&results[fi], &mn, &mx, &md, &iq);
+		printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
+		       results[fi].freq_khz / 1000,
+		       mn / 1e6, mx / 1e6, md / 1e6, iq / 1e6);
+	}
+}
+
+static void print_per_freq_stats(const struct result *results, int nfreqs,
+                                 int do_chase, int do_random)
+{
+	print_one_per_freq_stats("stride", "Mops", results, nfreqs, stride_stats);
+	if (do_chase)
+		print_one_per_freq_stats("chase", "Mops", results, nfreqs, chase_stats);
+	if (do_random)
+		print_one_per_freq_stats("random", "MOps", results, nfreqs, random_stats);
+	print_one_per_freq_stats("compute", "MOps", results, nfreqs, compute_stats);
+}
+
+/*
+ * Sweet-spot CI block: bootstrap-resamples per-freq raw samples and
+ * reports 2.5th/97.5th percentile of the resulting sweet-spot values.
+ *
+ * Raw layout: raw[(fi*4 + w)*nsamples + s], w ∈ {0=stride, 1=chase,
+ * 2=random, 3=compute}.  compact_to_results[] maps the compacted fi
+ * (0..n_valid-1) to the results[] index.
+ */
+static void print_sweet_spot_ci(const double *raw, int nsamples,
+                                const double *mops[4],
+                                const int *freqs_khz, int n_valid,
+                                double threshold,
+                                int headline_khz[4], int enabled[4],
+                                const int *compact_to_results)
+{
+	const char *labels[] = {"stride", "chase", "random", "compute"};
+
+	printf("#\n# --- sweet-spot CI ---\n");
+	printf("# workload  sweet_MHz  low_MHz  high_MHz  method\n");
+	for (int w = 0; w < 4; w++) {
+		if (!enabled[w]) continue;
+		int sweet = headline_khz[w];
+		if (w >= 2) {
+			int idx = -1;
+			sweet = find_sweet_spot(mops[w], freqs_khz,
+			                        n_valid, &idx, threshold);
+		}
+		if (sweet <= 0) {
+			printf("# %-8s  \xe2\x80\x94         \xe2\x80\x94       \xe2\x80\x94         no_plateau\n",
+			       labels[w]);
+			continue;
+		}
+		double *slice = malloc((size_t)n_valid * nsamples
+		                       * sizeof(double));
+		if (!slice) {
+			printf("# %-8s  %-9d  \xe2\x80\x94       \xe2\x80\x94         bootstrap_1000 (oom)\n",
+			       labels[w], sweet / 1000);
+			continue;
+		}
+		for (int fi = 0; fi < n_valid; fi++) {
+			int rfi = compact_to_results[fi];
+			memcpy(slice + fi * nsamples,
+			       raw + ((size_t)rfi * 4 + w) * nsamples,
+			       nsamples * sizeof(double));
+		}
+		int lo_khz = 0, hi_khz = 0;
+		bootstrap_sweet_spot_ci(slice, n_valid, nsamples,
+		                        freqs_khz, threshold, 1000,
+		                        &lo_khz, &hi_khz);
+		free(slice);
+		printf("# %-8s  %-9d  %-7d  %-9d  bootstrap_1000\n",
+		       labels[w],
+		       sweet / 1000,
+		       lo_khz / 1000,
+		       hi_khz / 1000);
+	}
+}
+
+/*
+ * Sensitivity blocks: re-runs sweet-spot detection at each user-supplied
+ * threshold so the user can see how sensitive the decision is.
+ */
+static void print_sensitivity(int n_user_thresholds,
+                              const double *user_thresholds,
+                              const double *mops[4],
+                              const int *freqs_khz, int n_valid,
+                              int enabled[4])
+{
+	const char *labels[] = {"stride", "chase", "random", "compute"};
+
+	for (int w = 0; w < 4; w++) {
+		if (!enabled[w]) continue;
+		printf("#\n# --- sensitivity (%s) ---\n", labels[w]);
+		printf("# threshold  sweet_spot_MHz\n");
+		for (int ti = 0; ti < n_user_thresholds; ti++) {
+			int idx = -1;
+			int khz = find_sweet_spot(mops[w], freqs_khz, n_valid,
+			                          &idx, user_thresholds[ti]);
+			if (khz > 0)
+				printf("# %.2f\t%d\n",
+				       user_thresholds[ti], khz / 1000);
+			else
+				printf("# %.2f\t\xe2\x80\x94\n", user_thresholds[ti]);
+		}
+	}
+}
+
+/*
+ * Plateau block: piecewise-linear breakpoint + slope ratio per workload,
+ * with power savings at the sweet spot when a sensor is available.
+ */
+static void print_plateau(const double *mops[4], const int *freqs_khz,
+                          int n_valid, double threshold,
+                          const struct result *results, int nfreqs,
+                          int enabled[4],
+                          const int *compact_to_results)
+{
+	const char *labels[] = {"stride", "chase", "random", "compute"};
+
+	printf("#\n# --- plateau ---\n");
+	for (int w = 0; w < 4; w++) {
+		if (!enabled[w]) continue;
+		int bp_mhz = 0, sweet_mhz = 0;
+		double ratio = 0.0;
+		int rc = detect_plateau(mops[w], freqs_khz, n_valid,
+		                        threshold, &bp_mhz, &ratio, &sweet_mhz);
+		if (rc == 0)
+			printf("# %-8s plateau_breakpoint: %d MHz  (slope ratio %.1fx, 95%% sweet spot %d MHz)\n",
+			       labels[w], bp_mhz, ratio, sweet_mhz);
+		else
+			printf("# %-8s plateau_breakpoint: \xe2\x80\x94  (no plateau; throughput keeps rising with frequency)\n",
+			       labels[w]);
+
+		/* Power at sweet spot */
+		int    max_power_idx      = -1;
+		double max_power_w        = 0.0;
+		int    max_power_freq_khz = 0;
+		for (int fi = 0; fi < nfreqs; fi++) {
+			if (!results[fi].valid) continue;
+			if (results[fi].load_power_uw <= 0) continue;
+			max_power_idx      = fi;
+			max_power_w        = results[fi].load_power_uw / 1e6;
+			max_power_freq_khz = results[fi].freq_khz;
+		}
+		if (rc == 0 && max_power_idx >= 0) {
+			int sweet_compact_idx = -1;
+			(void)find_sweet_spot(mops[w], freqs_khz,
+			                      n_valid, &sweet_compact_idx,
+			                      threshold);
+			if (sweet_compact_idx < 0 ||
+			    sweet_compact_idx >= n_valid)
+				continue;
+			int sweet_results_idx = compact_to_results[sweet_compact_idx];
+			if (sweet_results_idx < 0)
+				continue;
+			double sweet_power_w = results[sweet_results_idx].load_power_uw / 1e6;
+			double savings = (max_power_w - sweet_power_w)
+			                 / max_power_w * 100.0;
+			printf("# %-8s power: %.0fW at sweet spot (savings: %.0f%% vs %.0fW at %d MHz)\n",
+			       labels[w], sweet_power_w, savings,
+			       max_power_w, max_power_freq_khz / 1000);
+		} else if (rc != 0) {
+			printf("# %-8s power: N/A (no plateau)\n",
+			       labels[w]);
+		} else {
+			printf("# %-8s power: N/A (no sensor)\n",
+			       labels[w]);
+		}
+	}
+}
+
+/*
+ * Raw samples block: per-freq × per-sample throughput for each workload.
+ */
+static void print_raw_samples(const double *raw, int nsamples, int nfreqs,
+                              const struct result *results, int enabled[4])
+{
+	const char *labels[] = {"stride", "chase", "random", "compute"};
+
+	for (int w = 0; w < 4; w++) {
+		if (!enabled[w]) continue;
+		printf("#\n# --- raw_samples (%s) ---\n", labels[w]);
+		printf("# freq_MHz  sample_idx  mops\n");
+		for (int fi = 0; fi < nfreqs; fi++) {
+			if (!results[fi].valid) continue;
+			for (int s = 0; s < nsamples; s++) {
+				printf("# %d\t%d\t%.1f\n",
+				       results[fi].freq_khz / 1000, s + 1,
+				       raw[((size_t)fi * 4 + w) * nsamples + s] / 1e6);
+			}
+		}
+	}
+}
+
+/*
+ * Freq-lock sanity check: compute workload is CPU-bound, so its
+ * throughput must scale linearly with actual_khz if the frequency
+ * lock took.  R² < 0.90 is the smoking gun that it didn't.
+ */
+static void print_freq_lock_sanity(const struct result *results, int nfreqs)
+{
+	int n_lock_pts = 0;
+	for (int fi = 0; fi < nfreqs; fi++)
+		if (results[fi].valid) n_lock_pts++;
+	if (n_lock_pts < 4)
+		return;
+
+	double sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid) continue;
+		double x = results[fi].actual_khz / 1000.0;
+		double y = results[fi].compute_tput;
+		sum_x  += x;
+		sum_y  += y;
+		sum_xx += x * x;
+		sum_xy += x * y;
+	}
+	double denom = n_lock_pts * sum_xx - sum_x * sum_x;
+	if (denom <= 0)
+		return;
+
+	double slope     = (n_lock_pts * sum_xy - sum_x * sum_y) / denom;
+	double intercept = (sum_y - slope * sum_x) / n_lock_pts;
+	double mean_y    = sum_y / n_lock_pts;
+	double ss_res = 0, ss_tot = 0;
+	for (int fi = 0; fi < nfreqs; fi++) {
+		if (!results[fi].valid) continue;
+		double x = results[fi].actual_khz / 1000.0;
+		double y = results[fi].compute_tput;
+		double pred = slope * x + intercept;
+		ss_res += (y - pred) * (y - pred);
+		ss_tot += (y - mean_y) * (y - mean_y);
+	}
+	double r2 = ss_tot > 0 ? 1.0 - ss_res / ss_tot : 1.0;
+	printf("#\n# --- freq-lock sanity ---\n");
+	printf("# compute throughput vs actual frequency: "
+	       "R^2 = %.3f, slope = %.3f Mops/MHz\n", r2, slope);
+	if (r2 < 0.90) {
+		printf("# WARN: compute throughput does NOT scale linearly "
+		       "with frequency (R^2 = %.3f < 0.90)\n", r2);
+		printf("#       The frequency lock did NOT take — turbo, "
+		       "governor, or sysfs write may be bypassed.\n");
+		printf("#       Sweet-spot numbers from this run are NOT "
+		       "trustworthy. Re-run with:\n");
+		printf("#         - governor=performance, no turbo, "
+		       "verify /sys/devices/system/cpu/*/cpufreq/\n");
+		printf("#         - sudo ./memfreq_bench -F  (skip idle gate)\n");
+	} else {
+		printf("# OK: compute scales linearly with frequency — "
+		       "freq lock took, sweet-spot numbers are valid.\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -2330,52 +2771,8 @@ int main(int argc, char **argv)
 	printf("\n#\n");
 
 	/* column headers */
-	if (npower_paths > 0 && !power_is_uj) {
-		/* hwmon: idle_W, load_W, delta_W, energy_J */
-		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "chase_Mops",   "chase_%",
-			     "compute_Mops", "compute_%",
-			     "idle_W", "load_W", "delta_W", "energy_J");
-		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "compute_Mops", "compute_%",
-			     "idle_W", "load_W", "delta_W", "energy_J");
-		}
-	} else if (npower_paths > 0) {
-		/* RAPL: just energy_J */
-		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "chase_Mops",   "chase_%",
-			     "compute_Mops", "compute_%",
-			     "energy_J");
-		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "compute_Mops", "compute_%",
-			     "energy_J");
-		}
-	} else {
-		if (do_chase) {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "chase_Mops",   "chase_%",
-			     "compute_Mops", "compute_%");
-		} else {
-			printf("# %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			     "target_MHz", "actual_MHz",
-			     "stride_Mops", "stride_MBs", "stride_%",
-			     "compute_Mops", "compute_%");
-		}
-	}
+	enum power_mode pm = get_power_mode();
+	print_column_header(do_chase, pm);
 
 	/* reference = highest valid freq */
 	double s_max = results[ref].stride_tput;
@@ -2425,75 +2822,7 @@ int main(int argc, char **argv)
 		: 0;
 
 	/* data rows */
-	for (int fi = 0; fi < nfreqs; fi++) {
-		if (!results[fi].valid)
-			continue;
-		int target_mhz = results[fi].freq_khz / 1000;
-		int actual_mhz = results[fi].actual_khz / 1000;
-		double s_pct = results[fi].stride_tput / s_max * 100.0;
-		double p_pct = results[fi].compute_tput / p_max * 100.0;
-
-		if (npower_paths > 0 && !power_is_uj) {
-			/* hwmon: idle_W, load_W, delta_W, energy_J */
-			double idle_w = results[fi].idle_power_uw / 1e6;
-			double load_w = results[fi].load_power_uw / 1e6;
-			double delta_w = load_w - idle_w;
-			double e_j = results[fi].energy_uj / 1e6;
-			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
-			if (do_chase) {
-				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].chase_tput / 1e6, c_pct,
-				       results[fi].compute_tput / 1e6, p_pct,
-				       idle_w, load_w, delta_w, e_j);
-			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].compute_tput / 1e6, p_pct,
-				       idle_w, load_w, delta_w, e_j);
-			}
-		} else if (npower_paths > 0) {
-			/* RAPL: just energy_J */
-			double e_j = results[fi].energy_uj / 1e6;
-			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
-			if (do_chase) {
-				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].chase_tput / 1e6, c_pct,
-				       results[fi].compute_tput / 1e6, p_pct,
-				       e_j);
-			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].compute_tput / 1e6, p_pct,
-				       e_j);
-			}
-		} else {
-			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
-			if (do_chase) {
-				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].chase_tput / 1e6, c_pct,
-				       results[fi].compute_tput / 1e6, p_pct);
-			} else {
-				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
-				       target_mhz, actual_mhz,
-				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
-				       results[fi].compute_tput / 1e6, p_pct);
-			}
-		}
-	}
+	print_data_rows(results, nfreqs, s_max, c_max, p_max, do_chase, pm);
 
 	/* summary */
 	printf("#\n");
@@ -2522,56 +2851,8 @@ int main(int argc, char **argv)
 	printf("#   compute %% ≈ freq ratio                → sanity check (pure compute)\n");
 
 	/* ---- per-freq stats blocks ---- */
-	if (!summary) {
-	printf("#\n# --- per-freq stats (stride) ---\n");
-	printf("# freq_MHz  min_Mops  max_Mops  median_Mops  iqr_Mops\n");
-	for (int fi = 0; fi < nfreqs; fi++) {
-		if (!results[fi].valid) continue;
-		printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
-		       results[fi].freq_khz / 1000,
-		       results[fi].stride_min  / 1e6,
-		       results[fi].stride_max  / 1e6,
-		       results[fi].stride_tput / 1e6,
-		       results[fi].stride_iqr  / 1e6);
-	}
-	if (do_chase) {
-		printf("#\n# --- per-freq stats (chase) ---\n");
-		printf("# freq_MHz  min_Mops  max_Mops  median_Mops  iqr_Mops\n");
-		for (int fi = 0; fi < nfreqs; fi++) {
-			if (!results[fi].valid) continue;
-			printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
-			       results[fi].freq_khz / 1000,
-			       results[fi].chase_min  / 1e6,
-			       results[fi].chase_max  / 1e6,
-			       results[fi].chase_tput / 1e6,
-			       results[fi].chase_iqr  / 1e6);
-		}
-	}
-	if (do_random) {
-		printf("#\n# --- per-freq stats (random) ---\n");
-		printf("# freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps\n");
-		for (int fi = 0; fi < nfreqs; fi++) {
-			if (!results[fi].valid) continue;
-			printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
-			       results[fi].freq_khz / 1000,
-			       results[fi].random_min  / 1e6,
-			       results[fi].random_max  / 1e6,
-			       results[fi].random_tput / 1e6,
-			       results[fi].random_iqr  / 1e6);
-		}
-	}
-	printf("#\n# --- per-freq stats (compute) ---\n");
-	printf("# freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps\n");
-	for (int fi = 0; fi < nfreqs; fi++) {
-		if (!results[fi].valid) continue;
-		printf("# %d\t%.1f\t%.1f\t%.1f\t%.2f\n",
-		       results[fi].freq_khz / 1000,
-		       results[fi].compute_min  / 1e6,
-		       results[fi].compute_max  / 1e6,
-		       results[fi].compute_tput / 1e6,
-		       results[fi].compute_iqr  / 1e6);
-		}
-	}  /* end if (!summary) */
+	if (!summary)
+		print_per_freq_stats(results, nfreqs, do_chase, do_random);
 
 	/* ---- sweet-spot CI block ----
 	 * Quantifies run-to-run uncertainty on the 95% sweet spot by
@@ -2587,63 +2868,12 @@ int main(int argc, char **argv)
 	 * to propagate resampled medians, not raw IQR. The bootstrap
 	 * does this correctly. */
 	if (raw && !summary) {
-		const char *ci_labels[] = {"stride", "chase", "random", "compute"};
-		double *ci_arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
-		int ci_enabled[]       = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
-		int headline_khz[]     = {stride_sweet, chase_sweet, 0, 0};
-		printf("#\n# --- sweet-spot CI ---\n");
-		printf("# workload  sweet_MHz  low_MHz  high_MHz  method\n");
-		for (int w = 0; w < 4; w++) {
-			if (!ci_enabled[w]) continue;
-			int sweet = headline_khz[w];
-			/* compute sweet if not already (random, compute) */
-			if (w >= 2) {
-				int idx = -1;
-				sweet = find_sweet_spot(ci_arrs[w], freqs_khz,
-				                        n_valid, &idx, threshold);
-			}
-			if (sweet <= 0) {
-				/* no plateau -> emit em-dash for all four columns */
-				printf("# %-8s  \xe2\x80\x94         \xe2\x80\x94       \xe2\x80\x94         no_plateau\n",
-				       ci_labels[w]);
-				continue;
-			}
-			/* Bootstrap: pull the workload's slice from raw[]
-			 * (layout: raw[(fi*4 + w)*nsamples + s]). compact_to_results[]
-			 * maps the compacted fi (0..n_valid-1) to results[] index —
-			 * the invariant that every compacted freq has a valid
-			 * results[] entry is enforced by the assert at the top of
-			 * this function, so no silent zero-fill here. */
-			double *slice = malloc((size_t)n_valid * nsamples
-			                       * sizeof(double));
-			if (!slice) {
-				printf("# %-8s  %-9d  \xe2\x80\x94       \xe2\x80\x94         bootstrap_1000 (oom)\n",
-				       ci_labels[w], sweet / 1000);
-				continue;
-			}
-			for (int fi = 0; fi < n_valid; fi++) {
-				int rfi = compact_to_results[fi];
-				memcpy(slice + fi * nsamples,
-				       raw + ((size_t)rfi * 4 + w) * nsamples,
-				       nsamples * sizeof(double));
-			}
-			int lo_khz = 0, hi_khz = 0;
-			bootstrap_sweet_spot_ci(slice, n_valid, nsamples,
-			                        freqs_khz, threshold, 1000,
-			                        &lo_khz, &hi_khz);
-			free(slice);
-			/* No sanitization: bootstrap can legitimately return
-			 * lo > sweet or hi < sweet (e.g. skewed resample
-			 * median) — that is real signal about the headline's
-			 * uncertainty. Clamping it to the headline would hide
-			 * exactly the "the sweet spot might be elsewhere"
-			 * finding the CI block exists to surface. */
-			printf("# %-8s  %-9d  %-7d  %-9d  bootstrap_1000\n",
-			       ci_labels[w],
-			       sweet / 1000,
-			       lo_khz / 1000,
-			       hi_khz / 1000);
-		}
+		const double *ci_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
+		int ci_enabled[]  = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		int headline_khz[] = {stride_sweet, chase_sweet, 0, 0};
+		print_sweet_spot_ci(raw, nsamples, ci_mops, freqs_khz, n_valid,
+		                    threshold, headline_khz, ci_enabled,
+		                    compact_to_results);
 	}
 
 	/* ---- sensitivity blocks (only if --thresholds / -L was given) ----
@@ -2652,24 +2882,10 @@ int main(int argc, char **argv)
 	 * Per workload: stride always; chase/random only if that workload ran.
 	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
 	if (n_user_thresholds > 0 && !summary) {
-		const char *labels[] = {"stride", "chase", "random", "compute"};
-		double *arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
-		int     enabled[]   = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
-		for (int w = 0; w < 4; w++) {
-			if (!enabled[w]) continue;
-			printf("#\n# --- sensitivity (%s) ---\n", labels[w]);
-			printf("# threshold  sweet_spot_MHz\n");
-			for (int ti = 0; ti < n_user_thresholds; ti++) {
-				int idx = -1;
-				int khz = find_sweet_spot(arrs[w], freqs_khz, n_valid,
-				                          &idx, user_thresholds[ti]);
-				if (khz > 0)
-					printf("# %.2f\t%d\n",
-					       user_thresholds[ti], khz / 1000);
-				else
-					printf("# %.2f\t\xe2\x80\x94\n", user_thresholds[ti]);
-			}
-		}
+		const double *sens_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
+		int sens_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		print_sensitivity(n_user_thresholds, user_thresholds,
+		                  sens_mops, freqs_khz, n_valid, sens_enabled);
 	}
 
 	/* ---- plateau block (one row per workload that ran) ----
@@ -2678,150 +2894,20 @@ int main(int argc, char **argv)
 	 * the slope ratio. slope_ratio > 2.0 ⇒ real plateau (mem-bound);
 	 * < 2.0 ⇒ throughput keeps rising with frequency (compute-bound). */
 	if (!no_plateau && !summary) {
-		printf("#\n# --- plateau ---\n");
-		struct { const char *name; const double *mops; } workloads[] = {
-			{"stride",  stride_mops},
-			{"chase",   chase_mops},
-			{"random",  random_mops},
-			{"compute", compute_mops},
-		};
-		int enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
-		for (int w = 0; w < 4; w++) {
-			if (!enabled[w]) continue;
-			int bp_mhz = 0, sweet_mhz = 0;
-			double ratio = 0.0;
-			int rc = detect_plateau(workloads[w].mops, freqs_khz, n_valid,
-			                        threshold, &bp_mhz, &ratio, &sweet_mhz);
-			if (rc == 0)
-				printf("# %-8s plateau_breakpoint: %d MHz  (slope ratio %.1fx, 95%% sweet spot %d MHz)\n",
-				       workloads[w].name, bp_mhz, ratio, sweet_mhz);
-			else
-				printf("# %-8s plateau_breakpoint: \xe2\x80\x94  (no plateau; throughput keeps rising with frequency)\n",
-				       workloads[w].name);
-
-			/* Power at sweet spot: completes the DVFS thesis by
-			 * quantifying the energy savings achievable by running
-			 * at the sweet spot vs. max frequency. Requires both a
-			 * usable sweet spot (rc==0) and a power sensor. */
-			int    max_power_idx      = -1;
-			double max_power_w        = 0.0;
-			int    max_power_freq_khz = 0;
-			for (int fi = 0; fi < nfreqs; fi++) {
-				if (!results[fi].valid) continue;
-				if (results[fi].load_power_uw <= 0) continue;
-				max_power_idx      = fi;
-				max_power_w        = results[fi].load_power_uw / 1e6;
-				max_power_freq_khz = results[fi].freq_khz;
-			}
-			if (rc == 0 && max_power_idx >= 0) {
-				/* sweet_idx is into the compacted freqs_khz[] /
-				 * mops[] arrays. Walk results[] to find the row
-				 * whose freq_khz matches. Guard the lookup:
-				 * find_sweet_spot leaves *out_index untouched
-				 * when it returns 0, so sweet_compact_idx
-				 * could stay -1 and the next line would read
-				 * freqs_khz[-1]. rc==0 above (and the matching
-				 * sweet_khz>0 inside detect_plateau after the
-				 * P0-6 fix) makes this unlikely, but the guard
-				 * is cheap defense in depth. */
-				int sweet_compact_idx = -1;
-				(void)find_sweet_spot(workloads[w].mops, freqs_khz,
-				                      n_valid, &sweet_compact_idx,
-				                      threshold);
-				if (sweet_compact_idx < 0 ||
-				    sweet_compact_idx >= n_valid)
-					continue;
-				int sweet_results_idx = compact_to_results[sweet_compact_idx];
-				if (sweet_results_idx < 0)
-					continue;
-				double sweet_power_w = results[sweet_results_idx].load_power_uw / 1e6;
-				double savings = (max_power_w - sweet_power_w)
-				                 / max_power_w * 100.0;
-				printf("# %-8s power: %.0fW at sweet spot (savings: %.0f%% vs %.0fW at %d MHz)\n",
-				       workloads[w].name, sweet_power_w, savings,
-				       max_power_w, max_power_freq_khz / 1000);
-			} else if (rc != 0) {
-				printf("# %-8s power: N/A (no plateau)\n",
-				       workloads[w].name);
-			} else {
-				printf("# %-8s power: N/A (no sensor)\n",
-				       workloads[w].name);
-			}
-		}
+		const double *plat_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
+		int plat_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+		print_plateau(plat_mops, freqs_khz, n_valid, threshold,
+		              results, nfreqs, plat_enabled, compact_to_results);
 	}
 
 	/* ---- raw samples (only if --emit-raw / -r) ---- */
 	if (raw && !summary) {
-		const char *raw_labels[] = {"stride", "chase", "random", "compute"};
 		int raw_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
-		for (int w = 0; w < 4; w++) {
-			if (!raw_enabled[w]) continue;
-			printf("#\n# --- raw_samples (%s) ---\n", raw_labels[w]);
-			printf("# freq_MHz  sample_idx  mops\n");
-			for (int fi = 0; fi < nfreqs; fi++) {
-				if (!results[fi].valid) continue;
-				for (int s = 0; s < nsamples; s++) {
-					printf("# %d\t%d\t%.1f\n",
-					       results[fi].freq_khz / 1000, s + 1,
-					       raw[((size_t)fi * 4 + w) * nsamples + s] / 1e6);
-				}
-			}
-		}
+		print_raw_samples(raw, nsamples, nfreqs, results, raw_enabled);
 	}
 
-	/* ---- freq-lock sanity check ----
-	 * Compute is a CPU-bound control workload: if the frequency lock took,
-	 * its throughput must scale linearly with actual_khz. A low R² means
-	 * the actual frequency leaked through (turbo, governor override, etc.)
-	 * and the entire benchmark is suspect. */
-	int n_lock_pts = 0;
-	for (int fi = 0; fi < nfreqs; fi++)
-		if (results[fi].valid) n_lock_pts++;
-	if (n_lock_pts >= 4) {
-		double sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
-		for (int fi = 0; fi < nfreqs; fi++) {
-			if (!results[fi].valid) continue;
-			double x = results[fi].actual_khz / 1000.0;  /* MHz */
-			double y = results[fi].compute_tput;
-			sum_x  += x;
-			sum_y  += y;
-			sum_xx += x * x;
-			sum_xy += x * y;
-		}
-		double denom = n_lock_pts * sum_xx - sum_x * sum_x;
-		if (denom > 0) {
-			double slope     = (n_lock_pts * sum_xy - sum_x * sum_y) / denom;
-			double intercept = (sum_y - slope * sum_x) / n_lock_pts;
-			double mean_y    = sum_y / n_lock_pts;
-			double ss_res = 0, ss_tot = 0;
-			for (int fi = 0; fi < nfreqs; fi++) {
-				if (!results[fi].valid) continue;
-				double x = results[fi].actual_khz / 1000.0;
-				double y = results[fi].compute_tput;
-				double pred = slope * x + intercept;
-				ss_res += (y - pred) * (y - pred);
-				ss_tot += (y - mean_y) * (y - mean_y);
-			}
-			double r2 = ss_tot > 0 ? 1.0 - ss_res / ss_tot : 1.0;
-			printf("#\n# --- freq-lock sanity ---\n");
-			printf("# compute throughput vs actual frequency: "
-			       "R^2 = %.3f, slope = %.3f Mops/MHz\n", r2, slope);
-			if (r2 < 0.90) {
-				printf("# WARN: compute throughput does NOT scale linearly "
-				       "with frequency (R^2 = %.3f < 0.90)\n", r2);
-				printf("#       The frequency lock did NOT take — turbo, "
-				       "governor, or sysfs write may be bypassed.\n");
-				printf("#       Sweet-spot numbers from this run are NOT "
-				       "trustworthy. Re-run with:\n");
-				printf("#         - governor=performance, no turbo, "
-				       "verify /sys/devices/system/cpu/*/cpufreq/\n");
-				printf("#         - sudo ./memfreq_bench -F  (skip idle gate)\n");
-			} else {
-				printf("# OK: compute scales linearly with frequency — "
-				       "freq lock took, sweet-spot numbers are valid.\n");
-			}
-		}
-	}
+	/* ---- freq-lock sanity check ---- */
+	print_freq_lock_sanity(results, nfreqs);
 
 	free(buf);
 	free(raw);
