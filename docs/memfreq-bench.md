@@ -47,9 +47,9 @@ memory-bound:
 
 ---
 
-## 五种工作负载
+## 五种工作负载（三种默认，两种可选）
 
-工具运行五种基准测试，覆盖不同的"内存依赖度"：
+工具运行五种基准测试，覆盖不同的"内存依赖度"。默认启用 stride、chase、compute 三种；random（`-R`）和 flush（`-f`）需显式开启：
 
 ### 1. Stride（顺序遍历）
 
@@ -845,7 +845,7 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 1. **需要 root**：写 cpufreq sysfs 需要 root 权限
 2. **需要 cpufreq 驱动**：如果没有 `scaling_available_frequencies`，程序会报错退出
 3. **默认单核**：每个频率点默认只测一个 core，使用 `-N NCPU` 启用多核模式，测试多核访存的带宽饱和效应
-4. **不测功耗**：程序不读 RAPL / 电能计——甜点是纯性能角度的判定。要测实际节能效果，配合 `turbostat` 或 RAPL
+4. **功耗仅记录，不参与甜点判定**：程序会读取 RAPL / hwmon 功率传感器（如有），在 plateau 块输出甜点频率下的功耗和节能百分比。但甜点本身是纯性能角度的判定（95% 最大吞吐）。要更精确的功耗分析，配合 `turbostat`
 5. **stride 的 sum 有数据依赖**：`sum += arr[i]` 限制了流水线深度，但编译器可能展开为 partial sum，实际行为取决于 `-O2` 的优化策略。这不影响结论（仍然是 mem-bound 主导），但精确吞吐数值会因编译器而异
 6. **chase 的 100K 内循环**：如果 DRAM 极快（如 HBM），100K 次 × 50ns = 5ms 就结束，外层 `now()` 的调用开销（~15ns/call）占比 ~0.3%，可忽略
 7. **TLB 噪音**：4KB page 下 chase 的测量延迟包含 page walk 开销（~40ns/access），绝对延迟被高估 ~40%。不影响频率-吞吐的相对比较，需要绝对值请用 hugepage
