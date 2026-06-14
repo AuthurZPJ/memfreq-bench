@@ -1,27 +1,3 @@
-// 20 changes applied
-// + M-1 dc civac
-// + C-1 set_freq
-// + C-2 L3 size
-// + C-3 error path
-// + C-3 normal exit
-// + M-3 AMD RAPL
-// + M-6 HAVE_CACHE_FLUSH
-// + M-6 flush warning
-// + M-5 avg dir
-// + M-5 input dir
-// + M-5 input break
-// + H-2 multi-core domain
-// + H-3 buf dynamic
-// + H-3 stride buf
-// + H-3 chase buf
-// + H-3 compute buf
-// + H-3 qsort buf
-// + H-3 median buf
-// + H-3 buf_mc free
-// + H-4 sparse NUMA
-// ! WARNING: MISSING: M-2 range parsing
-// ! WARNING: MISSING: M-5 avg break
-// ! WARNING: MISSING: H-3 fix double-rename
 /*
  * memfreq_bench.c — Memory-bound frequency sweet-spot finder
  *
