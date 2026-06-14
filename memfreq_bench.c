@@ -2602,6 +2602,60 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* ---- freq-lock sanity check ----
+	 * Compute is a CPU-bound control workload: if the frequency lock took,
+	 * its throughput must scale linearly with actual_khz. A low R² means
+	 * the actual frequency leaked through (turbo, governor override, etc.)
+	 * and the entire benchmark is suspect. */
+	int n_lock_pts = 0;
+	for (int fi = 0; fi < nfreqs; fi++)
+		if (results[fi].valid) n_lock_pts++;
+	if (n_lock_pts >= 4) {
+		double sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
+		for (int fi = 0; fi < nfreqs; fi++) {
+			if (!results[fi].valid) continue;
+			double x = results[fi].actual_khz / 1000.0;  /* MHz */
+			double y = results[fi].compute_tput;
+			sum_x  += x;
+			sum_y  += y;
+			sum_xx += x * x;
+			sum_xy += x * y;
+		}
+		double denom = n_lock_pts * sum_xx - sum_x * sum_x;
+		if (denom > 0) {
+			double slope     = (n_lock_pts * sum_xy - sum_x * sum_y) / denom;
+			double intercept = (sum_y - slope * sum_x) / n_lock_pts;
+			double mean_y    = sum_y / n_lock_pts;
+			double ss_res = 0, ss_tot = 0;
+			for (int fi = 0; fi < nfreqs; fi++) {
+				if (!results[fi].valid) continue;
+				double x = results[fi].actual_khz / 1000.0;
+				double y = results[fi].compute_tput;
+				double pred = slope * x + intercept;
+				ss_res += (y - pred) * (y - pred);
+				ss_tot += (y - mean_y) * (y - mean_y);
+			}
+			double r2 = ss_tot > 0 ? 1.0 - ss_res / ss_tot : 1.0;
+			printf("#\n# --- freq-lock sanity ---\n");
+			printf("# compute throughput vs actual frequency: "
+			       "R^2 = %.3f, slope = %.3f Mops/MHz\n", r2, slope);
+			if (r2 < 0.90) {
+				printf("# WARN: compute throughput does NOT scale linearly "
+				       "with frequency (R^2 = %.3f < 0.90)\n", r2);
+				printf("#       The frequency lock did NOT take — turbo, "
+				       "governor, or sysfs write may be bypassed.\n");
+				printf("#       Sweet-spot numbers from this run are NOT "
+				       "trustworthy. Re-run with:\n");
+				printf("#         - governor=performance, no turbo, "
+				       "verify /sys/devices/system/cpu/*/cpufreq/\n");
+				printf("#         - sudo ./memfreq_bench -F  (skip idle gate)\n");
+			} else {
+				printf("# OK: compute scales linearly with frequency — "
+				       "freq lock took, sweet-spot numbers are valid.\n");
+			}
+		}
+	}
+
 	free(buf);
 	free(raw);
 	free(results);
