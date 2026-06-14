@@ -376,6 +376,58 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 行数 = `n_freqs × nsamples`。20 频点 × 5 样本 = 100 行/workload。
 
+#### 5. `# --- plateau ---` 中的 `power:` 行
+
+`# --- plateau ---` 块在每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
+
+```
+# stride   power: 45W at sweet spot (savings: 36% vs 71W at 2600 MHz)
+```
+
+- `45W` = 甜点频率下采样到的负载功率(RAPL 或 hwmon,µW → W)
+- `savings: 36%` = (max_freq 功率 − sweet_spot 功率) / max_freq 功率
+- `vs 71W at 2600 MHz` = 在最高频率点的功率(取最高频且有有效采样的点)
+
+如果该 workload 没有 plateau(compute-bound 典型情况)或机器没有功耗传感器,该行输出 `N/A (no plateau)` 或 `N/A (no sensor)`。
+
+**意义**：这条直接回答 DVFS 节能 thesis。memory-bound 工作负载的甜点频率低 + 甜点处功率远小于 max_freq 功率 = 实际节能空间。如果甜点处功率只比 max_freq 低 5%,即便频率降到甜点,节能效果也有限。
+
+### JSON 输出包含的新字段
+
+`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 4 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
+
+```json
+{
+  "meta": {...},
+  "sweet_spot_mhz": {"stride": 2000, "chase": 2000},
+  "per_freq_stats": {
+    "stride": [{"freq_mhz": 800, "min": 140.1, "max": 142.5, "median": 141.3, "iqr": 1.2}, ...],
+    "chase":  [...],
+    "random": [...],
+    "compute": [...]
+  },
+  "sensitivity": {
+    "stride": [{"threshold": 0.80, "sweet_spot_mhz": 1800}, {"threshold": 0.95, "sweet_spot_mhz": 2000}, ...],
+    "chase":  [...],
+    "compute": [{"threshold": 0.80, "sweet_spot_mhz": null}, ...]   ← null = 无 plateau
+  },
+  "plateau": [
+    {"workload": "stride",  "breakpoint_mhz": 2050, "slope_ratio": 18.3, "sweet_spot_mhz": 2000, "has_plateau": true},
+    {"workload": "chase",   "breakpoint_mhz": 2100, "slope_ratio": 22.1, "sweet_spot_mhz": 2000, "has_plateau": true},
+    {"workload": "compute", "breakpoint_mhz": null, "slope_ratio": 0.0,  "sweet_spot_mhz": 0,    "has_plateau": false}
+  ],
+  "raw_samples": {
+    "stride":  [{"freq_mhz": 800, "sample_idx": 1, "mops": 140.5}, ...],
+    "chase":   [...],
+    "random":  [...],
+    "compute": [...]
+  },
+  "data": [{"freq_mhz": 800, "stride_mops": 141.3, ...}, ...]
+}
+```
+
+`null` / `0` 表示无数据(对应 TSV 里的 `—`)。`compare_runs()` 只看 `sweet_spot_mhz`,新加的字段是给下游自定义分析用的(bootstrap CI、分布检验、sensitivity 斜率比较等)。
+
 ### 关键指标
 
 | 看什么 | 含义 |
