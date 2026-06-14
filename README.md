@@ -102,15 +102,15 @@ an issue.
    - `run_all_tests.sh` — 7 predefined suites, **~15-40 min**. Use for a
      quick health check.
    - `run_full_sweep.sh` — 57 tests across stride × core-count × NUMA × cache hierarchy,
-     **~3-4 h**. Use for deep analysis. See `docs/run_full_sweep.md`.
+     **~30 h** (use `--quick` for ~5 h). See `docs/run_full_sweep.md`.
 
 ## One-Click Wrappers
 
 ```bash
 sudo ./run_all_tests.sh                  # 7 suites, 15-40 min
 sudo ./run_all_tests.sh --suite 1,4      # just suites 1 and 4
-sudo ./run_full_sweep.sh                 # 57 tests, 3-4 hours
-sudo ./run_full_sweep.sh --quick         # 57 tests, ~1-2 hours (2s × 2 samples)
+sudo ./run_full_sweep.sh                 # 57 tests, ~30 hours
+sudo ./run_full_sweep.sh --quick         # 57 tests, ~5 hours (2s × 2 samples)
 sudo python3 memfreq_sweep.py            # run + ASCII bar charts
 sudo python3 memfreq_sweep.py --file results.txt   # re-parse saved output
 sudo python3 memfreq_sweep.py --json     # also write memfreq_results.json

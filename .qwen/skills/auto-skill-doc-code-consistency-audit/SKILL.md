@@ -179,6 +179,46 @@ Severity guide:
 - **Medium**: Causes misunderstanding (wrong algorithm steps, wrong output format)
 - **Low**: Cosmetic drift (line counts, file sizes)
 
+## Phase 5: Project-wide constant sweep
+
+After fixing individual drift issues, check whether any **project-wide constants** changed and were incompletely propagated.
+
+### When this applies:
+
+- A test count changed (e.g., 52 → 57 tests after adding a new suite)
+- A suite count changed (e.g., 6 → 7 suites)
+- A duration estimate changed (e.g., "~10-30 min" → "~15-40 min")
+- An API signature changed (e.g., function gained a parameter)
+
+### Procedure:
+
+1. **Grep every file type** for the old constant value:
+   ```bash
+   grep -rn "52 tests\|52 个测试\|52-test" *.md docs/ *.sh *.py
+   ```
+   Don't limit to `.md` — shell scripts, Python files, and config files all contain documentation-like claims (help text, comments, estimation constants).
+
+2. **Check shell script hardcoded constants** — Scripts often have `est_tests=52` or similar constants used for progress display. When the actual count changes, these go stale. Prefer dynamic computation:
+   ```bash
+   # BAD: hardcoded constant that goes stale
+   est_tests=52
+
+   # GOOD: dynamic count from actual suite contents
+   est_tests=0
+   est_tests=$((est_tests + 7))   # Suite A
+   est_tests=$((est_tests + 11))  # Suite C
+   # ...
+   ```
+
+3. **Check help text in scripts** — `--help` output often describes test counts, suite descriptions, and duration estimates. These are documentation embedded in code.
+
+4. **Check for sibling documentation files** — Projects often have both `AGENTS.md` (for one AI tool) and `CLAUDE.md` (for another) that contain overlapping content. When one is updated, the other must be synced. The sync pattern:
+   ```bash
+   cp AGENTS.md CLAUDE.md
+   # Then change only the tool-specific header line
+   sed -i '' 's/guidance to Codex/guidance to Claude Code/' CLAUDE.md
+   ```
+
 ## Key lessons
 
 1. **First pass catches 20% of issues, second pass catches the other 80%** — Quick reading misses subtle numeric drift and code snippet mismatches. Always do both passes.

@@ -9,11 +9,11 @@
 #   - Full NUMA matrix (local/remote × each node)
 #   - Combined modes
 #
-# Expected duration: ~3-4 hours at -t 5 -n 5
+# Expected duration: ~30 hours at -t 5 -n 5 (use --quick for ~5 hours)
 #
 # Usage:
 #   sudo ./run_full_sweep.sh
-#   sudo ./run_full_sweep.sh --quick       # ~30 min subset
+#   sudo ./run_full_sweep.sh --quick       # ~5 hours (reduced params)
 #   sudo ./run_full_sweep.sh --yes          # skip prompt
 #
 
