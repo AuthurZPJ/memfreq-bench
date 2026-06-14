@@ -38,6 +38,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <math.h>
+#include <assert.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -2190,6 +2191,24 @@ int main(int argc, char **argv)
 		n_valid++;
 	}
 
+	/* Map compact index (0..n_valid-1) → results[] index. The compact
+	 * arrays freqs_khz[]/mops[] are built from results[].valid rows in
+	 * the same iteration order, so a compacted freq must correspond to
+	 * exactly one results[] entry. We assert this here so the bootstrap
+	 * slice-gather (which needs to pull raw[f][w] from results[f]) can
+	 * fail loud on the impossible case instead of silently zero-filling. */
+	int compact_to_results[MAX_FREQS];
+	for (int ci = 0; ci < n_valid; ci++) {
+		compact_to_results[ci] = -1;
+		for (int k = 0; k < nfreqs; k++) {
+			if (results[k].valid && results[k].freq_khz == freqs_khz[ci]) {
+				compact_to_results[ci] = k;
+				break;
+			}
+		}
+		assert(compact_to_results[ci] >= 0);
+	}
+
 	int stride_sweet_idx = -1, chase_sweet_idx = -1;
 	int stride_sweet = find_sweet_spot(stride_mops, freqs_khz, n_valid,
 	                                   &stride_sweet_idx, threshold);
@@ -2347,37 +2366,24 @@ int main(int argc, char **argv)
 
 	/* ---- sweet-spot CI block ----
 	 * Quantifies run-to-run uncertainty on the 95% sweet spot by
-	 * constructing an optimistic low bound and a conservative high
-	 * bound. Always guarantees low_MHz <= sweet_MHz <= high_MHz.
+	 * bootstrap-resampling the per-freq raw samples, re-running
+	 * find_sweet_spot() on each resample, and reporting the 2.5th
+	 * and 97.5th percentile of the B sweet-spot values.
 	 *
-	 * Two methods, auto-selected:
-	 *   - bootstrap (B=1000): used when --emit-raw / -r is given and
-	 *     the raw per-sample buffer is available. Each iteration
-	 *     resamples nsamples throughputs per freq with replacement,
-	 *     takes the median, re-runs find_sweet_spot(); P2.5 and P97.5
-	 *     of the B sweet-spot values become the bounds.
-	 *   - IQR-based (default): with alpha = 1.96/sqrt(nsamples) we
-	 *     construct throughput +/- alpha*IQR. The OPTIMISTIC low bound
-	 *     uses the UPPER throughput curve (best case at each freq,
-	 *     so we can drop to a lower freq safely); the CONSERVATIVE
-	 *     high bound uses the LOWER throughput curve (worst case at
-	 *     each freq, so we need a higher freq to be safe). */
-	{
+	 * Requires -r / --emit-raw so raw per-sample throughputs are
+	 * available. The previous IQR-based default (alpha * IQR on the
+	 * median curve) was dropped because it conflated per-sample
+	 * dispersion with sweet-spot dispersion — the two are different
+	 * statistics, and a confidence interval on the sweet spot has
+	 * to propagate resampled medians, not raw IQR. The bootstrap
+	 * does this correctly. */
+	if (raw) {
 		const char *ci_labels[] = {"stride", "chase", "random", "compute"};
 		double *ci_arrs[]      = {stride_mops, chase_mops, random_mops, compute_mops};
 		int ci_enabled[]       = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
 		int headline_khz[]     = {stride_sweet, chase_sweet, 0, 0};
 		printf("#\n# --- sweet-spot CI ---\n");
 		printf("# workload  sweet_MHz  low_MHz  high_MHz  method\n");
-		double alpha = (nsamples > 0)
-		    ? 1.96 / sqrt((double)nsamples) : 0.0;
-		char method_label[64];
-		if (raw)
-			snprintf(method_label, sizeof(method_label),
-			         "bootstrap_1000");
-		else
-			snprintf(method_label, sizeof(method_label),
-			         "iqr_1.96/sqrt(%d)", nsamples);
 		for (int w = 0; w < 4; w++) {
 			if (!ci_enabled[w]) continue;
 			int sweet = headline_khz[w];
@@ -2393,83 +2399,41 @@ int main(int argc, char **argv)
 				       ci_labels[w]);
 				continue;
 			}
-			int lo_khz = sweet, hi_khz = sweet;
-			if (raw) {
-				/* bootstrap: pull the workload's slice from raw[]
-				 * (layout: raw[(fi*4 + w)*nsamples + s]) */
-				double *slice = malloc((size_t)n_valid * nsamples
-				                       * sizeof(double));
-				if (slice) {
-					for (int fi = 0; fi < n_valid; fi++) {
-						/* find the results[] index for this freqs_khz */
-						int rfi = -1;
-						for (int k = 0; k < nfreqs; k++) {
-							if (results[k].valid &&
-							    results[k].freq_khz ==
-							    freqs_khz[fi]) {
-								rfi = k; break;
-							}
-						}
-						if (rfi < 0) {
-							for (int s = 0; s < nsamples; s++)
-								slice[fi * nsamples + s] = 0.0;
-							continue;
-						}
-						memcpy(slice + fi * nsamples,
-						       raw + ((size_t)rfi * 4 + w) * nsamples,
-						       nsamples * sizeof(double));
-					}
-					bootstrap_sweet_spot_ci(slice, n_valid,
-					                        nsamples, freqs_khz,
-					                        threshold, 1000,
-					                        &lo_khz, &hi_khz);
-					free(slice);
-				}
-			} else {
-				/* IQR-based: build per-freq adjusted throughput,
-				 * then re-run find_sweet_spot() on each. */
-				double lo_adj[MAX_FREQS], hi_adj[MAX_FREQS];
-				for (int i = 0; i < n_valid; i++) {
-					double iqr = 0.0;
-					for (int k = 0; k < nfreqs; k++) {
-						if (!results[k].valid) continue;
-						if (results[k].freq_khz != freqs_khz[i])
-							continue;
-						switch (w) {
-						case 0: iqr = results[k].stride_iqr;  break;
-						case 1: iqr = results[k].chase_iqr;   break;
-						case 2: iqr = results[k].random_iqr;  break;
-						case 3: iqr = results[k].compute_iqr; break;
-						}
-						break;
-					}
-					lo_adj[i] = ci_arrs[w][i] - alpha * iqr;
-					hi_adj[i] = ci_arrs[w][i] + alpha * iqr;
-				}
-				int dummy_idx = -1;
-				/* OPTIMISTIC low: use UPPER throughput → can drop
-				 * to a lower freq than the headline. */
-				lo_khz = find_sweet_spot(hi_adj, freqs_khz, n_valid,
-				                         &dummy_idx, threshold);
-				/* CONSERVATIVE high: use LOWER throughput → need a
-				 * higher freq than the headline to be safe. */
-				hi_khz = find_sweet_spot(lo_adj, freqs_khz, n_valid,
-				                         &dummy_idx, threshold);
+			/* Bootstrap: pull the workload's slice from raw[]
+			 * (layout: raw[(fi*4 + w)*nsamples + s]). compact_to_results[]
+			 * maps the compacted fi (0..n_valid-1) to results[] index —
+			 * the invariant that every compacted freq has a valid
+			 * results[] entry is enforced by the assert at the top of
+			 * this function, so no silent zero-fill here. */
+			double *slice = malloc((size_t)n_valid * nsamples
+			                       * sizeof(double));
+			if (!slice) {
+				printf("# %-8s  %-9d  \xe2\x80\x94       \xe2\x80\x94         bootstrap_1000 (oom)\n",
+				       ci_labels[w], sweet / 1000);
+				continue;
 			}
-			/* Sanitize: ensure lo <= sweet <= hi. If a bound came
-			 * back as 0 (no plateau in that resample/curve), fall
-			 * back to the headline so the user always sees a
-			 * non-degenerate interval. */
-			if (lo_khz <= 0) lo_khz = sweet;
-			if (hi_khz <= 0) hi_khz = sweet;
-			if (lo_khz > sweet) lo_khz = sweet;
-			if (hi_khz < sweet) hi_khz = sweet;
-			printf("# %-8s  %-9d  %-7d  %-9d  %s\n",
+			for (int fi = 0; fi < n_valid; fi++) {
+				int rfi = compact_to_results[fi];
+				memcpy(slice + fi * nsamples,
+				       raw + ((size_t)rfi * 4 + w) * nsamples,
+				       nsamples * sizeof(double));
+			}
+			int lo_khz = 0, hi_khz = 0;
+			bootstrap_sweet_spot_ci(slice, n_valid, nsamples,
+			                        freqs_khz, threshold, 1000,
+			                        &lo_khz, &hi_khz);
+			free(slice);
+			/* No sanitization: bootstrap can legitimately return
+			 * lo > sweet or hi < sweet (e.g. skewed resample
+			 * median) — that is real signal about the headline's
+			 * uncertainty. Clamping it to the headline would hide
+			 * exactly the "the sweet spot might be elsewhere"
+			 * finding the CI block exists to surface. */
+			printf("# %-8s  %-9d  %-7d  %-9d  bootstrap_1000\n",
 			       ci_labels[w],
 			       sweet / 1000,
 			       lo_khz / 1000,
-			       hi_khz / 1000,
-			       method_label);
+			       hi_khz / 1000);
 		}
 	}
 
@@ -2543,20 +2507,24 @@ int main(int argc, char **argv)
 			if (rc == 0 && max_power_idx >= 0) {
 				/* sweet_idx is into the compacted freqs_khz[] /
 				 * mops[] arrays. Walk results[] to find the row
-				 * whose freq_khz matches. */
+				 * whose freq_khz matches. Guard the lookup:
+				 * find_sweet_spot leaves *out_index untouched
+				 * when it returns 0, so sweet_compact_idx
+				 * could stay -1 and the next line would read
+				 * freqs_khz[-1]. rc==0 above (and the matching
+				 * sweet_khz>0 inside detect_plateau after the
+				 * P0-6 fix) makes this unlikely, but the guard
+				 * is cheap defense in depth. */
 				int sweet_compact_idx = -1;
 				(void)find_sweet_spot(workloads[w].mops, freqs_khz,
 				                      n_valid, &sweet_compact_idx,
 				                      threshold);
-				int sweet_results_idx = -1;
-				for (int fi = 0; fi < nfreqs; fi++) {
-					if (!results[fi].valid) continue;
-					if (results[fi].freq_khz ==
-					    freqs_khz[sweet_compact_idx]) {
-						sweet_results_idx = fi;
-						break;
-					}
-				}
+				if (sweet_compact_idx < 0 ||
+				    sweet_compact_idx >= n_valid)
+					continue;
+				int sweet_results_idx = compact_to_results[sweet_compact_idx];
+				if (sweet_results_idx < 0)
+					continue;
 				double sweet_power_w = results[sweet_results_idx].load_power_uw / 1e6;
 				double savings = (max_power_w - sweet_power_w)
 				                 / max_power_w * 100.0;

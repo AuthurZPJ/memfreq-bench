@@ -4,6 +4,7 @@
  */
 #include "stats.h"
 
+#include <assert.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -11,13 +12,6 @@ int cmp_double(const void *a, const void *b)
 {
 	double da = *(const double *)a, db = *(const double *)b;
 	return (da > db) - (da < db);
-}
-
-/* qsort comparator for ints, local to this file. */
-static int cmp_int(const void *a, const void *b)
-{
-	int ia = *(const int *)a, ib = *(const int *)b;
-	return (ia > ib) - (ia < ib);
 }
 
 double percentile(const double *sorted, int n, double p)
@@ -71,13 +65,26 @@ static unsigned int bs_lcg(unsigned int *state)
 	return *state;
 }
 
+/*
+ * Sweep bounds for the bootstrap resample buffer. The C caller picks
+ * the actual B at the call site (currently 1000) and passes nsamples
+ * from the CLI; both must fit in these bounds.
+ */
+#define BS_MAX_B       1000
+#define BS_MAX_SAMPLES MAX_SAMPLES
+
 void bootstrap_sweet_spot_ci(
     const double *raw_block, int n_freqs, int nsamples,
     const int *freqs_khz, double threshold, int B,
     int *out_low_khz, int *out_high_khz)
 {
-	int sweets[1000];          /* B <= 1000, fixed-size */
-	double resample[MAX_SAMPLES];   /* per-iteration resample buffer      */
+	/* Fail loud on bad inputs rather than silently truncate or overrun. */
+	assert(B >= 2 && B <= BS_MAX_B);
+	assert(nsamples >= 1 && nsamples <= BS_MAX_SAMPLES);
+	assert(n_freqs >= 1 && n_freqs <= MAX_FREQS);
+
+	double sweets[BS_MAX_B];          /* B <= 1000, fixed-size */
+	double resample[BS_MAX_SAMPLES];  /* per-iteration resample buffer      */
 	double mops_b[MAX_FREQS];
 	unsigned int state = 42u;  /* deterministic seed */
 
@@ -92,12 +99,17 @@ void bootstrap_sweet_spot_ci(
 			mops_b[f] = resample[nsamples / 2];
 		}
 		int dummy_idx = -1;
-		sweets[b] = find_sweet_spot(mops_b, freqs_khz, n_freqs,
-		                            &dummy_idx, threshold);
+		int khz = find_sweet_spot(mops_b, freqs_khz, n_freqs,
+		                          &dummy_idx, threshold);
+		sweets[b] = (double)khz;
 	}
-	qsort(sweets, B, sizeof(int), cmp_int);
-	*out_low_khz  = sweets[B * 25  / 1000];  /* 2.5th percentile  */
-	*out_high_khz = sweets[B * 975 / 1000];  /* 97.5th percentile */
+	qsort(sweets, B, sizeof(double), cmp_double);
+	/* Use percentile() (linear-interp, numpy default) so the 2.5/97.5
+	 * percentile is computed correctly for any B, not only multiples
+	 * of 1000. The previous B*25/1000 formula was an integer-multiply
+	 * that only happened to give 25/975 at B=1000. */
+	*out_low_khz  = (int)percentile(sweets, B, 0.025);
+	*out_high_khz = (int)percentile(sweets, B, 0.975);
 }
 
 /*
@@ -191,5 +203,11 @@ int detect_plateau(const double *mops, const int *freqs_khz, int n,
 	int sweet_khz = find_sweet_spot(mops, freqs_khz, n, &sweet_idx, threshold);
 	*out_sweet_spot_mhz = sweet_khz > 0 ? sweet_khz / 1000 : 0;
 
-	return slope_ratio > 2.0 ? 0 : -1;
+	/* A high slope_ratio means "throughput rises then plateaus" but
+	 * tells us nothing if there's no usable sweet spot at this
+	 * threshold (e.g. extreme noise, or a flat compute-bound curve
+	 * where nothing hits the threshold). Reporting "plateau detected"
+	 * with sweet_MHz = 0 is misleading — return -1 so the caller
+	 * can show "no plateau" instead. */
+	return (slope_ratio > 2.0 && sweet_khz > 0) ? 0 : -1;
 }

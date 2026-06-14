@@ -122,7 +122,7 @@ check_contains "sensitivity has stride workload"     "$PARSE_OUT" "sens_workload
 check_contains "plateau has 3 rows"                  "$PARSE_OUT" "plateau_rows=3"
 check_contains "raw_samples has stride workload"     "$PARSE_OUT" "raw_workloads=compute,stride"
 check_contains "sweet_spot_ci has stride workload"   "$PARSE_OUT" "ci_workloads=chase,compute,stride"
-check_contains "CI method label is iqr_1.96/sqrt(5)" "$PARSE_OUT" "ci_method=iqr_1.96/sqrt(5)"
+check_contains "CI method label is bootstrap_1000"  "$PARSE_OUT" "ci_method=bootstrap_1000"
 check_contains "CI sweet_MHz parses as int"          "$PARSE_OUT" "ci_sweet=1200"
 check_contains "CI low_MHz parses as int"            "$PARSE_OUT" "ci_low=1200"
 check_contains "CI high_MHz parses as int"           "$PARSE_OUT" "ci_high=1200"

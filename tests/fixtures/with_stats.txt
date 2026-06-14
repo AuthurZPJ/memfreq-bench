@@ -32,8 +32,8 @@
 #
 # --- sweet-spot CI ---
 # workload	sweet_MHz	low_MHz	high_MHz	method
-# stride	1200	1200	1200	iqr_1.96/sqrt(5)
-# chase	2000	2000	2000	iqr_1.96/sqrt(5)
+# stride	1200	1200	1200	bootstrap_1000
+# chase	2000	2000	2000	bootstrap_1000
 # compute	—	—	—	no_plateau
 #
 # --- sensitivity (stride) ---
