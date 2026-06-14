@@ -48,12 +48,12 @@
 #include <linux/mempolicy.h>
 #endif
 
+#include "stats.h"  /* sweet-spot, plateau, bootstrap helpers + MAX_FREQS/MAX_SAMPLES */
+
 #define CL        64          /* cache line size (bytes)               */
-#define MAX_FREQS 256
 #define MAX_CPUS  256         /* max CPUs for multi-core mode          */
 #define MAX_NODES 16          /* max NUMA nodes                        */
 #define MAX_USER_THRESHOLDS 16 /* max entries in -L threshold list     */
-#define MAX_SAMPLES 16        /* max samples per freq (bootstrap)      */
 
 /* Convert ops/sec to MB/s for stride test (each op = 8 bytes) */
 #define OPS_TO_MBS(ops) ((ops) * 8.0 / 1048576.0)
@@ -254,17 +254,8 @@ static double now(void)
 /* Sort helper (for median)                                            */
 /* ------------------------------------------------------------------ */
 
-static int cmp_double(const void *a, const void *b)
-{
-	double da = *(const double *)a, db = *(const double *)b;
-	return (da > db) - (da < db);
-}
-
-static int cmp_int(const void *a, const void *b)
-{
-	int ia = *(const int *)a, ib = *(const int *)b;
-	return (ia > ib) - (ia < ib);
-}
+/* cmp_double / cmp_int moved to stats.c (cmp_double is exposed via     */
+/* stats.h; cmp_int is a private helper inside stats.c).                */
 
 /* ------------------------------------------------------------------ */
 /* CPU pinning                                                         */
@@ -1706,218 +1697,9 @@ static void usage(const char *prog)
 }
 
 /*
- * Forward declaration so the bootstrap helper below can call
- * find_sweet_spot(). The real definition is further down.
+ * Sweet-spot, plateau, and bootstrap helpers moved to stats.c.
+ * See stats.h for the API. This keeps main() focused on orchestration.
  */
-static int find_sweet_spot(const double *mops, const int *freqs_khz,
-                           int n, int *out_index, double threshold);
-
-/*
- * Tiny deterministic LCG (Numerical Recipes constants). Used by the
- * bootstrap so the CI is reproducible without touching the global rand()
- * state (which the bench uses for Fisher-Yates random-array init).
- */
-static unsigned int bs_lcg(unsigned int *state)
-{
-	*state = 1664525u * (*state) + 1013904223u;
-	return *state;
-}
-
-/*
- * Bootstrap confidence interval on the 95% sweet-spot frequency.
- *
- * Resamples nsamples throughput values per frequency point with
- * replacement, takes the median of each resample, then re-runs
- * find_sweet_spot() on the resampled-median curve. Repeats B times.
- * Out_low_khz / out_high_khz receive the 2.5th and 97.5th percentiles
- * of the B sweet-spot values (or 0 if every iteration returned 0,
- * i.e. no plateau in every resample).
- *
- * Layout of raw_block: n_freqs contiguous chunks of nsamples doubles,
- * i.e. raw_block[f * nsamples + s] for the s-th sample at freq f.
- * The caller picks the workload's slice from the global raw[] buffer.
- */
-static void bootstrap_sweet_spot_ci(
-    const double *raw_block, int n_freqs, int nsamples,
-    const int *freqs_khz, double threshold, int B,
-    int *out_low_khz, int *out_high_khz)
-{
-	int sweets[1000];          /* B <= 1000, fixed-size */
-	double resample[MAX_SAMPLES];   /* per-iteration resample buffer      */
-	double mops_b[MAX_FREQS];
-	unsigned int state = 42u;  /* deterministic seed */
-
-	for (int b = 0; b < B; b++) {
-		for (int f = 0; f < n_freqs; f++) {
-			for (int s = 0; s < nsamples; s++) {
-				unsigned int r = bs_lcg(&state);
-				int idx = (int)(r % (unsigned int)nsamples);
-				resample[s] = raw_block[f * nsamples + idx];
-			}
-			qsort(resample, nsamples, sizeof(double), cmp_double);
-			mops_b[f] = resample[nsamples / 2];
-		}
-		int dummy_idx = -1;
-		sweets[b] = find_sweet_spot(mops_b, freqs_khz, n_freqs,
-		                            &dummy_idx, threshold);
-	}
-	qsort(sweets, B, sizeof(int), cmp_int);
-	*out_low_khz  = sweets[B * 25  / 1000];  /* 2.5th percentile  */
-	*out_high_khz = sweets[B * 975 / 1000];  /* 97.5th percentile */
-}
-
-/*
- * Find the lowest frequency (in kHz) whose throughput is ≥ threshold × max.
- * Returns 0 if no such frequency exists (no plateau, e.g. compute-bound).
- * The data arrays are indexed by frequency point, in ascending-freq order
- * (same order as `results[]` in main()).
- */
-static int find_sweet_spot(const double *mops, const int *freqs_khz,
-                           int n, int *out_index, double threshold)
-{
-	if (n <= 0 || threshold <= 0.0)
-		return 0;
-
-	/* max throughput across all valid points */
-	double mx = -INFINITY;
-	for (int i = 0; i < n; i++)
-		if (mops[i] > mx)
-			mx = mops[i];
-
-	if (mx <= 0.0 || !isfinite(mx))
-		return 0;
-
-	/* lowest freq that meets threshold */
-	for (int i = 0; i < n; i++) {
-		if (mops[i] >= mx * threshold) {
-			*out_index = i;
-			return freqs_khz[i];
-		}
-	}
-	return 0;
-}
-
-/*
- * Linear-interpolation percentile, matching numpy's default (method='linear').
- * `sorted` must be in ascending order. `p` in [0, 1].
- * For nsamples < 3, returns 0.0 (insufficient data for IQR).
- */
-static double percentile(const double *sorted, int n, double p)
-{
-	if (n <= 0 || p < 0.0 || p > 1.0)
-		return 0.0;
-	if (n == 1)
-		return sorted[0];
-	double idx = p * (n - 1);
-	int lo = (int)idx;
-	double frac = idx - lo;
-	if (lo + 1 >= n)
-		return sorted[n - 1];
-	return sorted[lo] * (1.0 - frac) + sorted[lo + 1] * frac;
-}
-
-/*
- * Least-squares fit of y = slope*x + intercept.
- * n must be >= 2. Returns 0 on success, -1 if input is degenerate
- * (all x values equal → vertical line, no well-defined slope).
- */
-static int fit_line(const double *x, const double *y, int n,
-                    double *out_slope, double *out_intercept)
-{
-	if (n < 2)
-		return -1;
-	double sx = 0, sy = 0, sxx = 0, sxy = 0;
-	for (int i = 0; i < n; i++) {
-		sx  += x[i];
-		sy  += y[i];
-		sxx += x[i] * x[i];
-		sxy += x[i] * y[i];
-	}
-	double denom = n * sxx - sx * sx;
-	if (denom == 0.0)
-		return -1;
-	*out_slope     = (n * sxy - sx * sy) / denom;
-	*out_intercept = (sy - (*out_slope) * sx) / n;
-	return 0;
-}
-
-/*
- * SSE for a given piecewise fit at breakpoint index k.
- * Fits line to x[0..k], y[0..k] and x[k+1..n-1], y[k+1..n-1].
- * Returns total sum of squared residuals; -1.0 if any segment is too small.
- */
-static double piecewise_sse(const double *x, const double *y, int n, int k)
-{
-	if (k < 1 || k >= n - 1)
-		return -1.0;
-	double s1, i1, s2, i2;
-	if (fit_line(x, y, k + 1, &s1, &i1) < 0) return -1.0;
-	if (fit_line(x, y + k + 1, n - k - 1, &s2, &i2) < 0) return -1.0;
-	double sse = 0.0;
-	for (int j = 0; j <= k; j++) {
-		double r = y[j] - (s1 * x[j] + i1);
-		sse += r * r;
-	}
-	for (int j = k + 1; j < n; j++) {
-		double r = y[j] - (s2 * x[j] + i2);
-		sse += r * r;
-	}
-	return sse;
-}
-
-/*
- * Naive O(N^2) piecewise-linear plateau detection.
- * Finds the breakpoint k that minimizes total SSE of a two-segment fit.
- * Outputs:
- *   out_breakpoint_mhz: the freq (in MHz) at the breakpoint, or 0 if none
- *   out_slope_ratio:    |slope_left| / max(|slope_right|, 1e-9)
- *   out_sweet_spot_mhz: the 95% sweet spot for context (0 if no plateau)
- * Returns 0 if a plateau is detected (slope_ratio > 2.0), -1 otherwise.
- */
-static int detect_plateau(const double *mops, const int *freqs_khz, int n,
-                          double threshold,
-                          int *out_breakpoint_mhz,
-                          double *out_slope_ratio,
-                          int *out_sweet_spot_mhz)
-{
-	if (n < 4)  /* need at least 2 points per segment */
-		return -1;
-
-	double x[MAX_FREQS], y[MAX_FREQS];
-	for (int i = 0; i < n; i++) {
-		x[i] = (double)freqs_khz[i] / 1000.0;  /* MHz */
-		y[i] = mops[i] / 1e6;                  /* Mops */
-	}
-
-	/* find breakpoint k minimizing SSE */
-	int best_k = -1;
-	double best_sse = INFINITY;
-	for (int k = 1; k < n - 1; k++) {
-		double sse = piecewise_sse(x, y, n, k);
-		if (sse >= 0.0 && sse < best_sse) {
-			best_sse = sse;
-			best_k = k;
-		}
-	}
-	if (best_k < 0)
-		return -1;
-
-	/* compute slopes of the two segments at the best breakpoint */
-	double s_left, i_left, s_right, i_right;
-	fit_line(x, y, best_k + 1, &s_left, &i_left);
-	fit_line(x + best_k + 1, y + best_k + 1,
-	         n - best_k - 1, &s_right, &i_right);
-
-	double slope_ratio = fabs(s_left) / fmax(fabs(s_right), 1e-9);
-	*out_breakpoint_mhz = (int)x[best_k];
-	*out_slope_ratio    = slope_ratio;
-
-	int sweet_idx = -1;
-	int sweet_khz = find_sweet_spot(mops, freqs_khz, n, &sweet_idx, threshold);
-	*out_sweet_spot_mhz = sweet_khz > 0 ? sweet_khz / 1000 : 0;
-
-	return slope_ratio > 2.0 ? 0 : -1;
-}
 
 int main(int argc, char **argv)
 {
