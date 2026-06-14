@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3
+
+      - name: Build C benchmark + unit tests
+        run: make clean && make && make test_stats
+
+      - name: Run C unit tests
+        run: ./test_stats
+
+      - name: Run shell test harness
+        run: bash tests/test_stats_output.sh
+        # Tests 6-8 are auto-skipped on CI runners because /sys/devices/
+        # system/cpu/cpu*/cpufreq/ isn't present. The remaining 74
+        # assertions cover help, validation, JSON, parser, and compare.
+
+      - name: Syntax-check shell scripts
+        run: |
+          bash -n run_all_tests.sh
+          bash -n run_full_sweep.sh
+
+      - name: Syntax-check Python runner
+        run: python3 -m py_compile memfreq_sweep.py
+
+      - name: Smoke-test Python visualization
+        run: |
+          python3 memfreq_sweep.py --file tests/fixtures/with_stats.txt > /dev/null
+          python3 memfreq_sweep.py --file tests/fixtures/with_stats.txt --json > /dev/null
