@@ -811,17 +811,17 @@ cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 
 ### 多核并行带宽饱和测试
 
-当前工具只测单核。如果想知道"多核并行访存时带宽饱和在什么频率"：
+用 `-N NCPU` 启用多核模式（见上方的 `-N` 标志表）。`-N` 自动从不同 NUMA 节点各选一个核心，均衡分配：
 
 ```bash
-# 用 GNU parallel 同时在多个核上跑 stride
-for cpu in 0 1 2 3; do
-    taskset -c $cpu ./memfreq_bench -c $cpu -m 512 -C &
-done
-wait
+# 4 核多核带宽测试
+sudo ./memfreq_bench -N 4 -m 512 -t 3 -n 3
+
+# 半核心数（例如 48 核）
+sudo ./memfreq_bench -N 48 -m 512 -t 3 -n 3
 ```
 
-注意：cpufreq 对同 cluster 内的所有核是联动的，所以同 cluster 的多核测试有意义。跨 cluster 的核可能频率独立。
+详细多核模式说明见上方「多核并行模式（`-N`）」章节。注意 cpufreq 对同 cluster 内的所有核是联动的，所以同 cluster 的多核测试有意义；跨 cluster 的核可能频率独立。
 
 ### 配合功耗测量
 

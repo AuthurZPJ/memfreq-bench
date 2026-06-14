@@ -30,6 +30,7 @@ the full command is `gcc -O2 -o memfreq_bench memfreq_bench.c stats.c -lm`.
 ```bash
 sudo ./memfreq_bench -A -r -L 0.80,0.90,0.95,0.99
 #   -A                          auto-size array to 2× L3 (use this!)
+#   -N 4                        multi-core bandwidth-saturation test
 #   -r                          keep per-sample data → enables bootstrap CI
 #   -L 0.80,0.90,0.95,0.99      sweet spot at 4 thresholds
 ```
