@@ -102,9 +102,9 @@ an issue.
    - `run_all_tests.sh` — 7 predefined suites. Default `-t 3 -n 3`:
      **~2.5-5 hr** (depends on core count / NUMA). With `--quick` (`-t 1 -n 1`):
      **~20-45 min**. Use for a quick health check.
-   - `run_full_sweep.sh` — 57 tests across stride × core-count × NUMA × cache hierarchy.
-     Default `-t 5 -n 5`: **~30 hr**. With `--quick` (runs Suites 1/2/3/5/7,
-     ~23-37 tests, `-t 2 -n 5`): **~3 hr**. See `docs/run_full_sweep.md`.
+   - `run_full_sweep.sh` — 58 tests across stride × core-count × NUMA × cache hierarchy × L3-resident.
+     Default `-t 5 -n 5`: **~30 hr**. With `--quick` (runs Suites 1/2/3/5/7/8,
+     ~24-38 tests, `-t 2 -n 5`): **~3 hr**. See `docs/run_full_sweep.md`.
 
 ## One-Click Wrappers
 
@@ -112,8 +112,8 @@ an issue.
 sudo ./run_all_tests.sh                  # 7 suites, ~2.5-5 hr (default) / ~20-45 min (--quick)
 sudo ./run_all_tests.sh --suite 1,4      # just suites 1 and 4
 sudo ./run_all_tests.sh --quick          # 7 suites, ~20-45 min (1s × 1 sample)
-sudo ./run_full_sweep.sh                 # 57 tests, ~30 hours
-sudo ./run_full_sweep.sh --quick         # ~23-37 tests (Suites 1/2/3/5/7), ~3 hours (2s × 5 samples)
+sudo ./run_full_sweep.sh                 # 58 tests, ~30 hours
+sudo ./run_full_sweep.sh --quick         # ~24-38 tests (Suites 1/2/3/5/7/8), ~3 hours (2s × 5 samples)
 sudo python3 memfreq_sweep.py            # run + ASCII bar charts
 sudo python3 memfreq_sweep.py --file results.txt   # re-parse saved output
 sudo python3 memfreq_sweep.py --json     # also write memfreq_results.json

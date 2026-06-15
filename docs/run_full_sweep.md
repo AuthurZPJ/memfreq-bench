@@ -3,7 +3,7 @@
 ## 目录
 - [概述](#概述)
 - [脚本执行流程追踪](#脚本执行流程追踪)
-- [七个测试套件详解](#七个测试套件详解)
+- [八个测试套件详解](#八个测试套件详解)
 - [输出报告解读](#输出报告解读)
 - [数据分析与 DVFS 调优](#数据分析与-dvfs-调优)
 - [常见问题](#常见问题)
@@ -12,17 +12,17 @@
 
 ## 概述
 
-`run_full_sweep.sh` 是一个**深度内存性能扫描工具**，通过 57 个测试全面探测 CPU 频率与内存性能的复杂关系。
+`run_full_sweep.sh` 是一个**深度内存性能扫描工具**，通过 58 个测试全面探测 CPU 频率与内存性能的复杂关系。
 
 **核心目标**：找出不同工作负载模式下的"甜点频率"（sweet spot）—— 在保持 95% 以上性能的前提下，可以降到的最低频率。
 
 **预计耗时**（以 25 个频率点为例）：
-- 默认模式（`-t 5 -n 5`）：~30 小时（57 个测试，每个频率点 ~76 秒）
-- `--quick` 模式（`-t 2 -n 5`）：~3 小时（**跑 Suites 1/2/3/5/7**，约 23-37 个测试，每个频率点 ~33 秒）
+- 默认模式（`-t 5 -n 5`）：~30 小时（58 个测试，每个频率点 ~76 秒）
+- `--quick` 模式（`-t 2 -n 5`）：~3 小时（**跑 Suites 1/2/3/5/7/8**，约 24-38 个测试，每个频率点 ~33 秒）
 
 **与其他脚本的关系**：
 - `run_all_tests.sh` — 7 个预定义套件,默认模式（`-t 3 -n 3`）~2.5-5 小时,`--quick` 模式（`-t 1 -n 1`）~20-45 分钟,适合快速健康检查或 PR 前的回归测试
-- `run_full_sweep.sh`（本脚本）— 57 个测试的穷举矩阵,适合深入分析、新硬件评估或发表数据
+- `run_full_sweep.sh`（本脚本）— 58 个测试的穷举矩阵,适合深入分析、新硬件评估或发表数据
 - 当 `run_all_tests.sh` 全部通过后再用本脚本做深入扫描
 
 **输出文件**：
@@ -79,9 +79,9 @@
    └─ 示例：full_sweep_20250115_143052/
 ```
 
-### 阶段 3：运行 57 个测试（~30 小时）
+### 阶段 3：运行 58 个测试（~30 小时）
 
-脚本按顺序执行 7 个测试套件。每个测试调用 `memfreq_bench`，该程序会：
+脚本按顺序执行 8 个测试套件。每个测试调用 `memfreq_bench`，该程序会：
 
 ```
 单个测试的内部流程（以 s8 为例）：
@@ -165,9 +165,9 @@
 - 合计：~76 秒/频率点
 
 以 25 个频率点为例：25 × 76 ≈ 1900 秒 ≈ 32 分钟/测试。
-57 个测试 × 32 分钟 ≈ 30 小时，加上进程启动和数据写入开销。
+58 个测试 × 32 分钟 ≈ 30 小时，加上进程启动和数据写入开销。
 
-> **提示**：如果 30 小时太长，可以用 `--quick`（`-t 2 -n 5`，跑 Suites 1/2/3/5/7）将时间缩短到 ~3 小时，或只运行部分套件（`--suite 1,3`）。
+> **提示**：如果 30 小时太长，可以用 `--quick`（`-t 2 -n 5`，跑 Suites 1/2/3/5/7/8）将时间缩短到 ~3 小时，或只运行部分套件（`--suite 1,3`）。
 
 ### 阶段 4：生成报告（< 10 秒）
 
@@ -193,7 +193,7 @@
 
 ---
 
-## 七个测试套件详解
+## 八个测试套件详解
 
 ### Suite A: Stride Grid（7 个测试）
 
@@ -659,13 +659,46 @@ cache_quad_L3_64MB:  stride_sweet = 2200 MHz（收敛验证）
 - 大工作集应用（HPC、AI）：需保持 DRAM-bound 甜点（~2200 MHz）
 - 混合工作负载：根据工作集大小动态调整频率
 
+### Suite H: L3-Resident Sweep（1 个测试）
+
+**目的**：测量数据完全驻留在 L3 缓存中时的甜点频率。
+
+**测试列表**：
+
+| 测试 ID | 参数 | 描述 |
+|---------|------|------|
+| l3_resident | `-2 -A` | L3-resident sweep（数组 = 2× L2，数据完全驻留 L3） |
+
+**原理**：
+
+L2 miss 之后就已经是 mem-bound 了。但 L3 和 DRAM 的带宽/延迟特性不同，导致甜点频率也不同：
+
+```
+频率从高到低：
+  ┌─ compute-bound（数据在任何缓存里）
+  │
+  ├─ L2 miss, L3 hit → L3-bandwidth 受限   ← Suite H 测这里
+  │
+  └─ L3 miss, DRAM   → DRAM-bandwidth 受限  ← 默认 Suite 测这里
+```
+
+**输出**：额外报告 `# stride_l3 sweet spot: N MHz`，表示 L3-resident 场景下的最低节能频率。
+
+**解读**：
+
+| 对比 | 含义 |
+|------|------|
+| `stride_l3 < stride` | L3 带宽充裕，L3-resident 工作负载可以更激进降频 |
+| `stride_l3 ≈ stride` | L3 和 DRAM 甜点趋同，带宽瓶颈相似 |
+| `stride_l3 > stride` | L3 带宽不如 DRAM（罕见），可能 L3 较小或争用严重 |
+
 ---
 
 ## 输出报告解读
 
 ### FULL_REPORT.txt 结构
 
-报告包含 5 个分析表格 + DVFS 建议：
+报告包含 6 个分析表格 + DVFS 建议：
 
 ```
 ================================================================
@@ -679,11 +712,11 @@ Topology  : 96P/192T, SMT=2, NUMA=2
 Frequency : 2000 – 2600 MHz
 Duration  : 5s × 5 samples
 
-Results: 57 tests (57 ok, 0 failed)
+Results: 58 tests (58 ok, 0 failed)
 ```
 
 **解读**：
-- 57 个测试全部成功 → 数据可靠
+- 58 个测试全部成功 → 数据可靠
 - 频率范围 2000-2600 MHz → 600 MHz 调节空间
 - 2 NUMA 节点 → 需要关注本地性
 
@@ -1006,6 +1039,52 @@ full_R          15400        2600     2550-2650         2600     2550-2650      
 
 ---
 
+### TABLE 8: L3-Resident
+
+```
+================================================================
+  TABLE 8: L3-Resident — sweet spot with data in L3 cache
+================================================================
+
+  Max throughput:         3200 MB/s
+  Stride sweet spot:      2200 MHz
+  L3-resident sweet spot: 1800 MHz
+  Stride CI (95%):        2100–2300 MHz
+  Plateau breakpoint:     2500 MHz
+
+  Analysis:
+    stride_l3 sweet spot = lowest freq for L3-bandwidth workloads.
+    Data fits in L3 (array = 2× L2), so only L3 bandwidth matters.
+    Compare with stride sweet spot (DRAM-bound):
+      stride_l3 < stride  → L3 has more headroom than DRAM
+      stride_l3 ≈ stride  → L3 and DRAM sweet spots converge
+```
+
+**解读步骤**：
+
+1. **L3 vs DRAM 甜点差异**：
+   ```
+   stride_l3 = 1800 MHz  vs  stride = 2200 MHz
+   → L3-resident 工作负载可以多降 400 MHz（~18%）
+   → 适合数据库索引查找、小工作集 Web 服务等场景
+   ```
+
+2. **带宽差异**：
+   ```
+   L3-resident 吞吐 3200 MB/s  vs  DRAM-bound ~1200 MB/s
+   → L3 带宽远高于 DRAM，所以更早进入平台期
+   → 更早进入平台期 = 更低频率就够用
+   ```
+
+3. **与 Suite G (Cache Hierarchy) 的关系**：
+   ```
+   Suite G 的 2×L2 测试已经跑了类似大小的数组，
+   但 Suite H 用 -2 flag 直接提取 stride_l3 sweet spot，
+   不需要手动从 cache hierarchy 数据中推断。
+   ```
+
+---
+
 ### DVFS Governor Recommendations
 
 ```
@@ -1014,6 +1093,10 @@ full_R          15400        2600     2550-2650         2600     2550-2650      
 ================================================================
 
 Based on test results:
+
+L3-bandwidth workloads (working set fits in L3 cache):
+  → Safe frequency floor: 1800 MHz
+  → Below this, L3 bandwidth dominates
 
 Latency-bound workloads (single task, DB queries, compilers):
   → Safe frequency floor: 2200 MHz
@@ -1152,26 +1235,26 @@ int select_freq(int cores_active, double compute_ratio, double mem_ratio) {
 A: 每个测试在所有频率点上运行 3 个工作负载，每个工作负载做 5 次 × 5 秒采样。以 25 个频率点为例：
 - 每个频率点：~76 秒（3 × 5 × 5s + 开销）
 - 每个测试：25 × 76 ≈ 32 分钟
-- 57 个测试：~30 小时
+- 58 个测试：~30 小时
 
 缩短时间的方法：
-- `--quick`：`-t 2 -n 5`，跑 Suites 1/2/3/5/7，缩短到 ~3 小时
+- `--quick`：`-t 2 -n 5`，跑 Suites 1/2/3/5/7/8，缩短到 ~3 小时
 - `--suite 1,3`：只运行部分套件
 - `--duration 3 --samples 3`：自定义参数
 
 ### Q2: `--quick` 模式和默认模式有什么区别？
 
-A: `--quick` 跑 **Suites 1/2/3/5/7**（stride grid、random/flush、多核 sweep、NUMA 矩阵、缓存层次），跳过 4/6（多核组合、stress-NG 对比）。其中 Suite 1 缩减为 4 个代表性 stride（1, 8, 32, 64），并将每个频率点的测试参数调整：
+A: `--quick` 跑 **Suites 1/2/3/5/7/8**（stride grid、random/flush、多核 sweep、NUMA 矩阵、缓存层次、L3-resident），跳过 4/6（多核组合、stress-NG 对比）。其中 Suite 1 缩减为 4 个代表性 stride（1, 8, 32, 64），并将每个频率点的测试参数调整：
 - 默认：`-t 5 -n 5`（每个 workload 在每个频率点采样 5 次，每次 5 秒 = 25s/工作负载/频率点）
 - Quick：`-t 2 -n 5`（5 次 × 2 秒 = 10s/工作负载/频率点）
 
-默认跑全部 57 测试约 30 小时，Quick 跑约 23-37 测试约 3 小时。Quick 模式保留了 5 次采样的中位数降噪能力，适合快速验证或时间有限的场景。正式分析建议使用默认参数。
+默认跑全部 58 测试约 30 小时，Quick 跑约 24-38 测试约 3 小时。Quick 模式保留了 5 次采样的中位数降噪能力，适合快速验证或时间有限的场景。正式分析建议使用默认参数。
 
 ### Q3: 如何判断数据是否可靠？
 
 A: 检查 `FULL_REPORT.txt` 顶部的统计：
 ```
-Results: 57 tests (57 ok, 0 failed)
+Results: 58 tests (58 ok, 0 failed)
 ```
 - 全部成功 → 数据可靠
 - 有失败 → 检查失败的测试，可能是 cpufreq 权限或硬件问题
@@ -1192,7 +1275,7 @@ sudo ./run_full_sweep.sh --samples 3
 # 减少测试时长（噪声略增）
 sudo ./run_full_sweep.sh --duration 3
 
-# 只运行特定套件（套件编号 1-7）
+# 只运行特定套件（套件编号 1-8）
 sudo ./run_full_sweep.sh --suite 1,3    # 只测 stride 和多核
 
 # 组合使用

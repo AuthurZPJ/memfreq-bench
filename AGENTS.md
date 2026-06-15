@@ -23,7 +23,7 @@ sudo ./memfreq_bench -m 512       # array must exceed L3 cache
 
 # One-click wrappers
 sudo ./run_all_tests.sh           # 7 predefined suites, ~2.5-5 hr default / ~20-45 min --quick
-sudo ./run_full_sweep.sh          # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/2/3/5/7)
+sudo ./run_full_sweep.sh          # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/2/3/5/7/8)
 
 # Visualization
 sudo python3 memfreq_sweep.py     # run + ASCII bar charts
@@ -47,7 +47,7 @@ There is one lightweight test suite (`bash tests/test_stats_output.sh`,
 | `tests/test_stats_output.sh` | Shell test harness: 77 assertions over Python parser, JSON output, compare mode, plus runs `test_stats`. |
 | `tests/fixtures/` | TSV/JSON fixtures used by the shell harness. |
 | `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA, cache hierarchy). |
-| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (57 tests). |
+| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (58 tests). |
 | `docs/memfreq-bench.md` | Full design rationale, microarchitectural analysis, noise model, tuning guide. **The single best reference for "why" questions.** |
 | `README.md` | Quick-start only. |
 
