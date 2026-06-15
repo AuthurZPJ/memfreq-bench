@@ -79,6 +79,8 @@ memory-bound:
 
 工具运行五种基准测试，覆盖不同的"内存依赖度"。默认启用 stride、chase、compute 三种；random（`-R`）和 flush（`-f`）需显式开启：
 
+> 本节给出每个负载的代码和一句话微架构结论。完整的 **cache 层级穿透分析**（单次粒度 / 工作集 / prefetcher 角色 / MLP / 频率 sweet spot）见 [docs/workloads.md](workloads.md)。
+
 ### 1. Stride（顺序遍历）
 
 ```c
@@ -805,3 +807,4 @@ sysfs_write("scaling_max_freq", khz);      // tighten ceiling
 | `tests/test_stats_output.sh` | Shell 测试框架（77 个断言） |
 | `docs/memfreq-bench.md` | 本文档 |
 | `docs/memfreq-sweep.md` | Python 可视化工具使用说明 |
+| `docs/workloads.md` | 五个工作负载的 cache 层级穿透分析（MLP × prefetcher 矩阵） |
