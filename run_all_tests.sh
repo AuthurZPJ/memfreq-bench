@@ -516,9 +516,9 @@ generate_summary() {
 
             local stride_sweet chase_sweet max_mbs
             stride_sweet=$(grep "stride.*sweet spot" "$result_file" 2>/dev/null | \
-                           grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                           grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}' || true)
             chase_sweet=$(grep "chase.*sweet spot" "$result_file" 2>/dev/null | \
-                          grep -oE '\d+ MHz' | head -1 | awk '{print $1}' || true)
+                          grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}' || true)
 
             local max_line
             max_line=$(grep -E "^[0-9]" "$result_file" 2>/dev/null | tail -1 || true)
