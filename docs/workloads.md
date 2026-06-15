@@ -9,8 +9,10 @@
 - [3. Random](#3-random随机置换需-r)
 - [4. Compute](#4-compute对照组默认)
 - [5. Stride + Flush](#5-stride--flush显式驱逐需-f)
+- [6. L3-Resident Sweep](#6-l3-resident-sweep-2)
 - [横向对比](#横向对比两个轴统一分类)
 - [频率 sweet spot 矩阵](#频率-sweet-spot-矩阵)
+- [如何验证这些分析](#如何验证这些分析)
 - [附录](#附录为什么这-5-个放在一起刚好)
 
 ---
@@ -45,7 +47,7 @@
 | **chase** | 1 cache line | `-m` MB | miss | miss(串行) | ❌ 链式依赖 | **= 1** | **DRAM 延迟** | **最低**(CPU 闲置) |
 | **random** | 1 cache line | `-m` MB | miss | 部分(~50%) | ❌ 索引乱序 | 多个 outstanding | **DRAM 随机带宽** | **中等**(MLP 用得上) |
 | **compute** | 0(无内存) | 0 | n/a | n/a | n/a | n/a | **频率基线** | **无 sweet spot**(线性) |
-| **flush** | 1 cache line | `-m` MB | prefetched (≈100%) | ≈0%(顺序) | ✅ 仍有效(stride=8) | 3-6(同 stride) | **clflush 指令开销 + stride** | 与 stride 接近(略高) |
+| **flush** | 1 cache line | `-m` MB | prefetched (≈100%) | ≈0%(同 stride,顺序遍历超出 L3 容量) | ✅ 仍有效(stride=8) | 3-6(同 stride) | **clflush 指令开销 + stride** | 与 stride 接近(略高) |
 
 > **核心对比**:stride 测"DRAM 在 prefetch 协同下能跑多快",chase 测"DRAM 一次访问要多久",random 测"DRAM 在乱序访问下能跑多快",compute 测"CPU 不靠内存能跑多快",flush 测"stride + clflush 指令开销"(**不是**裸 DRAM 带宽 —— 详见 §5)。
 
@@ -134,7 +136,7 @@ load p[0]      load p[X]      load p[Y]
  才能发下一个   才能发下一个   才能发下一个
 ```
 
-**chase 与 stride 共享同一组 cache 失守点(L1 < L2 < L3),但 MLP 完全不同**:
+**chase 与 stride 面对相同的 cache 容量约束**(L1 < L2 < L3 的容量失守点),但 MLP 完全不同:
 
 - **MLP = 1**:每次 deref 必须等前一次拿到 `next` 指针才能发起下一次 load
 - CPU 在 100 ns DRAM 等待里**完全闲置**,没有 outstanding load 在飞
@@ -171,7 +173,7 @@ for (size_t i = 0; i < count; i++)
 ### 单次粒度 vs 工作集
 
 - **粒度**:64 B(1 cache line)
-- **工作集**:`-m` MB 全数组 + 一张 64 M × 8 B = **`-m` MB** 的索引表(`random_idx`,每 u64 元素对应一个 `size_t` 索引)
+- **工作集**:`-m` MB 数组 + 一张 `-m` MB 索引表(`random_idx`,每 `uint64_t` 元素对应一个 `size_t` 索引)。**总工作集 = 2× `-m` MB**(如 512 MB 数组 + 512 MB 索引 = 1024 MB)。索引表是顺序访问,对 L3 hit 分析无影响。
 
 ### Cache 穿透分析(与 stride 的关键区别)
 
@@ -267,7 +269,7 @@ L1d 命中率 100%(但只用了几个 cache line 反复 hit),L2/L3/DRAM **完全
   - `compute_%` 异常低(< 频率比)→ 该频点 `set_freq` 失败,实际频率低于 target
 - **频率 sweet spot = 无**(compute 永远需要最大频率才能保持性能)
 
-详见 `memfreq-bench.md` 的 [compute_% 作为频率锁定 sanity check](#compute-作为频率锁定-sanity-check) 段。
+详见 [memfreq-bench.md](memfreq-bench.md#compute_-作为-sanity-check) 的 compute_% sanity check 段。
 
 ---
 
@@ -338,6 +340,48 @@ flush 不引入新的依赖,MLP 仍是 3-6(同 stride)。
 
 ---
 
+## 6. L3-Resident Sweep(`-2`)
+
+`-2` 不是一个新 workload,而是**改变数组大小**来测不同 cache 层级下的 sweet spot。
+
+### 原理
+
+默认 sweep 的数组 = 2× L3(数据超出 L3,测的是 DRAM-bound sweet spot)。`-2` 额外跑一轮 sweep,数组 = 2× L2(数据完全驻留在 L3 中):
+
+```
+频率从高到低:
+  ┌─ compute-bound（数据在任何缓存里）
+  │
+  ├─ L2 miss, L3 hit → L3-bandwidth 受限   ← -2 测这里
+  │
+  └─ L3 miss, DRAM   → DRAM-bandwidth 受限  ← 默认测这里
+```
+
+L2 miss 之后就已经是 mem-bound 了。但 L3 和 DRAM 的带宽/延迟特性不同,导致甜点频率也不同:
+
+### 在 MLP × Prefetcher 框架中的位置
+
+L3-resident sweep 仍然使用 stride workload,所以 MLP > 1 + prefetcher 友好 — 与 stride 在同一象限。区别在于**瓶颈层级不同**:
+
+| | 默认 stride | `-2` stride_l3 |
+|---|---|---|
+| 数组大小 | 2× L3 | 2× L2 |
+| 数据驻留 | DRAM | L3 |
+| 瓶颈 | DRAM 带宽 | L3 带宽 |
+| sweet spot | 较低(DRAM 带宽充裕) | 可能更高或更低(取决于 L3 带宽特性) |
+
+### 解读
+
+| 对比 | 含义 |
+|------|------|
+| `stride_l3 < stride` | L3 带宽充裕,L3-resident 工作负载可以更激进降频 |
+| `stride_l3 ≈ stride` | L3 和 DRAM 甜点趋同,带宽瓶颈相似 |
+| `stride_l3 > stride` | L3 带宽不如 DRAM（罕见），可能 L3 较小或争用严重 |
+
+> **与 [run_full_sweep.sh Suite G](run_full_sweep.md#suite-g-cache-hierarchy-sweep5-个测试) (Cache Hierarchy) 的关系**:Suite G 的 2×L2 测试已经跑了类似大小的数组,但 `-2` 直接提取 `stride_l3 sweet spot`,不需要手动从 cache hierarchy 数据中推断。
+
+---
+
 ## 横向对比:两个轴统一分类
 
 把 5 个内存型工作负载放在 **MLP × prefetcher 友好度** 这两个轴的 2D 平面上:
@@ -347,13 +391,15 @@ flush 不引入新的依赖,MLP 仍是 3-6(同 stride)。
               ┌──────────────────────┬──────────────────────┐
   MLP > 1     │  stride              │  random              │
   (带宽测试)   │  (顺序流,DRAM 带宽)  │  (乱序流,DRAM 带宽)  │
+              │  flush(同象限,       │                      │
+              │   多 ~50 cycle 开销) │                      │
               ├──────────────────────┼──────────────────────┤
   MLP = 1     │  (本仓库未覆盖)      │  chase               │
   (延迟测试)   │  假想:顺序链表       │  (纯 DRAM 延迟)      │
               └──────────────────────┴──────────────────────┘
 ```
 
-**flush**:名义上属于 MLP>1 + prefetcher 友好象限(同 stride),但**每个迭代多 ~50 cycle clflush 成本**,所以测的是 stride 带宽与 clflush 指令开销的混合(详见 §5)。
+**flush**:与 stride 同属 MLP>1 + prefetcher 友好象限,但每个迭代多 ~50 cycle clflush 成本,所以测的是 stride 带宽与 clflush 指令开销的混合(详见 §5)。
 
 **compute**:不在 2D 平面里(零内存访问),作为频率基线对照。
 
@@ -384,38 +430,62 @@ flush 不引入新的依赖,MLP 仍是 3-6(同 stride)。
 
 ---
 
+## 如何验证这些分析
+
+本文的 cache 行为分析可以通过 `perf stat` 验证:
+
+```bash
+# stride: 预期 L1 hit 高(prefetch 有效),L3 miss 高(超出 L3)
+sudo perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
+    ./memfreq_bench -c 0 -A -t 1 -n 1
+
+# chase: 预期 L1 miss 高(随机跳转),L3 miss 高(串行依赖)
+sudo perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
+    ./memfreq_bench -c 0 -A -t 1 -n 1 -C -R
+
+# random: 预期 L1 miss 高,L3 miss ~50%(如本文分析)
+sudo perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
+    ./memfreq_bench -c 0 -A -t 1 -n 1 -C
+
+# flush: 预期 L1 hit 高(同 stride),但 IPC 显著降低(clflush 开销)
+sudo perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,instructions,cycles \
+    ./memfreq_bench -c 0 -A -t 1 -n 1 -f
+```
+
+验证要点:
+
+| Workload | 预期 L1 miss rate | 预期 L3 miss rate | 预期 IPC |
+|----------|:---:|:---:|:---:|
+| stride | <5%(prefetch 有效) | ~100%(超出 L3) | 中等 |
+| chase | ~100%(随机跳转) | ~100%(串行依赖) | 极低(大量 stall) |
+| random | ~100%(随机索引) | ~50%(如 L3/array 比) | 中等(MLP 帮助) |
+| flush | <5%(同 stride) | ~100% | 低(clflush 开销) |
+| compute | 极低(寄存器操作) | 极低 | 高(纯计算) |
+
+> **提示**:[run_full_sweep.sh Suite 7 (Cache Hierarchy)](run_full_sweep.md#suite-g-cache-hierarchy-sweep5-个测试) 通过跑不同数组大小(½×L2, 2×L2, ½×L3, 2×L3, 4×L3)直接观察吞吐在不同缓存层级的阶跃,可以验证本文"stride 在 L3 失守后打 DRAM"的分析。
+
+---
+
 ## 附录:为什么这 5 个放在一起刚好
 
-任何内存访问模式都可以用"MLP + prefetcher 友好度"两个轴分类:
+任何内存访问模式都可以用"MLP + prefetcher 友好度"两个轴分类。完整矩阵见上方[横向对比](#横向对比)。本仓库 5 个工作负载覆盖了 4 个象限中的 3.5 个(stride+flush 共享一个象限):
 
-```text
-                  prefetcher 友好         prefetcher 无效
-              ┌──────────────────────┬──────────────────────┐
-  MLP > 1     │  stride              │  random              │
-  (能并行 load)│  (顺序,带宽主导)     │  (随机,带宽主导)     │
-              │                      │                      │
-              │  flush               │  (本仓库未覆盖)      │
-              │  (强制 L1 miss)      │  假想:stride+索引乱序│
-              ├──────────────────────┼──────────────────────┤
-  MLP = 1     │  (本仓库未覆盖)      │  chase               │
-  (严格串行)  │  假想:链表顺序,无法命中│  (随机链,延迟主导)  │
-              │  prefetch 但 MLP=1)  │                      │
-              └──────────────────────┴──────────────────────┘
-                                            ↑
-                                       本仓库 5 个工作负载
-                                       几乎覆盖了 4 个象限
-```
+- **stride + flush**:MLP>1, prefetcher 友好 → DRAM 带宽
+- **random**:MLP>1, prefetcher 无效 → DRAM 随机带宽
+- **chase**:MLP=1, prefetcher 无效 → 纯 DRAM 延迟
+- **未覆盖**:MLP=1, prefetcher 友好 → 顺序链表(prefetcher 可预测但串行依赖)
 
 `compute` 不在 2D 平面里(它根本没内存访问),它在这个矩阵上方,作为"频率基线"。
 
-每个象限至少一个代表(本仓库实现了 stride、random、chase、flush 4 个;缺的是 MLP=1+prefetcher 友好的象限 —— 即"顺序链"—— 但这在工程上无意义,因为顺序链就退化成 stride 了)。
+## Insights
 
-`★ Insight ─────────────────────────────────────`
-- **"MLP × prefetcher"二维分类法**是分析 memory-bound 性能最实用的工具。带宽测试要求 MLP > 1(否则测不到带宽上限),延迟测试要 MLP = 1(否则隐藏了延迟);prefetcher 友好表示"实际负载可以借助硬件加速",不友好表示"最坏情况"。这两个轴的 4 个象限对应 4 种典型性能瓶颈场景,而本仓库 5 个 workload 几乎覆盖全。
-- **"工作集 > cache ⇒ 必然 evict"是 cache 行为的铁律**。理解了它,stride/chase/random 三者的 cache hit rate 差异就只是 LRU 替换的推论:
-  - **stride 顺序** ⇒ L3 hit 率近 0(每次 wrap 后旧行已 evict)
-  - **chase 串行** ⇒ L3 hit 率也近 0(被前面 1M 次访问就 evict 了)
-  - **random 随机** ⇒ L3 hit 率 ≈ 50%(最近 4.4M 个行可能还在 L3,占 8M 工作的 53%)
-  这就是 LRU 数学,不是经验值。
-- **compute 的"无 sweet spot"才是 sweet spot 概念的"零向量"**。前 4 个 workload 都是用"频率降 + 吞吐不变"来定义甜点;compute 反向 —— "频率降 + 吞吐同步降"作为 sanity check,告诉其他三个 workload 的甜点是**真实的**。如果 compute_% 不线性,说明整组实验的频率锁没生效,所有甜点数字都作废。这是为什么每个 memfreq_bench 输出都坚持打印 compute 列 —— 它是元数据验证,不是测量结果。
-`─────────────────────────────────────────────────`
+> **"MLP × prefetcher"二维分类法**是分析 memory-bound 性能最实用的工具。带宽测试要求 MLP > 1(否则测不到带宽上限),延迟测试要 MLP = 1(否则隐藏了延迟);prefetcher 友好表示"实际负载可以借助硬件加速",不友好表示"最坏情况"。这两个轴的 4 个象限对应 4 种典型性能瓶颈场景,而本仓库 5 个 workload 几乎覆盖全。
+
+> **"工作集 > cache ⇒ 必然 evict"是 cache 行为的铁律**。理解了它,stride/chase/random 三者的 cache hit rate 差异就只是 LRU 替换的推论:
+> - **stride 顺序** ⇒ L3 hit 率近 0(每次 wrap 后旧行已 evict)
+> - **chase 串行** ⇒ L3 hit 率也近 0(被前面 1M 次访问就 evict 了)
+> - **random 随机** ⇒ L3 hit 率 ≈ 50%(最近 4.4M 个行可能还在 L3,占 8M 工作的 53%)
+>
+> 这就是 LRU 数学,不是经验值。
+
+> **compute 的"无 sweet spot"才是 sweet spot 概念的"零向量"**。前 4 个 workload 都是用"频率降 + 吞吐不变"来定义甜点;compute 反向 —— "频率降 + 吞吐同步降"作为 sanity check,告诉其他三个 workload 的甜点是**真实的**。如果 compute_% 不线性,说明整组实验的频率锁没生效,所有甜点数字都作废。这是为什么每个 memfreq_bench 输出都坚持打印 compute 列 —— 它是元数据验证,不是测量结果。
