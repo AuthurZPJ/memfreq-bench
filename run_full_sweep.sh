@@ -13,7 +13,7 @@
 #
 # Usage:
 #   sudo ./run_full_sweep.sh
-#   sudo ./run_full_sweep.sh --quick       # ~3 hours (Suites 1/2/3/5/7, -t 2 -n 5)
+#   sudo ./run_full_sweep.sh --quick       # ~3 hours (Suites 1/2/3/5/7/8, -t 2 -n 5)
 #   sudo ./run_full_sweep.sh --yes          # skip prompt
 #
 
@@ -215,9 +215,13 @@ extract_data() {
     stride_bp=$(grep "stride.*plateau_breakpoint" "$file" 2>/dev/null | grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}')
     chase_bp=$(grep  "chase.*plateau_breakpoint"  "$file" 2>/dev/null | grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}')
 
-    # 11-field pipe-delimited row. Order is significant — see report code.
-    # Fields 1-5 are the original baseline; 6-11 are the new statistical add-ons.
-    echo "${test_name}|${max_freq:-?}|${max_mbs:-?}|${stride_sweet:-?}|${chase_sweet:-?}|${stride_ci_low:-?}|${stride_ci_high:-?}|${chase_ci_low:-?}|${chase_ci_high:-?}|${stride_bp:-?}|${chase_bp:-?}"
+    # Extract L3-resident sweet spot (only present with -2 flag)
+    local stride_l3_sweet
+    stride_l3_sweet=$(grep "stride_l3.*sweet spot" "$file" 2>/dev/null | grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}')
+
+    # 12-field pipe-delimited row. Order is significant — see report code.
+    # Fields 1-5 are the original baseline; 6-11 are the statistical add-ons; 12 is L3-resident.
+    echo "${test_name}|${max_freq:-?}|${max_mbs:-?}|${stride_sweet:-?}|${chase_sweet:-?}|${stride_ci_low:-?}|${stride_ci_high:-?}|${chase_ci_low:-?}|${chase_ci_high:-?}|${stride_bp:-?}|${chase_bp:-?}|${stride_l3_sweet:-?}"
 }
 
 # Per-threshold sensitivity for a given workload. Returns pipe-separated
@@ -453,6 +457,15 @@ suite_cache_hierarchy() {
     done
 }
 
+suite_l3_resident() {
+    log_suite "Suite 8: L3-Resident Sweep (-2 flag)"
+    log_info "Measuring sweet spot with data fitting in L3 cache (2× L2 array)"
+
+    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+
+    run_test "l3_resident" "${common[@]}" -2
+}
+
 # ============================================================================
 # Report Generation
 # ============================================================================
@@ -679,6 +692,39 @@ generate_full_report() {
             echo ""
         done
 
+        # ---- Table 8: L3-Resident Sweet Spot ----
+        local l3r_file="$OUTPUT_DIR/l3_resident.txt"
+        if [[ -f "$l3r_file" ]]; then
+            echo "================================================================"
+            echo "  TABLE 8: L3-Resident — sweet spot with data in L3 cache"
+            echo "================================================================"
+            echo ""
+
+            local l3r_data
+            l3r_data=$(extract_data "$l3r_file")
+            local l3r_mbs l3r_stride_sp l3r_l3_sp l3r_s_lo l3r_s_hi l3r_bp
+            l3r_mbs=$(echo "$l3r_data"     | cut -d'|' -f3)
+            l3r_stride_sp=$(echo "$l3r_data" | cut -d'|' -f4)
+            l3r_l3_sp=$(echo "$l3r_data"   | cut -d'|' -f12)
+            l3r_s_lo=$(echo "$l3r_data"    | cut -d'|' -f6)
+            l3r_s_hi=$(echo "$l3r_data"    | cut -d'|' -f7)
+            l3r_bp=$(echo "$l3r_data"      | cut -d'|' -f10)
+
+            printf "  %-20s %10s\n" "Max throughput:" "${l3r_mbs} MB/s"
+            printf "  %-20s %10s\n" "Stride sweet spot:" "${l3r_stride_sp} MHz"
+            printf "  %-20s %10s\n" "L3-resident sweet spot:" "${l3r_l3_sp} MHz"
+            printf "  %-20s %10s\n" "Stride CI (95%):" "${l3r_s_lo}–${l3r_s_hi} MHz"
+            printf "  %-20s %10s\n" "Plateau breakpoint:" "${l3r_bp} MHz"
+            echo ""
+            echo "  Analysis:"
+            echo "    stride_l3 sweet spot = lowest freq for L3-bandwidth workloads."
+            echo "    Data fits in L3 (array = 2× L2), so only L3 bandwidth matters."
+            echo "    Compare with stride sweet spot (DRAM-bound):"
+            echo "      stride_l3 < stride  → L3 has more headroom than DRAM"
+            echo "      stride_l3 ≈ stride  → L3 and DRAM sweet spots converge"
+            echo ""
+        fi
+
         # ---- Summary: DVFS Governor Recommendations ----
         echo "================================================================"
         echo "  DVFS GOVERNOR RECOMMENDATIONS"
@@ -697,9 +743,19 @@ generate_full_report() {
         local half_sweet
         half_sweet=$(grep "stride.*sweet spot" "$OUTPUT_DIR/half_s8.txt" 2>/dev/null | \
                      grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}' || true)
+        # Find L3-resident sweet spot
+        local l3r_sweet
+        l3r_sweet=$(grep "stride_l3.*sweet spot" "$OUTPUT_DIR/l3_resident.txt" 2>/dev/null | \
+                    grep -oE '[0-9]+ MHz' | head -1 | awk '{print $1}' || true)
 
         echo "  Based on test results:"
         echo ""
+        if [[ -n "$l3r_sweet" ]]; then
+            echo "  L3-bandwidth workloads (working set fits in L3 cache):"
+            echo "    → Safe frequency floor: $l3r_sweet MHz"
+            echo "    → Below this, L3 bandwidth dominates"
+            echo ""
+        fi
         if [[ -n "$sc_sweet" ]]; then
             echo "  Latency-bound workloads (single task, DB queries, compilers):"
             echo "    → Safe frequency floor: $sc_sweet MHz"
@@ -743,7 +799,7 @@ generate_full_report() {
         for t in "${ts[@]}"; do sens_hdr+=",stride_at_${t}"; done
         for t in "${ts[@]}"; do sens_hdr+=",chase_at_${t}"; done
 
-        echo "test,max_MHz,max_MBs,stride_sweet_MHz,chase_sweet_MHz,stride_ci_low_MHz,stride_ci_high_MHz,chase_ci_low_MHz,chase_ci_high_MHz,stride_plateau_bp_MHz,chase_plateau_bp_MHz${sens_hdr}"
+        echo "test,max_MHz,max_MBs,stride_sweet_MHz,chase_sweet_MHz,stride_ci_low_MHz,stride_ci_high_MHz,chase_ci_low_MHz,chase_ci_high_MHz,stride_plateau_bp_MHz,chase_plateau_bp_MHz,stride_l3_sweet_MHz${sens_hdr}"
         for file in "$OUTPUT_DIR"/*.txt; do
             local bn
             bn=$(basename "$file" .txt)
@@ -762,6 +818,7 @@ generate_full_report() {
             c_hi=$(echo "$data"  | cut -d'|' -f9)
             bp_s=$(echo "$data"  | cut -d'|' -f10)
             bp_c=$(echo "$data"  | cut -d'|' -f11)
+            l3_sp=$(echo "$data" | cut -d'|' -f12)
 
             # Per-threshold sensitivity for stride + chase (pipe-separated,
             # one value per threshold in $SENS_THRESHOLDS order)
@@ -786,7 +843,7 @@ generate_full_report() {
                 for _ in "${ts[@]}"; do c_vals+=","; done
             fi
 
-            echo "${name},${max_f},${mbs},${s_sp},${c_sp},${s_lo},${s_hi},${c_lo},${c_hi},${bp_s},${bp_c}${s_vals}${c_vals}"
+            echo "${name},${max_f},${mbs},${s_sp},${c_sp},${s_lo},${s_hi},${c_lo},${c_hi},${bp_s},${bp_c},${l3_sp}${s_vals}${c_vals}"
         done
     } > "$csv"
     log_success "CSV data: $csv (includes CI, plateau BP, and sensitivity columns)"
@@ -818,7 +875,7 @@ Usage: sudo ./run_full_sweep.sh [OPTIONS]
 Exhaustive memfreq_bench sweep for deep analysis.
 
 Options:
-  --quick      Suites 1/2/3/5/7, reduced params (2s × 5 samples)
+  --quick      Suites 1/2/3/5/7/8, reduced params (2s × 5 samples)
   --yes        Skip confirmation prompt
   --duration N Seconds per test point (default: 5)
   --samples N  Samples per point (default: 5)
@@ -841,6 +898,7 @@ Test Suites (--suite N picks one or more):
   5  Full NUMA matrix + multi-core NUMA — ~10 tests
   6  Half/full system with all modes — 7 tests
   7  Cache hierarchy sweep (½×L2, 2×L2, ½×L3, 2×L3, 4×L3) — ~5 tests
+  8  L3-resident sweep (-2 flag, data fits in L3) — 1 test
 
 Output:
   FULL_REPORT.txt  — Analysis tables + DVFS recommendations
@@ -902,15 +960,16 @@ main() {
     # Estimate
     local est_tests
     if [[ $QUICK_MODE -eq 1 ]]; then
-        # Quick runs suites 1,2,3,5,7 with reduced parameters
+        # Quick runs suites 1,2,3,5,7,8 with reduced parameters
         est_tests=0
         est_tests=$((est_tests + 4))  # Suite A: stride grid (4 representative)
         est_tests=$((est_tests + 3))  # Suite B: random + flush modes
         est_tests=$((est_tests + 11)) # Suite C: multi-core sweep
         [[ $NUM_NUMA -ge 2 ]] && est_tests=$((est_tests + NUM_NUMA * 2 + 4))  # Suite E: NUMA
         est_tests=$((est_tests + 5))  # Suite G: cache hierarchy
+        est_tests=$((est_tests + 1))  # Suite H: L3-resident sweep
     else
-        est_tests=57  # full sweep (on 2-NUMA system)
+        est_tests=58  # full sweep (on 2-NUMA system, +1 for L3-resident)
     fi
     local est_min=$(( est_tests * TEST_DURATION * 4 / 60 ))
 
@@ -933,12 +992,13 @@ main() {
 
     # Run suites
     if [[ $QUICK_MODE -eq 1 ]]; then
-        # Quick: stride grid + random/flush + mc sweep + NUMA + cache hierarchy
+        # Quick: stride grid + random/flush + mc sweep + NUMA + cache hierarchy + L3-resident
         should_run_suite 1 && suite_stride_grid
         should_run_suite 2 && suite_random_flush
         should_run_suite 3 && suite_multicore_sweep
         should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
         should_run_suite 7 && suite_cache_hierarchy
+        should_run_suite 8 && suite_l3_resident
     else
         should_run_suite 1 && suite_stride_grid
         should_run_suite 2 && suite_random_flush
@@ -947,6 +1007,7 @@ main() {
         should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
         should_run_suite 6 && suite_stress_comparison
         should_run_suite 7 && suite_cache_hierarchy
+        should_run_suite 8 && suite_l3_resident
     fi
 
     local end_time
