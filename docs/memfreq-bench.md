@@ -5,6 +5,32 @@
 
 ---
 
+## 目录
+
+- [核心原理](#核心原理)
+- [五种工作负载](#五种工作负载三种默认两种可选)
+- [完整测试流程](#完整测试流程以-96-核-arm-服务器为例)
+- [使用方法](#使用方法)
+  - [环境准备](#环境准备)
+  - [运行](#运行)
+  - [参数](#参数)
+  - [可视化](#可视化)
+- [解读输出](#解读输出)
+  - [数据行](#数据行)
+  - [甜点判定](#甜点判定)
+  - [统计块](#统计块)
+  - [JSON 输出](#json-输出)
+  - [关键指标速查](#关键指标速查)
+- [多核并行模式](#多核并行模式-n)
+- [噪音分析](#噪音分析)
+- [设计原理](#设计原理)
+- [高核数服务器补充说明](#高核数服务器补充说明)
+- [限制和注意事项](#限制和注意事项)
+- [与其他工具对比](#与其他工具对比)
+- [文件清单](#文件清单)
+
+---
+
 ## 核心原理
 
 CPU 频率决定了计算单元每秒能推进多少个"状态步"。但 CPU 的吞吐不一定随频率线性增长——**取决于瓶颈在哪里**：
@@ -99,7 +125,7 @@ for (size_t i = 0; i < nnodes; i++)
 
 这是**最纯粹的 memory-bound** 测试。
 
-### 3. Random（随机置换遍历）— 新增
+### 3. Random（随机置换遍历）
 
 ```c
 size_t *idx = build_random_index(count);  // Fisher-Yates shuffle
@@ -126,9 +152,9 @@ for (size_t i = 0; i < 1000000; i++)
 - 零内存访问 → 不涉及 cache / DRAM
 - 吞吐**完全由 CPU 频率决定** → 频率减半，吞吐减半
 
-**用途：sanity check**。如果 compute 在不同频率下的吞吐比不等于频率比，说明频率没有成功锁定（turbo 还在跑、或者 governor 覆盖了你的设置）。
+**用途：sanity check**。如果 compute 在不同频率下的吞吐比不等于频率比，说明频率没有成功锁定（turbo 还在跑、或者 governor 覆盖了你的设置）。详见 [compute_% 作为 sanity check](#compute_-作为-sanity-check)。
 
-### 5. Stride + Flush（强制 L3 miss）— 新增
+### 5. Stride + Flush（强制 L3 miss）
 
 ```c
 for (size_t i = 0; i < count; i += stride) {
@@ -144,17 +170,48 @@ for (size_t i = 0; i < count; i += stride) {
 
 ---
 
-## 使用方法
-
-### 编译
+## 完整测试流程（以 96 核 ARM 服务器为例）
 
 ```bash
-gcc -O2 -o memfreq_bench memfreq_bench.c stats.c -lm
+# ── 1. 拓扑侦察 ──
+lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
+numactl -H
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+
+# ── 2. 基本测试（L3 自动检测，数组自动 2× L3）──
+sudo ./memfreq_bench -c 0 -A -t 3 -n 5
+
+# ── 3. 多核带宽饱和测试（每 NUMA node 各 1 核）──
+sudo ./memfreq_bench -N 2 -A -t 3 -n 5
+
+# ── 4. 半核带宽饱和测试（48 物理核）──
+sudo ./memfreq_bench -N 48 -A -t 3 -n 5
+
+# ── 5. NUMA 绑定测试（强制内存到 Node 0）──
+sudo ./memfreq_bench -c 0 -A -B 0 -t 3 -n 5
+
+# ── 6. 可选：random permutation 测试 ──
+sudo ./memfreq_bench -c 0 -A -R -t 3 -n 5
+
+# ── 7. 可选：cache flush 测试（强制 L3 miss）──
+sudo ./memfreq_bench -c 0 -A -f -t 3 -n 5
+
+# ── 8. 可选：不同 stride 对比 ──
+sudo ./memfreq_bench -c 0 -A -s 1     # prefetcher-friendly
+sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
+
+# ── 9. 可选：L3-resident 测试（数据驻留 L3）──
+sudo ./memfreq_bench -c 0 -A -2 -t 3 -n 5
 ```
 
-### 运行前：环境准备
+---
 
-#### 第一步：确认硬件拓扑
+## 使用方法
+
+### 环境准备
+
+#### 1. 确认硬件拓扑
 
 ```bash
 # L3 大小 — 决定数组该多大
@@ -163,7 +220,7 @@ lscpu | grep "L3 cache"
 lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
 ```
 
-**关键：数组大小必须 > L3 cache，否则测试的是 L3 而非 DRAM。**
+**关键：数组大小必须 > L3 cache，否则测试的是 L3 而非 DRAM。** 用 `-A` 可自动检测并设为 2× L3。
 
 | L3 大小 | `-m` 参数 | 说明 |
 |---------|-----------|------|
@@ -171,40 +228,31 @@ lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
 | 32-128 MB | 256-512 | 高端服务器 |
 | 128-300 MB | 512-1024 | 高核数 ARM（如 96 核 / 273 MB L3） |
 
-#### 第二步：处理 SMT
+**验证方法**：如果低频的 stride_% 异常高（接近 100%），可能数组没超出 L3——加大 `-m` 重测。
 
-SMT 兄弟线程共享同一物理核的 L1/L2 cache 和执行单元。如果 SMT 兄弟在运行其他任务，会引入不可控噪音：
+#### 2. 处理 SMT
+
+SMT 兄弟线程共享同一物理核的 L1/L2 cache 和执行单元。cpufreq 通常按物理核调频，SMT 兄弟的负载不影响频率设置，所以**SMT 隔离不是必须的**。但如果追求低噪音测量：
 
 ```bash
-# 查看 SMT 映射（以 96 物理核 × SMT 2 = 192 逻辑 CPU 为例）
+# 查看 SMT 映射
 cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
-# 输出: 0,96  → cpu 0 和 cpu 96 共享同一物理核
 
 # 隔离 SMT 兄弟（关闭每个物理核的第二个 SMT 线程）
 echo off > /sys/devices/system/cpu/smt/control
 
 # 测试完成后恢复
 echo on > /sys/devices/system/cpu/smt/control
-# 或逐个恢复：echo 1 > /sys/devices/system/cpu/cpu$s/online
 ```
 
-SMT 隔离不是必须的——cpufreq 通常按物理核调频，SMT 兄弟的负载不影响频率设置。但如果追求低噪音测量，隔离是推荐的。
+SMT 对测量精度的影响详见 [噪音分析](#噪音分析) 中的 SMT 噪音段。
 
-#### 第三步：了解 NUMA 拓扑
+#### 3. 了解 NUMA 拓扑
 
 高核数服务器通常有多个 NUMA node，本地和远端 DRAM 延迟差异显著：
 
 ```bash
 numactl -H
-# 典型输出（4 NUMA node）：
-# available: 4 nodes (0-3)
-# node 0 cpus: 0 1 2 ... 23 96 97 98 ... 119
-# node 0 size: 128 GB
-# node distances:
-#    0  1  2  3
-# 0: 10 20 30 30
-# 1: 20 10 30 30
-# ...
 ```
 
 ```
@@ -215,6 +263,8 @@ numactl -H
 → 远端 DRAM 延迟更高 → 甜点只会更低（更多时间等 interconnect）
 ```
 
+跨 NUMA 测试方法见下方 [运行](#运行) 中的 numactl 示例。
+
 ### 运行
 
 ```bash
@@ -223,6 +273,9 @@ sudo ./memfreq_bench -m 512
 
 # 指定 CPU（选物理核，非 SMT 线程）
 sudo ./memfreq_bench -c 0 -m 512
+
+# 自动检测 L3 大小，数组设为 2× L3
+sudo ./memfreq_bench -c 0 -A
 
 # 更大的 stride（更极端 memory-bound）
 sudo ./memfreq_bench -c 0 -m 512 -s 16
@@ -233,16 +286,29 @@ sudo ./memfreq_bench -c 0 -m 512 -t 5 -n 5
 # 跨 NUMA 对比（把内存分配到远端 node）
 sudo numactl --membind=1 ./memfreq_bench -c 0 -m 512
 
+# L3-resident 测试（额外测量数据驻留 L3 时的甜点）
+sudo ./memfreq_bench -c 0 -A -2 -t 3 -n 5
+
 # 跳过 chase 测试
 sudo ./memfreq_bench -C
+
+# 配合功耗测量
+# Intel:
+sudo turbostat --Summary --show PkgWatt,CorWatt,MHz,Busy% -i 1 &
+./memfreq_bench -m 512
+
+# ARM:
+watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 ```
+
+将功耗数据与频率数据对齐，就能画出 **性能-功耗 Pareto 曲线**，找到真正的能效最优点。
 
 ### 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-c CPU` | 0 | 绑定到指定 CPU 核心（逻辑 CPU 编号） |
-| `-N NCPU` | — | 多核并行模式，自动分布到 NUMA 节点（见下方） |
+| `-N NCPU` | — | 多核并行模式，自动分布到 NUMA 节点（见 [多核并行模式](#多核并行模式-n)） |
 | `-m SIZE_MB` | 128 | 数组大小（MB），**必须 > L3 cache** |
 | `-A` | — | 自动检测 L3 大小，将数组设为 2× L3 |
 | `-s STRIDE` | 8 | 步长（uint64 单位），8 = 64B = 一个 cache line |
@@ -306,72 +372,85 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # stride_l3 sweet spot: 1800 MHz  (69% of max 2600 MHz)
 ```
 
-注意输出现在包含：
-- **target_MHz / actual_MHz**：设定频率和实际运行频率（`cpuinfo_cur_freq`）
-- **stride_MBs**：显式带宽报告（MB/s），比 Mops 更直观
-- **stride_l3 sweet spot**：L3-resident sweep 的甜点（仅当使用 `-2` 时输出，数组大小 = 2× L2）
+注意输出包含：
 - **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
+- **stride_l3 sweet spot**：L3-resident sweep 的甜点（仅当使用 `-2` 时输出，数组大小 = 2× L2）
 
-#### 数据行每列含义
+### 数据行
 
 | 列 | 类型 | 计算 |
 |----|------|------|
 | `target_MHz` | int | 写到 `scaling_min/max_freq` 的目标频率 / 1000 |
-| `actual_MHz` | int | 频率切换 + 100ms 稳定后**单次**读 `cpuinfo_cur_freq`（瞬时值），失败回退 `cpuinfo_avg_freq`（`memfreq_bench.c:1433-1457`）|
+| `actual_MHz` | int | 频率切换 + 100ms 稳定后**单次**读 `cpuinfo_cur_freq`（瞬时值），失败回退 `cpuinfo_avg_freq` |
 | `stride_Mops` | %.1f | stride workload 的 ops/sec 取 `nsamples` 次中位数 / 1e6 |
-| `stride_MBs` | %.1f | `stride_tput × 8 / 2^20`（`OPS_TO_MBS` 宏，`memfreq_bench.c:64`）—— 8 = `uint64_t` 元素字节数 |
+| `stride_MBs` | %.1f | `stride_tput × 8 / 2^20`（`OPS_TO_MBS` 宏）—— 8 = `uint64_t` 元素字节数 |
 | `stride_%` | %.1f | `stride_tput / s_max × 100` |
 | `chase_Mops` | %.1f | chase workload 的 ops/sec 中位数 / 1e6 |
 | `chase_%` | %.1f | `chase_tput / c_max × 100` |
 | `compute_Mops` | %.1f | compute workload 的 ops/sec 中位数 / 1e6 |
 | `compute_%` | %.1f | `compute_tput / p_max × 100` |
 
-**分母 `s_max` / `c_max` / `p_max` 的定义**：取**最高有效频率点**（`ref = highest valid freq`，`memfreq_bench.c:2754-2759`）的对应 workload 吞吐，**不是扫到的全局最大值**。因此最高频点行的 `*_%` 定义上 = 100.0；高频点采样失败或频率没锁住时 `*_%` 会被低估。
+**分母 `s_max` / `c_max` / `p_max` 的定义**：取**最高有效频率点**（`ref = highest valid freq`）的对应 workload 吞吐，**不是扫到的全局最大值**。因此最高频点行的 `*_%` 定义上 = 100.0。
 
-**几个隐含的工程细节**：
+**隐含的工程细节**：
 
-- **TAB 分隔**：实际是 TSV（本节用空格展示是为了可读性；AGENTS.md 写的是真实格式）
+- **TAB 分隔**：实际是 TSV（本节用空格展示是为了可读性）
 - **`actual_MHz ≠ target_MHz` 是诊断信号**：差超过 ±2% 警惕 CPPC 拒步 / turbo 漏过
 - **中位数 vs 平均值**：每个 freq 跑 `nsamples` 次取**中位数**，对单次中断异常不敏感
-- **有功耗传感器时追加列**：见下方 "数据行功耗列含义"
 
-#### 数据行功耗列含义
+#### 功耗列（仅当检测到功耗传感器时追加）
 
-仅当检测到功耗传感器时追加。两种模式物理意义不同：
+两种模式物理意义不同：
 
 | 列 | 类型 | 计算 |
 |----|------|------|
-| `idle_W` | %.2f | 频率切换 + 1.1s 稳定后、测试**前** `read_power()` 采样（µW / 1e6）。仅 HWMON |
-| `load_W` | %.2f | 所有 workload 跑**完**后 `read_power()` 采样（µW / 1e6）。仅 HWMON |
-| `delta_W` | %.2f | `load_W - idle_W`（SoC 增量功耗，去掉 baseline）。仅 HWMON |
-| `energy_J` | %.3f | RAPL: 累积 µJ 差 / 1e6（`power_after - power_before`）；HWMON: `(load - idle) µW × elapsed_sec / 1e6` |
+| `idle_W` | %.2f | 频率切换 + 1.1s 稳定后、测试**前** `read_power()` 采样。仅 HWMON |
+| `load_W` | %.2f | 所有 workload 跑**完**后 `read_power()` 采样。仅 HWMON |
+| `delta_W` | %.2f | `load_W - idle_W`（SoC 增量功耗）。仅 HWMON |
+| `energy_J` | %.3f | RAPL: 累积 µJ 差 / 1e6；HWMON: `(load - idle) µW × elapsed_sec / 1e6` |
 
-**RAPL vs HWMON**：
+**RAPL**（Intel/AMD x86）：硬件积分的累积 µJ，直接差分 = 本次测试消耗的能量。只输出 `energy_J`。
+**HWMON**（ARM 等）：瞬时 µW，`energy_J` 去掉 SoC baseline，只算测试本身的贡献。
 
-- **RAPL**（Intel/AMD x86，`/sys/class/powercap/intel-rapl:0/energy_uj`）：硬件积分的累积 µJ，直接差分 = 本次测试消耗的能量。**只输出 `energy_J`，无 `idle_W` / `load_W`**
-- **HWMON**（ARM 等无 RAPL 系统，`/sys/class/hwmon/*/power1_input`）：瞬时 µW。`energy_J = (P_load - P_idle) × elapsed` 去掉 SoC baseline，只算测试本身的贡献。读取前 sleep 1.1s（`memfreq_bench.c:2632-2633`）让平均窗口稳定
+`energy_J` 覆盖整个测试窗口——所有 workload（stride / chase / random / compute）共用一行。传感器未检测到时这 1-4 列不输出。
 
-**几个注意点**：
+#### compute_% 作为 sanity check
 
-- `energy_J` 覆盖**整个测试窗口**（`t_energy_start` → `t_energy_end`，`memfreq_bench.c:2647-2736`）——所有 4 个 workload（stride / chase / random / compute）共用一行，不是单 workload
-- 传感器未检测到（`npower_paths == 0`）时这 1-4 列直接不输出，header 也不带这些字段
+compute 测试的 `%` 值应该近似等于频率比：
 
-### 新增统计段
+```
+freq=1500 MHz, max=3000 MHz
+compute_% 预期 ≈ 1500/3000 × 100 = 50%
+
+如果 compute_% = 95% → 频率没锁住！turbo 仍在跑
+如果 compute_% = 30% → 该频率点 set_freq 可能失败了
+```
+
+### 甜点判定
+
+程序自动计算：**最低频率 ≥ 最大吞吐的 95%** = 甜点。
+
+```
+甜点在 27% 频率 → 功耗节省 = (1 - 0.27) × (V_low/V_high)² ≈ 50-70%
+甜点在 80% 频率 → 功耗节省有限，工作负载对频率敏感
+```
+
+95% 阈值可通过 `-T FRAC` 调整（默认 0.95）。想看甜点对阈值的敏感度,加 `-L 0.8,0.9,0.95,0.99` 触发 `# --- sensitivity ---` 块。
+
+### 统计块
 
 数据行之后,会按顺序追加 5 个 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
 
-> **注意：** `-f` 启用的 `bench_stride_flush` 工作负载（强制 L3 miss）**不会**出现在统计块里——它的数据只出现在原始数据行(没有单独的 `flush` 列,数据覆盖在 `stride` 行的同列里)。
+> **注意：** `-f` 启用的 `bench_stride_flush` 工作负载（强制 L3 miss）**不会**出现在统计块里——它的数据只出现在原始数据行。
 
 #### 1. `# --- per-freq stats (workload) ---`
 
-每个频率点的 min / max / median / IQR。IQR = Q3 − Q1。看 IQR 列判断测量噪声：
+每个频率点的 min / max / median / IQR。看 IQR 列判断测量噪声：
 
 ```
 # --- per-freq stats (stride) ---
 # freq_MHz  min_MOps  max_MOps  median_MOps  iqr_MOps
 # 800       140.1     142.5     141.3        1.2
-# 1200      155.0     157.2     156.0        1.5
-# ...
 ```
 
 - IQR 全程 < 1% → 机器安静,数据可信
@@ -389,33 +468,17 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # random    1800       1700     2000      bootstrap_1000
 ```
 
-- `sweet_MHz` = 现有 95% 甜点(标题值,基于 raw median 吞吐)
-- `low_MHz` / `high_MHz` = bootstrap 2.5/97.5 百分位(B = 1000)。可以是 0(没有 resample 命中甜点)或越过 `sweet` 的一侧(重采样中位数偏向另一侧)— 都是真实信号,不再被夹回 headline
-- `method` = `bootstrap_1000`(本项目目前唯一支持的方法)
+- `sweet_MHz` = 现有 95% 甜点(标题值)
+- `low_MHz` / `high_MHz` = bootstrap 2.5/97.5 百分位(B = 1000)
+- `method` = `bootstrap_1000`（确定性 LCG 种子 `state=42`,结果可复现）
 
-**Bootstrap 法(`-r` 必选)**:有 raw per-sample 数据时使用。`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。方法标签为 `bootstrap_1000`。用确定性 LCG 种子(`state=42`),结果可复现。
-
-> **历史:** 早期版本还提供过 `iqr_1.96/sqrt(N)` IQR-based CI,但它把"per-sample 离散度"错当成"甜点位置离散度"做了 CI— 两者是不同统计量,后者必须传播 resampled medians。该方法已删除。如果想看 IQR 的影响,改用 `# --- per-freq stats ---` 块的 `iqr_MOps` 列。
+**Bootstrap 法**：`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。
 
 **解读:**
-- `low == sweet == high` → 数据噪声极小(IQR≈0 或只有 1 个样本),单点估计很可靠
-- `low < sweet < high` 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
-- 区间宽(> 500 MHz)→ 测量噪声大,或工作负载对频率敏感;考虑增加 `-n 5` 或更长 `-t`
-- `low > sweet` 或 `high < sweet` → bootstrap 发现 headline 可能偏乐观(或偏悲观)。考虑把甜点定在 `[low, high]` 区间内
-- `— / — / —` + `no_plateau` → 该 workload 无平台,`find_sweet_spot` 返回 0
-
-**示例输出**(`-m 512 -t 3 -n 5 -r`):
-
-```
-# --- sweet-spot CI ---
-# workload  sweet_MHz  low_MHz  high_MHz  method
-# stride    1600       1500     2000      bootstrap_1000
-# chase     1200       1200     1600      bootstrap_1000
-```
-
-`stride` 的下界比甜点低(测量有 spread 时乐观地能降频),`chase` 在三档不同频点间分布(因为它三档都接近 max)。
-
-**JSON 字段**:每个 workload 一行 `{"workload": "stride", "sweet_mhz": 1600, "low_mhz": 1500, "high_mhz": 2000, "method": "bootstrap_1000"}`,`null` 表示无数据(对应 em-dash)。
+- `low == sweet == high` → 数据噪声极小,单点估计很可靠
+- 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
+- 区间宽(> 500 MHz)→ 测量噪声大;考虑增加 `-n 5` 或更长 `-t`
+- `— / — / —` + `no_plateau` → 该 workload 无平台
 
 #### 3. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
 
@@ -425,8 +488,6 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # --- sensitivity (stride) ---
 # threshold  sweet_spot_MHz
 # 0.80       1800
-# 0.85       1900
-# 0.90       1950
 # 0.95       2000
 # 0.99       2400
 ```
@@ -447,38 +508,30 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - `slope ratio > 2.0` → 有明显平台期,mem-bound 信号强
 - `—`  → 无平台,吞吐随频率持续上升
 - 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
-- 每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
+- 每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时):
 
 ```
 # stride   power: 45W at sweet spot (savings: 36% vs 71W at 2600 MHz)
 ```
 
-  - `45W` = 甜点频率下采样到的负载功率(RAPL 或 hwmon,µW → W)
-  - `savings: 36%` = (max_freq 功率 − sweet_spot 功率) / max_freq 功率
-  - `vs 71W at 2600 MHz` = 在最高频率点的功率(取最高频且有有效采样的点)
-  - 没有 plateau 时输出 `N/A (no plateau)`;没有功耗传感器时输出 `N/A (no sensor)`
-
-  **意义**：这条直接回答 DVFS 节能 thesis。memory-bound 工作负载的甜点频率低 + 甜点处功率远小于 max_freq 功率 = 实际节能空间。如果甜点处功率只比 max_freq 低 5%,即便频率降到甜点,节能效果也有限。
+这条直接回答 DVFS 节能 thesis：甜点频率低 + 甜点处功率远小于 max_freq 功率 = 实际节能空间。
 
 #### 5. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
 
-每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）；Python `--compare` 不需要这个。
+每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）。
 
 ```
 # --- raw_samples (stride) ---
 # freq_MHz  sample_idx  mops
 # 800       1           140.5
 # 800       2           141.2
-# 800       3           140.8
-# 1200      1           155.0
-# ...
 ```
 
-行数 = `n_freqs × nsamples`。例如 20 频点 × 5 样本 = 100 行/workload。
+行数 = `n_freqs × nsamples`。
 
-### JSON 输出包含的新字段
+### JSON 输出
 
-`memfreq_sweep.py --json` 导出的 JSON 现在也包含上面 5 个块的全部数据(在原有 `meta` / `sweet_spot_mhz` / `data` 之外新增):
+`memfreq_sweep.py --json` 导出的 JSON 包含上面 5 个块的全部数据:
 
 ```json
 {
@@ -511,11 +564,11 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 }
 ```
 
-`null` / `0` 表示无数据(对应 TSV 里的 `—`)。`compare_runs()` 只看 `sweet_spot_mhz`,新加的字段是给下游自定义分析用的(bootstrap CI、分布检验、sensitivity 斜率比较等)。
+`null` / `0` 表示无数据(对应 TSV 里的 `—`)。`compare_runs()` 只看 `sweet_spot_mhz`,新加的字段是给下游自定义分析用的。
 
-### 关键指标
+### 关键指标速查
 
-按输出顺序（数据行 → 5 个统计块）排列的速查表——每行都回答一个独立问题：
+按输出顺序排列——每行都回答一个独立问题：
 
 | 看什么 | 含义 | 出现位置 |
 |--------|------|----------|
@@ -528,30 +581,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 | `slope ratio > 2.0` | 平台期强 = 强 mem-bound | `# --- plateau ---` |
 | `power: savings: >30%` | **直接答 DVFS 节能量** | `# --- plateau ---` 的 `power:` 行 |
 
-**反向信号**：`stride_%` / `chase_%` 随频率线性增长（高%同频比），说明该 workload 有 compute 成分（不是纯 mem-bound），降频需谨慎——把 `95%` 阈值降到 `99%` 验证决策不会垮（用 `-L 0.95,0.99` 看 sensitivity）。
-
-### 甜点判定
-
-程序自动计算：**最低频率 ≥ 最大吞吐的 95%** = 甜点。
-
-```
-甜点在 27% 频率 → 功耗节省 = (1 - 0.27) × (V_low/V_high)² ≈ 50-70%
-甜点在 80% 频率 → 功耗节省有限，工作负载对频率敏感
-```
-
-95% 阈值可通过 `-T FRAC` 调整（默认 0.95）。想看甜点对阈值的敏感度,加 `-L 0.8,0.9,0.95,0.99` 触发 `# --- sensitivity ---` 块。想知道这个 95% 甜点跟独立分段线性检测是否一致,看 `# --- plateau ---` 块里的 `plateau_breakpoint`;两个方法结论一致 = 强证据。判断测量噪声看 `# --- per-freq stats ---` 的 IQR 列。
-
-### compute_% 作为 sanity check
-
-compute 测试的 `%` 值应该近似等于频率比：
-
-```
-freq=1500 MHz, max=3000 MHz
-compute_% 预期 ≈ 1500/3000 × 100 = 50%
-
-如果 compute_% = 95% → 频率没锁住！turbo 仍在跑
-如果 compute_% = 30% → 该频率点 set_freq 可能失败了
-```
+**反向信号**：`stride_%` / `chase_%` 随频率线性增长，说明该 workload 有 compute 成分（不是纯 mem-bound），降频需谨慎——把 `95%` 阈值降到 `99%` 验证（用 `-L 0.95,0.99` 看 sensitivity）。
 
 ---
 
@@ -566,7 +596,7 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 | 单核 (`-c 0`) | DRAM 延迟 (~100ns) | 很低频 | DB 查询、编译器、shell |
 | 多核 (`-N 4`) | MC 带宽饱和 | 中频 | HPC、AI 训练、视频编码 |
 
-### CPU 自动分配（stress-ng 风格）
+### CPU 自动分配
 
 `-N NCPU` 自动选择 NCPU 个核心，分配策略：
 
@@ -587,7 +617,7 @@ sudo ./memfreq_bench -N 4 -m 512
 sudo ./memfreq_bench -N 48 -m 512
 ```
 
-### 多核执行架构（借鉴 stress-ng）
+### 多核执行架构
 
 ```
 父进程（coordinator）
@@ -596,8 +626,8 @@ sudo ./memfreq_bench -N 48 -m 512
   ├── fork → child 1 (CPU 48, Node 1) → bench → write shared mem
   ├── waitpid(all)
   ├── set_freq(f-1)
-  ├── fork → child 0 (CPU 0) → bench → write shared mem
-  ├── fork → child 1 (CPU 48) → bench → write shared mem
+  ├── fork → child 0 → bench → write shared mem
+  ├── fork → child 1 → bench → write shared mem
   └── ...
 ```
 
@@ -617,6 +647,8 @@ sudo ./memfreq_bench -N 48 -m 512
 ...
 ```
 
+注意 cpufreq 对同 cluster 内的所有核是联动的，所以同 cluster 的多核测试有意义；跨 cluster 的核可能频率独立。
+
 ---
 
 ## 噪音分析
@@ -633,33 +665,15 @@ chase 内循环编译后（arm64, `-O2`）：
     b.ne  .Lloop          ; branch       (1 cycle, 分支预测器命中)
 ```
 
-乱序执行窗口分析：
-
-```
-每次循环迭代的时序：
-
-  load 发出 ──────── 等 ~300 cycles ──────── load 完成
-  │                                          │
-  ├── add  (1 cycle) ──┐                     │
-  ├── cmp  (1 cycle) ──┤ 已被 retire         │
-  └── b.ne (1 cycle) ──┘                     │
-                                              ↓
-                                      发射下一条 load
-
-  实际每迭代延迟 = max(load_latency, add+cmp+branch)
-                = max(300 cycles, 3 cycles)
-                = 300 cycles
-```
-
 | 成分 | 占比 | 说明 |
 |------|------|------|
 | DRAM load 延迟 | **~98%** | `p = p->next` 的串行依赖链 |
 | 循环控制 (add/cmp/branch) | **~1-2%** | 被乱序执行隐藏在 load 延迟后面 |
 | 外循环 `now()` 调用 | **<0.001%** | 每 10ms 才调一次（~15ns/次） |
 
-**chase 是 practically pure latency bound。** 1-2% 的 compute 开销在所有频率点一致，不影响频率-吞吐的相对比较。
+**chase 是 practically pure latency bound。**
 
-### TLB 噪音
+### TLB 噪音与 Hugepage
 
 ```
 4KB pages:
@@ -673,14 +687,25 @@ chase 随机访问 → 几乎每次 dereference 都 L1 TLB miss
   DRAM 延迟被高估 ~40%
 ```
 
-这个噪音在各频率点**一致**（不影响相对比较），但如果你关心绝对延迟值，需要用 hugepage 消除（见下方"进阶优化"）。
+这个噪音在各频率点**一致**（不影响相对比较），但如果你关心绝对延迟值，需要用 hugepage 消除：
+
+```bash
+# 分配 2MB hugepage（512 MB 需要 256 个 hugepage）
+echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+程序目前用 `posix_memalign` 分配内存（4KB page）。要使用 hugepage，需要修改为 `mmap` + `MAP_HUGETLB`，或使用 `madvise` + `MADV_HUGEPAGE`。
+
+### SMT 噪音
+
+SMT 兄弟线程共享同一物理核的 L1/L2 cache、TLB 和执行单元。chase 是 98% 时间等 DRAM → 执行单元几乎空闲 → 端口竞争影响小。但 L1/L2 eviction 会让部分访问命中 L2 而非 miss 到 DRAM → 降低 mem-bound 纯度。**对甜点分析而言，SMT 兄弟 idle 即可，不需要 offline。**
 
 ### 系统级噪音
 
 | 噪音源 | 影响 | 缓解 |
 |--------|------|------|
 | 中断（定时器、网卡等） | 抢占测试线程 | `isolcpus=` + `irqaffinity=` 隔离 CPU |
-| SMT 兄弟负载 | 共享 L1/L2/执行单元 | offlining SMT sibling |
+| SMT 兄弟负载 | 共享 L1/L2/执行单元 | offlining SMT sibling（见上方） |
 | 后台进程 | 调度竞争 | 测试前 `systemctl isolate multi-user.target` |
 | DRAM refresh 冲突 | tRFC 阻塞（~260ns / 7.8µs） | 固有噪音，中位数采样过滤 |
 | 温度节流 | 高频持续后降频 | `-t 3` 控制单次测试时长 |
@@ -706,16 +731,13 @@ chase 随机访问 → 几乎每次 dereference 都 L1 TLB miss
 
 ```
 场景 A：stride 97% at 800MHz，compute 25% at 800MHz
-  → 工作负载是 memory-bound
-  → DVFS 可以大胆降频
+  → 工作负载是 memory-bound → DVFS 可以大胆降频
 
 场景 B：stride 60% at 800MHz，compute 25% at 800MHz
-  → 工作负载是 mixed（有计算也有访存）
-  → DVFS 需要更保守
+  → 工作负载是 mixed → DVFS 需要更保守
 
 场景 C：stride 25% at 800MHz，compute 25% at 800MHz
-  → 工作负载是 compute-bound
-  → 降频 = 降性能，DVFS 无节能空间
+  → 工作负载是 compute-bound → 降频 = 降性能，DVFS 无节能空间
 ```
 
 compute 测试作为**基线**——它告诉你"如果纯粹是计算密集，各频率的吞吐上限是多少"。stride/chase 的百分比与 compute 百分比的差异，就是 memory-bound 的程度。
@@ -734,8 +756,6 @@ L3 典型大小：4-64 MB
   嵌入式（0 L3 / 几 MB LLC）：默认 128 MB 绰绰有余
 ```
 
-**验证方法**：如果低频的 stride_% 异常高（接近 100%），可能数组没超出 L3——加大 `-m` 重测。
-
 ### 为什么 chase 用随机链表而非随机数组？
 
 随机数组（`arr[rand() % N]`）的问题是：
@@ -751,7 +771,7 @@ L3 典型大小：4-64 MB
 
 ```c
 // 三步写入 — 关键顺序！
-// 1. 放宽 max 到硬件上限 → range 变成 [old_min, hw_max]（widened）
+// 1. 放宽 max 到硬件上限 → range 变成 [old_min, hw_max]
 // 2. 写 min=khz → range 变成 [khz, hw_max]（always valid since khz ≤ hw_max）
 // 3. 收紧 max=khz → range 变成 [khz, khz]（locked）
 // 如果先写 min=X（X > 当前 max），内核会拒绝：min > max
@@ -760,11 +780,11 @@ sysfs_write("scaling_min_freq", khz);      // set floor
 sysfs_write("scaling_max_freq", khz);      // tighten ceiling
 ```
 
-程序退出时恢复原始 min/max 范围（通过 `freq_cleanup()`，包括 signal handler 和 `atexit`），不影响 governor 的后续行为。
+程序退出时恢复原始 min/max 范围（通过 `freq_cleanup()`，包括 signal handler 和 `atexit`）。
 
 ### Turbo/Boost 处理
 
-测试前自动关闭 turbo boost（防止频率飙到标称值之上），测试后恢复。
+测试前自动关闭 turbo boost，测试后恢复。
 
 | 平台 | sysfs 路径 |
 |------|------------|
@@ -773,130 +793,31 @@ sysfs_write("scaling_max_freq", khz);      // tighten ceiling
 
 ---
 
-## 高核数服务器调优指南
+## 高核数服务器补充说明
 
-### SMT 的影响
+本节补充高核数（48+ 物理核）服务器的特殊注意事项，详细内容见各交叉引用。
 
-SMT 兄弟线程共享同一物理核的 L1 cache、L2 cache、TLB 和执行单元。测试期间如果 SMT 兄弟在跑任务：
+### NUMA 拓扑
 
-```
-物理核内的资源争抢：
-  ┌─────────────────────────────┐
-  │  物理核                       │
-  │  ┌───────────┐              │
-  │  │ L1 cache  │ ← 两线程共享  │  测试线程的 cache line 可能被兄弟 evict
-  │  └───────────┘              │
-  │  ┌───────────┐              │
-  │  │ L2 cache  │ ← 两线程共享  │  同上
-  │  └───────────┘              │
-  │  ┌────┐ ┌────┐              │
-  │  │ T0 │ │ T1 │              │  执行单元共享（端口竞争）
-  │  └────┘ └────┘              │
-  └─────────────────────────────┘
-
-chase 是 98% 时间等 DRAM → 执行单元几乎空闲 → 端口竞争影响小
-但 L1/L2 eviction 会让部分访问命中 L2 而非 miss 到 DRAM → 降低 mem-bound 纯度
-```
-
-**建议**：对甜点分析而言，SMT 兄弟 idle 即可，不需要 offline。只有追求最低噪音测量时才 offline。
-
-### NUMA 的影响
-
-```
-典型 96 核服务器拓扑（4 NUMA node）：
-
-  ┌─────────────────┐  ┌─────────────────┐
-  │  Node 0          │  │  Node 1          │
-  │  24 物理核        │  │  24 物理核        │
-  │  DDR channel 0   │  │  DDR channel 1   │
-  │  ~100ns 本地延迟  │  │  ~100ns 本地延迟  │
-  └────────┬─────────┘  └────────┬─────────┘
-           │ interconnect        │
-  ┌────────┴─────────┐  ┌────────┴─────────┐
-  │  Node 2          │  │  Node 3          │
-  │  24 物理核        │  │  24 物理核        │
-  │  DDR channel 2   │  │  DDR channel 3   │
-  │  ~100ns 本地延迟  │  │  ~100ns 本地延迟  │
-  └─────────────────┘  └─────────────────┘
-
-  跨 node 访问延迟：~150-250 ns
-```
-
-**本地 NUMA 测试**（默认）：`-c 0` + 内存由内核分配（通常本地）→ 测的是"最佳情况的 DRAM 甜点"。
-
-**跨 NUMA 测试**（可选）：`numactl --membind=1 ./memfreq_bench -c 0` → 内存强制分配到 Node 1 而 CPU 在 Node 0 → 测的是"最差情况的 DRAM 甜点"（延迟更高，但瓶颈在 interconnect 带宽）。
+多 NUMA node 下，本地和远端 DRAM 延迟差异 1.5-2×。本地测试（默认）测的是最佳情况；用 `numactl --membind=<远端node>` 可测最差情况。详见 [环境准备](#3-了解-numa-拓扑)。
 
 ### 大 L3 的陷阱
 
-273 MB L3 意味着：
-- stride 128 MB 数组可能部分或全部命中 L3（取决于 L3 slice 分配策略）
-- chase 128 MB 链表：2M 个 64B 节点 × 随机访问 → L3 容量是节点数的 ~4.3M 个 cache line → 约一半的 chase 访问命中 L3
+273 MB L3 意味着 stride 128 MB 数组可能部分命中 L3。chase 128 MB 链表约一半访问命中 L3。**解决方案**：数组大小 ≥ 2× L3 → 对于 273 MB L3 用 `-m 512`，更保险用 `-m 1024`。**验证**：如果 chase 的 Mops 在高频率点异常高（>20 Mops），说明大量 L3 hit → 加大数组。
 
-**解决方案**：数组大小 ≥ 2× L3 → 对于 273 MB L3 用 `-m 512`，更保险用 `-m 1024`。
+### cpufreq 联动
 
-**验证**：如果 chase 的 Mops 在高频率点异常高（比如 >20 Mops），说明大量 L3 hit → 加大数组。
-
----
-
-## 进阶优化
-
-### 用 Hugepage 消除 TLB 噪音
-
-4KB page 下，512 MB 数组需要 131,072 个页表项。chase 的随机访问几乎每次都 TLB miss，引入 ~40ns 的 page walk 开销。
-
-```bash
-# 分配 2MB hugepage（512 MB 需要 256 个 hugepage）
-echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-
-# 验证
-cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-# 输出: 256
-```
-
-程序目前用 `posix_memalign` 分配内存（4KB page）。要使用 hugepage，需要修改为 `mmap` + `MAP_HUGETLB`，或使用 `madvise` + `MADV_HUGEPAGE` 让内核做透明大页合并。
-
-### 多核并行带宽饱和测试
-
-用 `-N NCPU` 启用多核模式（见上方的 `-N` 标志表）。`-N` 自动从不同 NUMA 节点各选一个核心，均衡分配：
-
-```bash
-# 4 核多核带宽测试
-sudo ./memfreq_bench -N 4 -m 512 -t 3 -n 3
-
-# 半核心数（例如 48 核）
-sudo ./memfreq_bench -N 48 -m 512 -t 3 -n 3
-```
-
-详细多核模式说明见上方「多核并行模式（`-N`）」章节。注意 cpufreq 对同 cluster 内的所有核是联动的，所以同 cluster 的多核测试有意义；跨 cluster 的核可能频率独立。
-
-### 配合功耗测量
-
-甜点只是性能角度。要量化实际节能：
-
-```bash
-# Intel: turbostat
-sudo turbostat --Summary --show PkgWatt,CorWatt,MHz,Busy% -i 1 &
-./memfreq_bench -m 512
-
-# ARM: 读 RAPL 或 SoC-specific power sensor
-watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
-```
-
-将功耗数据与频率数据对齐，就能画出 **性能-功耗 Pareto 曲线**，找到真正的能效最优点。
+同 cluster 内的核可能频率联动（如 ARM 的 cpufreq policy 按 cluster 分组），设置 cpu0 的频率可能同时影响 cpu0-3。多核测试时注意这一点。
 
 ---
 
 ## 限制和注意事项
 
 1. **需要 root**：写 cpufreq sysfs 需要 root 权限
-2. **需要 cpufreq 驱动**：程序会依次尝试三种频率枚举方式——`scaling_available_frequencies`（离散列表）、acpi_cppc 高低非线性性能值、`cpuinfo_min/max_freq`（范围模式）。三者都不可用时才报错退出
-3. **默认单核**：每个频率点默认只测一个 core，使用 `-N NCPU` 启用多核模式，测试多核访存的带宽饱和效应
-4. **功耗仅记录，不参与甜点判定**：程序会读取 RAPL / hwmon 功率传感器（如有），在 plateau 块输出甜点频率下的功耗和节能百分比。但甜点本身是纯性能角度的判定（95% 最大吞吐）。要更精确的功耗分析，配合 `turbostat`
-5. **stride 的 sum 有数据依赖**：`sum += arr[i]` 限制了流水线深度，但编译器可能展开为 partial sum，实际行为取决于 `-O2` 的优化策略。这不影响结论（仍然是 mem-bound 主导），但精确吞吐数值会因编译器而异
-6. **chase 的内循环**：每次遍历全部 `nnodes` 个节点（数组大小 / 64B），外层 `now()` 的调用开销（~15ns/call）占比极小，可忽略
-7. **TLB 噪音**：4KB page 下 chase 的测量延迟包含 page walk 开销（~40ns/access），绝对延迟被高估 ~40%。不影响频率-吞吐的相对比较，需要绝对值请用 hugepage
-8. **cpufreq 联动**：同 cluster 内的核可能频率联动（如 ARM 的 cpufreq policy 按 cluster 分组），设置 cpu0 的频率可能同时影响 cpu0-3
-9. **统计输出默认开启**：per-freq min/max/IQR 和 plateau 检测默认会输出到结果末尾（`#`-prefixed 块,不影响数据行）。想看 sweep 的甜点稳定性,配合 `memfreq_sweep.py --compare` 比较多次 JSON 结果
+2. **需要 cpufreq 驱动**：程序依次尝试三种频率枚举方式——`scaling_available_frequencies`（离散列表）、acpi_cppc 高低非线性性能值、`cpuinfo_min/max_freq`（范围模式）。三者都不可用时才报错退出
+3. **功耗仅记录，不参与甜点判定**：甜点本身是纯性能角度的判定（95% 最大吞吐）。功耗数据在 plateau 块的 `power:` 行输出
+4. **stride 的 sum 有数据依赖**：`sum += arr[i]` 限制了流水线深度，但编译器可能展开为 partial sum，精确吞吐数值因编译器而异
+5. **统计输出默认开启**：per-freq min/max/IQR 和 plateau 检测默认输出到结果末尾（`#`-prefixed 块,不影响数据行）。想看 sweep 的甜点稳定性,配合 `memfreq_sweep.py --compare` 比较多次 JSON 结果
 
 ---
 
@@ -911,40 +832,6 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 | `turbostat` | 实际功耗/频率 | 不生成工作负载 |
 
 **memfreq_bench 的独特价值**：它不只是测内存性能或 CPU 性能——它测的是**"内存性能如何随 CPU 频率变化"**，这直接回答 DVFS governor 的核心问题：降频会损失多少性能？
-
----
-
-## 完整测试流程（以 96 核 ARM 服务器为例）
-
-```bash
-# ── 1. 拓扑侦察 ──
-lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
-numactl -H
-cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq
-cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
-
-# ── 2. 基本测试（L3 自动检测，数组自动 2× L3）──
-sudo ./memfreq_bench -c 0 -A -t 3 -n 5
-
-# ── 3. 多核带宽饱和测试（每 NUMA node 各 1 核）──
-sudo ./memfreq_bench -N 2 -A -t 3 -n 5
-
-# ── 4. 半核带宽饱和测试（48 物理核）──
-sudo ./memfreq_bench -N 48 -A -t 3 -n 5
-
-# ── 5. NUMA 绑定测试（强制内存到 Node 0）──
-sudo ./memfreq_bench -c 0 -A -B 0 -t 3 -n 5
-
-# ── 6. 可选：random permutation 测试 ──
-sudo ./memfreq_bench -c 0 -A -R -t 3 -n 5
-
-# ── 7. 可选：cache flush 测试（强制 L3 miss）──
-sudo ./memfreq_bench -c 0 -A -f -t 3 -n 5
-
-# ── 8. 可选：不同 stride 对比 ──
-sudo ./memfreq_bench -c 0 -A -s 1     # prefetcher-friendly
-sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
-```
 
 ---
 

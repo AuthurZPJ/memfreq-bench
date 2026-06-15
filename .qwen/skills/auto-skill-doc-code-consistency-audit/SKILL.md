@@ -219,6 +219,22 @@ After fixing individual drift issues, check whether any **project-wide constants
    sed -i '' 's/guidance to Codex/guidance to Claude Code/' CLAUDE.md
    ```
 
+### Output-line propagation checklist
+
+When the C binary adds or removes an output line (e.g., `# stride_l3 sweet spot: N MHz`), the downstream pipeline must be updated atomically. Use this checklist:
+
+1. **C printf** — the source of truth
+2. **Python parser** — `parse_output()` must recognize the new line pattern
+3. **Shell report extractor** — `extract_data()` must parse the new field (often a new `|`-delimited column)
+4. **Test fixtures** — add example data for the new line/block to `.txt` and `.json` fixtures
+5. **Test assertions** — update expected counts (e.g., `plateau_rows=2` → `3`)
+6. **Doc example outputs** — every `# ---` block example and sweet-spot summary in docs must show/hide the new line
+7. **CSV headers** — add the new column name to the header row
+8. **Report tables** — add the new table or column to the report generation code
+9. **DVFS recommendations** — add new recommendation if the output drives one
+
+The same checklist applies in reverse when *removing* an output artifact (e.g., removing `compute` from statistical blocks). Every downstream consumer must drop the corresponding parsing/extraction/display code.
+
 ## Key lessons
 
 1. **First pass catches 20% of issues, second pass catches the other 80%** — Quick reading misses subtle numeric drift and code snippet mismatches. Always do both passes.
