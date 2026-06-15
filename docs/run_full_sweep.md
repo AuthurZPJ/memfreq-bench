@@ -1310,6 +1310,16 @@ sudo ./run_full_sweep.sh --yes --output automated_results
 python3 analyze.py automated_results/data.csv
 ```
 
+### Q9: 报错 `ERROR: system too busy for reliable benchmarking` 怎么办？
+
+A: 这个错误来自 `memfreq_bench` 的 idle gate —— 当 `loadavg(1min) > online_cpus` 时拒绝运行。长时间 sweep 过程中这个检查可能会在后面的 suite 触发（测试本身会推高 loadavg，叠加机器上其他负载）。解决方案：
+
+```bash
+sudo ./run_full_sweep.sh --quick --yes --force
+```
+
+`--force` 会把 `-F` 传给所有 `memfreq_bench` 调用，跳过 idle gate。注意 `--force` 会**绕过安全检查**，在繁忙系统上跑的 sweep 数据会有噪声。如果数据可信度重要，先用 `uptime` 确认 `loadavg < online_cpus` 再跑。
+
 ---
 
 ## 附录：测试命名规则

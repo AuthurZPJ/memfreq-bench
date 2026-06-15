@@ -25,6 +25,7 @@ set -uo pipefail
 
 QUICK_MODE=0
 NO_PROMPT=0
+FORCE_MODE=0     # --force: pass -F to memfreq_bench (skip idle gate)
 SELECTED_SUITES=""   # --suite N[,N...]: run only the listed suite numbers
 RESUME_MODE=0        # --resume: skip tests whose output file already has a sweet-spot line
 OUTPUT_DIR=""
@@ -263,7 +264,7 @@ suite_stride_grid() {
     log_suite "Suite A: Stride Grid (7 values × full sweep)"
     log_info "Testing how stride size affects frequency sensitivity"
 
-    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     local -a strides=(1 2 4 8 16 32 64)
     # Quick mode: representative subset — prefetcher-active, cache-line, mid, extreme-miss
@@ -277,7 +278,7 @@ suite_stride_grid() {
 suite_random_flush() {
     log_suite "Suite B: Random + Flush Modes"
 
-    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     run_test "random"    "${common[@]}" -R
     run_test "flush"     "${common[@]}" -f
@@ -288,7 +289,7 @@ suite_multicore_sweep() {
     log_suite "Suite C: Multi-Core Sweep (11 core counts)"
     log_info "Testing how core count affects bandwidth-bound sweet spot"
 
-    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     local -a counts=(1 2 4 8 12 16 24 32 48 64 96)
 
@@ -301,7 +302,7 @@ suite_multicore_sweep() {
 suite_multicore_modes() {
     log_suite "Suite D: Multi-Core + Access Modes"
 
-    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     # Multi-core × stride
     for n in 2 4 8 16; do
@@ -331,7 +332,7 @@ suite_numa_matrix() {
         return 0
     fi
 
-    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     # Every CPU×Memory combination
     for cpu_node in $(seq 0 $((NUM_NUMA - 1))); do
@@ -363,7 +364,7 @@ suite_stress_comparison() {
     log_suite "Suite F: Stress-NG Style Comparison"
     log_info "Comparing different memory access patterns at scale"
 
-    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     # Half-system with all access modes
     local half=$((NUM_PHYSICAL / 2))
@@ -382,7 +383,7 @@ suite_cache_hierarchy() {
     log_suite "Suite G: Cache Hierarchy Sweep"
     log_info "Testing memory-bound behavior across cache boundaries"
 
-    local common=(-c "$CPU_PIN" -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-c "$CPU_PIN" -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     # Calculate array sizes at different cache boundaries
     local -a sizes_mb=()
@@ -461,7 +462,7 @@ suite_l3_resident() {
     log_suite "Suite 8: L3-Resident Sweep (-2 flag)"
     log_info "Measuring sweet spot with data fitting in L3 cache (2× L2 array)"
 
-    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
+    local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}" "${FORCE_FLAGS[@]}")
 
     run_test "l3_resident" "${common[@]}" -2
 }
@@ -883,6 +884,7 @@ Options:
   --output DIR Output directory
   --suite LIST Comma-separated suite numbers to run, e.g. 1,3,5 (default: all)
   --resume     Skip tests whose output file already has a sweet-spot line
+  --force      Pass -F to memfreq_bench (skip idle gate, use on busy systems)
   --help       Show this help
 
 Environment:
@@ -924,10 +926,15 @@ main() {
             --output)   OUTPUT_DIR="$2"; shift 2 ;;
             --suite)    SELECTED_SUITES="$2"; shift 2 ;;
             --resume)   RESUME_MODE=1; shift ;;
+            --force)    FORCE_MODE=1; shift ;;
             --help|-h)  show_help; exit 0 ;;
             *)          log_error "Unknown option: $1"; show_help; exit 1 ;;
         esac
     done
+
+    # Build memfreq_bench force-run flag once, reuse across all suites
+    FORCE_FLAGS=()
+    [[ $FORCE_MODE -eq 1 ]] && FORCE_FLAGS=(-F)
 
     # Pre-flight
     if [[ $EUID -ne 0 ]]; then
