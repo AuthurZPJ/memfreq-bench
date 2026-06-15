@@ -163,7 +163,7 @@ return (double)iterations * 1000000.0 / elapsed;   // 真实 OPS = iterations ×
 - 零内存访问 → 不涉及 cache / DRAM
 - 吞吐**完全由 CPU 频率决定** → 频率减半，吞吐减半
 
-**用途：sanity check**。如果 compute 在不同频率下的吞吐比不等于频率比，说明频率没有成功锁定（turbo 还在跑、或者 governor 覆盖了你的设置）。详见 [compute_% 作为 sanity check](#compute_-作为-sanity-check)。
+**用途：sanity check**。如果 compute 在不同频率下的吞吐比不等于频率比，说明频率没有成功锁定（turbo 还在跑、或者 governor 覆盖了你的设置）。详见 [compute_% 作为频率锁定 sanity check](#compute-作为频率锁定-sanity-check)。
 
 ### 5. Stride + Flush（强制 L3 miss）
 
