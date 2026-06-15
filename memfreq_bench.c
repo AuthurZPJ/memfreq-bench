@@ -913,7 +913,7 @@ static int count_cpus_in_list(const char *cpulist)
 static long detect_l3_size(void)
 {
 	long max_total = -1;
-	char path[512], buf[512], shared_list[512];
+	char path[512], buf[512];
 
 	for (int idx = 0; idx < 16; idx++) {
 		/* read cache level */
@@ -954,34 +954,84 @@ static long detect_l3_size(void)
 		else if (len > 0 && (buf[len - 1] == 'M' || buf[len - 1] == 'm'))
 			slice_size *= 1024 * 1024;
 
-		/* read shared_cpu_list to find how many cores share this L3 */
-		snprintf(path, sizeof(path),
-			 "/sys/devices/system/cpu/cpu0/cache/index%d/shared_cpu_list",
-			 idx);
-		if (sysfs_read(path, shared_list, sizeof(shared_list)) < 0) {
-			/* fallback: assume this is the total size */
-			if (slice_size > max_total)
-				max_total = slice_size;
-			continue;
-		}
-
-		int num_sharing = count_cpus_in_list(shared_list);
-		if (num_sharing <= 0)
-			num_sharing = 1;
-
-		/* total L3 = per-core slice × number of cores sharing it */
-		/* For shared caches (L3+), sysfs size is already the total */
-		long total_size;
-		if (level >= 3)
-			total_size = slice_size;
-		else
-			total_size = slice_size * num_sharing;
+		/* For shared caches (L3+), sysfs size is already the total size */
+		/* (no need to multiply by num_sharing) */
+		long total_size = slice_size;
 
 		if (total_size > max_total)
 			max_total = total_size;
 	}
 
 	return max_total;
+}
+
+/* ------------------------------------------------------------------ */
+/* L2 cache detection                                                  */
+/*                                                                     */
+/* Scan /sys/devices/system/cpu/cpu0/cache/indexN/ for L2 unified or   */
+/* data cache. Returns per-core L2 size in bytes, or -1.               */
+/* ------------------------------------------------------------------ */
+static long detect_l2_size(void)
+{
+	char path[512], buf[512], shared_list[512];
+
+	for (int idx = 0; idx < 16; idx++) {
+		/* read cache level */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/level",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			break;
+		int level = atoi(buf);
+
+		if (level != 2)
+			continue;
+
+		/* read cache type */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/type",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		/* only consider Unified or Data caches */
+		if (strncmp(buf, "Unified", 7) != 0 &&
+		    strncmp(buf, "Data", 4) != 0)
+			continue;
+
+		/* read size (per-core slice) */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/size",
+			 idx);
+		if (sysfs_read(path, buf, sizeof(buf)) < 0)
+			continue;
+
+		long slice_size = atol(buf);
+		/* handle K/M suffix */
+		size_t len = strlen(buf);
+		if (len > 0 && (buf[len - 1] == 'K' || buf[len - 1] == 'k'))
+			slice_size *= 1024;
+		else if (len > 0 && (buf[len - 1] == 'M' || buf[len - 1] == 'm'))
+			slice_size *= 1024 * 1024;
+
+		/* L2 is per-core: sysfs size is per-core, not shared total */
+		/* Verify by checking shared_cpu_list (should be single CPU or SMT pair) */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu0/cache/index%d/shared_cpu_list",
+			 idx);
+		if (sysfs_read(path, shared_list, sizeof(shared_list)) == 0) {
+			int num_sharing = count_cpus_in_list(shared_list);
+			/* If >2 CPUs share L2, it's likely misreported or unusual topology */
+			if (num_sharing > 2) {
+				dprintf("WARN: L2 shared by %d CPUs (unusual), "
+					"using per-core size\n", num_sharing);
+			}
+		}
+
+		return slice_size;  /* L2 is per-core */
+	}
+
+	return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2282,6 +2332,7 @@ static void usage(const char *prog)
 "  -R          Add random permutation test (Fisher-Yates, defeats prefetcher)\n"
 "  -f          Flush cache line after each access (clflush/dc cvac)\n"
 "  -F          Force run even if system is busy (skip idle check)\n"
+"  -2          L3-resident sweep: also measure sweet spot with 2× L2 array\n"
 "  -B NODE     Bind array memory to NUMA node (default: -1 = no binding)\n"
 "  -T FRAC     Sweet-spot threshold in (0, 1]   (default: 0.95)\n"
 "  -L LIST     Multi-threshold sweep, e.g. 0.8,0.9,0.95,0.99 (max 16)\n"
@@ -2309,6 +2360,7 @@ int main(int argc, char **argv)
 	int   do_chase  = 1;
 	int   do_random = 0;  /* -R: random permutation test */
 	int   do_flush  = 0;  /* -f: flush cache line after each access */
+	int   do_l3_resident = 0;  /* -2: also run sweep with 2× L2 array */
 	int   step_khz  = 25000;   /* 25 MHz default step for CPPC range */
 	int   force_run = 0;
 	int   numa_node = -1;  /* -1 = no binding */
@@ -2328,7 +2380,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfFhT:L:rPy")) != -1) {
+	while ((opt = getopt(argc, argv, "c:N:m:As:t:n:S:B:CRfF2hT:L:rPy")) != -1) {
 		switch (opt) {
 		case 'c': cpu       = atoi(optarg); break;
 		case 'N': ncpu      = atoi(optarg); break;
@@ -2343,6 +2395,7 @@ int main(int argc, char **argv)
 		case 'R': do_random = 1;            break;
 		case 'f': do_flush  = 1;            break;
 		case 'F': force_run = 1;            break;
+		case '2': do_l3_resident = 1;       break;
 		case 'T': threshold = atof(optarg);
 		          if (threshold <= 0.0 || threshold > 1.0) {
 		              dprintf("ERROR: threshold must be in (0, 1], got %s\n", optarg);
@@ -2388,6 +2441,14 @@ int main(int argc, char **argv)
 		if (size_mb < 16)
 			size_mb = 16;  /* minimum 16 MB */
 	}
+
+	/* ---- detect L2 cache (for -2 L3-resident sweep) ---- */
+	long l2_bytes = detect_l2_size();
+	if (do_l3_resident && l2_bytes <= 0) {
+		dprintf("ERROR: -2 requires L2 cache detection, but L2 not found\n");
+		return 1;
+	}
+
 	/* Bound-check size_mb. The cast to size_t is deliberately BEFORE the
 	 * multiplication (1024UL * 1024UL keeps each factor explicitly unsigned
 	 * long) so the result is never computed in 32-bit int — that would
@@ -2541,6 +2602,9 @@ int main(int argc, char **argv)
 
 	dprintf("=== memfreq_bench ===\n");
 	dprintf("CPU       : %d (of %d online)\n", cpu, ncpus_online);
+	if (l2_bytes > 0)
+		dprintf("L2 cache  : %ld KB (per core)\n",
+			l2_bytes / 1024);
 	if (l3_bytes > 0)
 		dprintf("L3 cache  : %ld MB (total shared across all cores)\n",
 			l3_bytes / (1024 * 1024));
@@ -2573,6 +2637,9 @@ int main(int argc, char **argv)
 	}
 	dprintf("Freq pts  : %d\n", nfreqs);
 	dprintf("Sweep     : high → low (max freq first = reference baseline)\n");
+	if (do_l3_resident)
+		dprintf("L3-resident: yes (array=%ld MB = 2× L2)\n",
+			(l2_bytes * 2) / (1024 * 1024));
 	dprintf("\n");
 
 	struct result *results = calloc(nfreqs, sizeof(*results));
@@ -2743,6 +2810,72 @@ int main(int argc, char **argv)
 	/* ---- restore ---- */
 	freq_cleanup();
 
+	/* ---- L3-resident sweep (optional, -2 flag) ---- */
+	double *l3r_mops = NULL;
+	int l3r_sweet = 0;
+	if (do_l3_resident) {
+		dprintf("\n");
+		dprintf("=== L3-resident sweep (2× L2 = %ld MB) ===\n",
+			(l2_bytes * 2) / (1024 * 1024));
+		
+		size_t l3r_bytes = (size_t)(l2_bytes * 2);
+		size_t l3r_count = l3r_bytes / sizeof(uint64_t);
+		
+		uint64_t *l3r_arr = NULL;
+		if (posix_memalign((void **)&l3r_arr, CL, l3r_bytes)) {
+			dprintf("WARN: L3-resident array allocation failed, skipping\n");
+			do_l3_resident = 0;
+		} else {
+			/* Initialize with stride pattern */
+			for (size_t i = 0; i < l3r_count; i++)
+				l3r_arr[i] = i;
+			
+			/* Allocate results array for L3-resident sweep */
+			l3r_mops = calloc(nfreqs, sizeof(double));
+			if (!l3r_mops) {
+				dprintf("WARN: L3-resident results allocation failed\n");
+				free(l3r_arr);
+				do_l3_resident = 0;
+			} else {
+				/* Lock frequency again */
+				freq_lock(cpu);
+				
+				/* Sweep from high to low */
+				for (int fi = nfreqs - 1; fi >= 0; fi--) {
+					if (set_freq(cpu, freqs[fi]) < 0) {
+						dprintf("\nWARN: cannot set cpu%d to %d kHz, skipping\n",
+							cpu, freqs[fi]);
+						continue;
+					}
+					usleep(100000);  /* let frequency settle */
+					
+					dprintf("\rL3-resident: freq %d/%d MHz  ",
+						freqs[fi] / 1000, freqs[nfreqs-1] / 1000);
+					fflush(stderr);
+					
+					/* Run stride benchmark multiple times */
+					double samples[3];
+					for (int s = 0; s < 3; s++) {
+						samples[s] = bench_stride(l3r_arr, l3r_count, stride, test_secs);
+					}
+					qsort(samples, 3, sizeof(double), cmp_double);
+					l3r_mops[fi] = samples[1];  /* median */
+				}
+				
+				dprintf("\r                                  \r");
+				fflush(stderr);
+				
+				freq_cleanup();
+				
+				/* Find sweet spot */
+				int l3r_idx = 0;
+				l3r_sweet = find_sweet_spot(l3r_mops, freqs, nfreqs, &l3r_idx, 0.95);
+				
+				free(l3r_arr);
+			}
+		}
+	}
+
 	/* ---- find valid reference (highest successful freq) ---- */
 	int ref = -1;
 	for (int fi = nfreqs - 1; fi >= 0; fi--) {
@@ -2840,6 +2973,11 @@ int main(int argc, char **argv)
 		       chase_sweet * 100 / freqs[nfreqs - 1],
 		       freqs[nfreqs - 1] / 1000);
 	printf("# compute sweet spot: — (scales linearly, always needs max freq)\n");
+	if (do_l3_resident && l3r_sweet > 0)
+		printf("# stride_l3 sweet spot: %d MHz  (%d%% of max %d MHz)\n",
+		       l3r_sweet / 1000,
+		       l3r_sweet * 100 / freqs[nfreqs - 1],
+		       freqs[nfreqs - 1] / 1000);
 
 	/* Interpretation guide */
 	printf("#\n");
@@ -2912,6 +3050,7 @@ int main(int argc, char **argv)
 	free(arr);
 	free(chase_nodes);
 	free(random_idx);
+	free(l3r_mops);
 	return 0;
 }
 

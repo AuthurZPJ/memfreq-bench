@@ -129,6 +129,7 @@ numbers drift with edits — use the banners, not line refs, to find things):
 | `-t N -n N` | Per-freq duration (sec) and sample count. Median is taken; `t=3 n=5` is the typical low-noise setting. |
 | `-S N` | kHz step in CPPC range mode. Default 25000 (25 MHz). |
 | `-N N` | Multi-core mode: pick N CPUs, distribute across NUMA. Measures bandwidth saturation, not latency. |
+| `-2` | L3-resident sweep: also measure sweet spot with 2× L2 array (data fits in L3). Reports `stride_l3 sweet spot`. |
 | `-B N` | Bind array to NUMA node N. Use with `numactl` to create local/remote latency splits. |
 | `-R -f` | Add random-permutation and clflush workloads. |
 | `-F` | Skip the idle gate. |
@@ -142,7 +143,7 @@ numbers drift with edits — use the banners, not line refs, to find things):
 TSV to stdout, `#`-prefixed metadata/header lines, then rows. The Python parser keys off:
 
 - `# cpu=… array=… stride=… duration=… samples=…` — meta line
-- `# stride  sweet spot: <MHz>` / `# chase   sweet spot: <MHz>` / `# compute sweet spot: —` — headline values
+- `# stride  sweet spot: <MHz>` / `# chase   sweet spot: <MHz>` / `# compute sweet spot: —` / `# stride_l3 sweet spot: <MHz>` (only with `-2`) — headline values
 
 Data rows: `target_MHz<TAB>actual_MHz<TAB>stride_Mops<TAB>stride_MBs<TAB>stride_%<TAB>chase_Mops<TAB>chase_%<TAB>compute_Mops<TAB>compute_%` (chase columns absent with `-C`)
 

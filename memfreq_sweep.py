@@ -333,6 +333,10 @@ def parse_output(text: str) -> dict:
             sweet["chase"] = int(line.split(":")[1].strip().split()[0])
             i += 1
             continue
+        if line.startswith("# stride_l3 sweet spot:"):
+            sweet["stride_l3"] = int(line.split(":")[1].strip().split()[0])
+            i += 1
+            continue
 
         # New block headers — collect lines until next "# ---" header or EOF,
         # then dispatch to the appropriate sub-parser.
@@ -647,7 +651,12 @@ def generate_report(dir_path: str, output_path: str | None = None) -> int:
         s = data.get("sweet", {}) or {}
         st = s.get("stride", None)
         ch = s.get("chase", None)
-        return (f"{st} MHz" if st else "\u2014"), (f"{ch} MHz" if ch else "\u2014")
+        st_l3 = s.get("stride_l3", None)
+        return (
+            f"{st} MHz" if st else "\u2014",
+            f"{ch} MHz" if ch else "\u2014",
+            f"{st_l3} MHz" if st_l3 else "\u2014"
+        )
 
     def _max_bw(data):
         rows = data.get("rows", [])
@@ -697,14 +706,14 @@ def generate_report(dir_path: str, output_path: str | None = None) -> int:
     # Summary table
     lines.append("## 测试总览")
     lines.append("")
-    lines.append("| 测试 | Stride Sweet Spot | Chase Sweet Spot |")
-    lines.append("|------|-----|-----|")
+    lines.append("| 测试 | Stride Sweet Spot | Chase Sweet Spot | Stride L3-Resident |")
+    lines.append("|------|-----|-----|-----|")
     for name, data in parsed:
         if data is None:
-            lines.append(f"| {name} | (解析失败) | (解析失败) |")
+            lines.append(f"| {name} | (解析失败) | (解析失败) | (解析失败) |")
         else:
-            st, ch = _ss(data)
-            lines.append(f"| {name} | {st} | {ch} |")
+            st, ch, st_l3 = _ss(data)
+            lines.append(f"| {name} | {st} | {ch} | {st_l3} |")
     lines.append("")
 
     # Per-group tables
@@ -721,16 +730,16 @@ def generate_report(dir_path: str, output_path: str | None = None) -> int:
             continue
         lines.append(f"## {gtitle}")
         lines.append("")
-        lines.append("| 测试 | 最大带宽 MB/s | Stride Spot | Chase Spot | 平台期 |")
-        lines.append("|------|-------------:|:-----------:|:----------:|:------:|")
+        lines.append("| 测试 | 最大带宽 MB/s | Stride Spot | Chase Spot | Stride L3 | 平台期 |")
+        lines.append("|------|-------------:|:-----------:|:----------:|:---------:|:------:|")
         for name, data in items:
             if data is None:
-                lines.append(f"| {name} | \u2014 | \u2014 | \u2014 | \u2014 |")
+                lines.append(f"| {name} | \u2014 | \u2014 | \u2014 | \u2014 | \u2014 |")
                 continue
-            st, ch = _ss(data)
+            st, ch, st_l3 = _ss(data)
             bw = _max_bw(data)
             bp = _plateau(data)
-            lines.append(f"| {name} | {bw:.0f} | {st} | {ch} | {bp} |")
+            lines.append(f"| {name} | {bw:.0f} | {st} | {ch} | {st_l3} | {bp} |")
         lines.append("")
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

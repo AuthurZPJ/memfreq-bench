@@ -252,6 +252,7 @@ sudo ./memfreq_bench -C
 | `-C` | — | 跳过 pointer chase 测试 |
 | `-R` | — | 启用 random permutation 测试 |
 | `-f` | — | 启用 cache flush（clflush/dc cvac） |
+| `-2` | — | 额外运行 L3-resident sweep（数组大小 = 2× L2，数据完全驻留在 L3 中） |
 | `-B NODE` | -1 | 将数组绑定到指定 NUMA 节点 |
 | `-F` | — | 强制运行（跳过系统空闲检查） |
 | `-T FRAC` | 0.95 | sweet-spot 阈值,(0, 1] 范围内 |
@@ -302,11 +303,13 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # stride  sweet spot: 2000 MHz  (77% of max 2600 MHz)
 # chase   sweet spot: 2000 MHz  (77% of max 2600 MHz)
 # compute sweet spot: — (scales linearly, always needs max freq)
+# stride_l3 sweet spot: 1800 MHz  (69% of max 2600 MHz)
 ```
 
 注意输出现在包含：
 - **target_MHz / actual_MHz**：设定频率和实际运行频率（`cpuinfo_cur_freq`）
 - **stride_MBs**：显式带宽报告（MB/s），比 Mops 更直观
+- **stride_l3 sweet spot**：L3-resident sweep 的甜点（仅当使用 `-2` 时输出，数组大小 = 2× L2）
 - **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
 
 #### 数据行每列含义
