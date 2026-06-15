@@ -13,7 +13,7 @@
 #
 # Usage:
 #   sudo ./run_full_sweep.sh
-#   sudo ./run_full_sweep.sh --quick       # ~3 hours (Suites 1/3/5/7 only, -t 2 -n 2)
+#   sudo ./run_full_sweep.sh --quick       # ~3 hours (Suites 1/2/3/5/7, -t 2 -n 5)
 #   sudo ./run_full_sweep.sh --yes          # skip prompt
 #
 
@@ -261,7 +261,11 @@ suite_stride_grid() {
 
     local common=(-c "$CPU_PIN" -A -t "$TEST_DURATION" -n "$TEST_SAMPLES" "${STATS_FLAGS[@]}")
 
-    for stride in 1 2 4 8 16 32 64; do
+    local -a strides=(1 2 4 8 16 32 64)
+    # Quick mode: representative subset — prefetcher-active, cache-line, mid, extreme-miss
+    [[ $QUICK_MODE -eq 1 ]] && strides=(1 8 32 64)
+
+    for stride in "${strides[@]}"; do
         run_test "s${stride}" "${common[@]}" -s "$stride"
     done
 }
@@ -814,7 +818,7 @@ Usage: sudo ./run_full_sweep.sh [OPTIONS]
 Exhaustive memfreq_bench sweep for deep analysis.
 
 Options:
-  --quick      Suites 1/3/5/7 only, reduced params (2s × 2 samples)
+  --quick      Suites 1/2/3/5/7, reduced params (2s × 5 samples)
   --yes        Skip confirmation prompt
   --duration N Seconds per test point (default: 5)
   --samples N  Samples per point (default: 5)
@@ -891,16 +895,17 @@ main() {
     # In quick mode, reduce parameters
     if [[ $QUICK_MODE -eq 1 ]]; then
         TEST_DURATION=2
-        TEST_SAMPLES=2
+        TEST_SAMPLES=5
         log_warn "Quick mode: reduced duration=${TEST_DURATION}s, samples=${TEST_SAMPLES}"
     fi
 
     # Estimate
     local est_tests
     if [[ $QUICK_MODE -eq 1 ]]; then
-        # Quick runs suites 1,3,5,7 with reduced parameters
+        # Quick runs suites 1,2,3,5,7 with reduced parameters
         est_tests=0
-        est_tests=$((est_tests + 7))  # Suite A: stride grid
+        est_tests=$((est_tests + 4))  # Suite A: stride grid (4 representative)
+        est_tests=$((est_tests + 3))  # Suite B: random + flush modes
         est_tests=$((est_tests + 11)) # Suite C: multi-core sweep
         [[ $NUM_NUMA -ge 2 ]] && est_tests=$((est_tests + NUM_NUMA * 2 + 4))  # Suite E: NUMA
         est_tests=$((est_tests + 5))  # Suite G: cache hierarchy
@@ -928,8 +933,9 @@ main() {
 
     # Run suites
     if [[ $QUICK_MODE -eq 1 ]]; then
-        # Quick: stride grid + mc sweep + NUMA + cache hierarchy
+        # Quick: stride grid + random/flush + mc sweep + NUMA + cache hierarchy
         should_run_suite 1 && suite_stride_grid
+        should_run_suite 2 && suite_random_flush
         should_run_suite 3 && suite_multicore_sweep
         should_run_suite 5 && [[ $NUM_NUMA -ge 2 ]] && suite_numa_matrix
         should_run_suite 7 && suite_cache_hierarchy

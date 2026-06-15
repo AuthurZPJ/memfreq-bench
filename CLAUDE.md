@@ -23,7 +23,7 @@ sudo ./memfreq_bench -m 512       # array must exceed L3 cache
 
 # One-click wrappers
 sudo ./run_all_tests.sh           # 7 predefined suites, ~2.5-5 hr default / ~20-45 min --quick
-sudo ./run_full_sweep.sh          # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/3/5/7 only)
+sudo ./run_full_sweep.sh          # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/2/3/5/7)
 
 # Visualization
 sudo python3 memfreq_sweep.py     # run + ASCII bar charts
