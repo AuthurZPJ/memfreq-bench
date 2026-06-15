@@ -155,11 +155,11 @@ check_contains "parse_output returns sensitivity"    "$PARSE_OUT" "sensitivity"
 check_contains "parse_output returns plateau"        "$PARSE_OUT" "plateau"
 check_contains "parse_output returns raw_samples"    "$PARSE_OUT" "raw_samples"
 check_contains "parse_output returns sweet_spot_ci"  "$PARSE_OUT" "sweet_spot_ci"
-check_contains "per_freq_stats has stride workload"  "$PARSE_OUT" "pfs_workloads=chase,compute,stride"
-check_contains "sensitivity has stride workload"     "$PARSE_OUT" "sens_workloads=chase,compute,stride"
-check_contains "plateau has 3 rows"                  "$PARSE_OUT" "plateau_rows=3"
-check_contains "raw_samples has stride workload"     "$PARSE_OUT" "raw_workloads=compute,stride"
-check_contains "sweet_spot_ci has stride workload"   "$PARSE_OUT" "ci_workloads=chase,compute,stride"
+check_contains "per_freq_stats has stride workload"  "$PARSE_OUT" "pfs_workloads=chase,stride"
+check_contains "sensitivity has stride workload"     "$PARSE_OUT" "sens_workloads=chase,stride"
+check_contains "plateau has 2 rows"                  "$PARSE_OUT" "plateau_rows=2"
+check_contains "raw_samples has stride workload"     "$PARSE_OUT" "raw_workloads=stride"
+check_contains "sweet_spot_ci has stride workload"   "$PARSE_OUT" "ci_workloads=chase,stride"
 check_contains "CI method label is bootstrap_1000"  "$PARSE_OUT" "ci_method=bootstrap_1000"
 check_contains "CI sweet_MHz parses as int"          "$PARSE_OUT" "ci_sweet=1200"
 check_contains "CI low_MHz parses as int"            "$PARSE_OUT" "ci_low=1200"
@@ -230,7 +230,6 @@ else
     # if the previous run already failed. Use sudo unconditionally here.
     OUT=$(sudo $BIN -c 0 -m 128 -t 1 -n 5 2>&1)
     check_contains "stats block header (stride)" "$OUT" "per-freq stats (stride)"
-    check_contains "stats block header (compute)" "$OUT" "per-freq stats (compute)"
 
     echo "=== Test 8: -r emits raw_samples block ==="
     OUT=$(sudo $BIN -c 0 -m 128 -t 1 -n 3 -r 2>&1)

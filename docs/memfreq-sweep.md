@@ -52,7 +52,7 @@ $ sudo ./memfreq_bench -c 0 -m 256 -s 8 -t 2 -n 3
   → CHASE is purely latency-bound (DRAM round-trip).
 ```
 
-三张柱状图（Stride / Chase / Compute）+ 甜点摘要 + 分析建议。如果用了 `-r`，还会输出 bootstrap CI 和 plateau 检测。
+三张柱状图（Stride / Chase / Compute）+ 甜点摘要 + 分析建议。统计块（per-freq stats / CI / sensitivity / plateau / raw_samples）只包含 stride / chase / random，不含 compute（compute 仅用于频率锁定 sanity check）。如果用了 `-r`，还会输出 bootstrap CI 和 plateau 检测。
 
 ---
 
@@ -72,7 +72,7 @@ python3 memfreq_sweep.py --file results/s8.txt --json
 {
   "meta": {"cpu": "0", "array": "256MB", ...},
   "sweet_spot_mhz": {"stride": 800, "chase": 800},
-  "per_freq_stats": {"stride": [...], "chase": [...], "compute": [...]},
+  "per_freq_stats": {"stride": [...], "chase": [...], "random": [...]},
   "sensitivity": {"stride": [...], "chase": [...]},
   "plateau": [...],
   "sweet_spot_ci": [...],
@@ -99,7 +99,7 @@ python3 memfreq_sweep.py --compare baseline.txt experiment.txt
 workload     mean_MHz    std_MHz    min_MHz    max_MHz  range_MHz
 stride           1975       35.4       1950       2000         50
 chase            1800       28.9       1750       1850        100
-compute            —          —          —          —          —
+random             —          —          —          —          —
 ```
 
 标准差和范围用于评估甜点稳定性。单次运行（1 个文件）输出 `—` 作为标准差。

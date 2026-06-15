@@ -13,12 +13,6 @@
       {"freq_mhz": 1200, "min": 11.6, "max": 12.3, "median": 12.0, "iqr": 0.40},
       {"freq_mhz": 1600, "min": 12.2, "max": 12.6, "median": 12.4, "iqr": 0.20},
       {"freq_mhz": 2000, "min": 12.5, "max": 12.7, "median": 12.6, "iqr": 0.10}
-    ],
-    "compute": [
-      {"freq_mhz": 800,  "min": 79.0, "max": 81.0, "median": 80.0, "iqr": 1.00},
-      {"freq_mhz": 1200, "min": 118.0, "max": 122.0, "median": 120.0, "iqr": 2.00},
-      {"freq_mhz": 1600, "min": 158.0, "max": 162.0, "median": 160.0, "iqr": 2.00},
-      {"freq_mhz": 2000, "min": 198.0, "max": 202.0, "median": 200.0, "iqr": 2.00}
     ]
   },
   "sensitivity": {
@@ -32,16 +26,11 @@
       {"threshold": 0.80, "sweet_spot_mhz_or_null": 1600},
       {"threshold": 0.95, "sweet_spot_mhz_or_null": 2000},
       {"threshold": 1.00, "sweet_spot_mhz_or_null": null}
-    ],
-    "compute": [
-      {"threshold": 0.80, "sweet_spot_mhz_or_null": null},
-      {"threshold": 0.95, "sweet_spot_mhz_or_null": null}
     ]
   },
   "plateau": [
     {"workload": "stride",  "breakpoint_mhz_or_null": 2050, "slope_ratio": 18.3, "sweet_spot_mhz": 2000, "has_plateau": true},
-    {"workload": "chase",   "breakpoint_mhz_or_null": null, "slope_ratio": null,  "sweet_spot_mhz": null, "has_plateau": false},
-    {"workload": "compute", "breakpoint_mhz_or_null": null, "slope_ratio": null,  "sweet_spot_mhz": null, "has_plateau": false}
+    {"workload": "chase",   "breakpoint_mhz_or_null": null, "slope_ratio": null,  "sweet_spot_mhz": null, "has_plateau": false}
   ],
   "raw_samples": {
     "stride": [
@@ -49,10 +38,6 @@
       {"freq_mhz": 800,  "sample_idx": 2, "mops": 141.0},
       {"freq_mhz": 1200, "sample_idx": 1, "mops": 149.0},
       {"freq_mhz": 1200, "sample_idx": 2, "mops": 150.5}
-    ],
-    "compute": [
-      {"freq_mhz": 800, "sample_idx": 1, "mops": 80.0},
-      {"freq_mhz": 800, "sample_idx": 2, "mops": 80.5}
     ]
   },
   "data": [

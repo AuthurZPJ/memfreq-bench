@@ -1771,14 +1771,13 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 	double p_max = mc_results[mc_ref].compute_tput;
 
 	/* build ascending-freq arrays for find_sweet_spot() */
-	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], compute_mops[MAX_FREQS];
+	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS];
 	int    freqs_khz[MAX_FREQS];
 	int    n_valid = 0;
 	for (int fi = 0; fi < nfreqs; fi++) {
 		if (!mc_results[fi].valid) continue;
 		stride_mops[n_valid]  = mc_results[fi].stride_tput;
 		chase_mops[n_valid]   = mc_results[fi].chase_tput;
-		compute_mops[n_valid] = mc_results[fi].compute_tput;
 		freqs_khz[n_valid]    = mc_results[fi].freq_khz;
 		n_valid++;
 	}
@@ -2002,11 +2001,6 @@ static void random_stats(const struct result *r,
 { *mn = r->random_min; *mx = r->random_max;
   *md = r->random_tput; *iq = r->random_iqr; }
 
-static void compute_stats(const struct result *r,
-                          double *mn, double *mx, double *md, double *iq)
-{ *mn = r->compute_min; *mx = r->compute_max;
-  *md = r->compute_tput; *iq = r->compute_iqr; }
-
 static void print_one_per_freq_stats(const char *workload, const char *unit,
                                      const struct result *results, int nfreqs,
                                      stat_accessors get)
@@ -2032,7 +2026,6 @@ static void print_per_freq_stats(const struct result *results, int nfreqs,
 		print_one_per_freq_stats("chase", "Mops", results, nfreqs, chase_stats);
 	if (do_random)
 		print_one_per_freq_stats("random", "MOps", results, nfreqs, random_stats);
-	print_one_per_freq_stats("compute", "MOps", results, nfreqs, compute_stats);
 }
 
 /*
@@ -2044,17 +2037,17 @@ static void print_per_freq_stats(const struct result *results, int nfreqs,
  * (0..n_valid-1) to the results[] index.
  */
 static void print_sweet_spot_ci(const double *raw, int nsamples,
-                                const double *mops[4],
+                                const double *mops[3],
                                 const int *freqs_khz, int n_valid,
                                 double threshold,
-                                int headline_khz[4], int enabled[4],
+                                int headline_khz[3], int enabled[3],
                                 const int *compact_to_results)
 {
-	const char *labels[] = {"stride", "chase", "random", "compute"};
+	const char *labels[] = {"stride", "chase", "random"};
 
 	printf("#\n# --- sweet-spot CI ---\n");
 	printf("# workload  sweet_MHz  low_MHz  high_MHz  method\n");
-	for (int w = 0; w < 4; w++) {
+	for (int w = 0; w < 3; w++) {
 		if (!enabled[w]) continue;
 		int sweet = headline_khz[w];
 		if (w >= 2) {
@@ -2099,13 +2092,13 @@ static void print_sweet_spot_ci(const double *raw, int nsamples,
  */
 static void print_sensitivity(int n_user_thresholds,
                               const double *user_thresholds,
-                              const double *mops[4],
+                              const double *mops[3],
                               const int *freqs_khz, int n_valid,
-                              int enabled[4])
+                              int enabled[3])
 {
-	const char *labels[] = {"stride", "chase", "random", "compute"};
+	const char *labels[] = {"stride", "chase", "random"};
 
-	for (int w = 0; w < 4; w++) {
+	for (int w = 0; w < 3; w++) {
 		if (!enabled[w]) continue;
 		printf("#\n# --- sensitivity (%s) ---\n", labels[w]);
 		printf("# threshold  sweet_spot_MHz\n");
@@ -2126,16 +2119,16 @@ static void print_sensitivity(int n_user_thresholds,
  * Plateau block: piecewise-linear breakpoint + slope ratio per workload,
  * with power savings at the sweet spot when a sensor is available.
  */
-static void print_plateau(const double *mops[4], const int *freqs_khz,
+static void print_plateau(const double *mops[3], const int *freqs_khz,
                           int n_valid, double threshold,
                           const struct result *results, int nfreqs,
-                          int enabled[4],
+                          int enabled[3],
                           const int *compact_to_results)
 {
-	const char *labels[] = {"stride", "chase", "random", "compute"};
+	const char *labels[] = {"stride", "chase", "random"};
 
 	printf("#\n# --- plateau ---\n");
-	for (int w = 0; w < 4; w++) {
+	for (int w = 0; w < 3; w++) {
 		if (!enabled[w]) continue;
 		int bp_mhz = 0, sweet_mhz = 0;
 		double ratio = 0.0;
@@ -2190,11 +2183,11 @@ static void print_plateau(const double *mops[4], const int *freqs_khz,
  * Raw samples block: per-freq × per-sample throughput for each workload.
  */
 static void print_raw_samples(const double *raw, int nsamples, int nfreqs,
-                              const struct result *results, int enabled[4])
+                              const struct result *results, int enabled[3])
 {
-	const char *labels[] = {"stride", "chase", "random", "compute"};
+	const char *labels[] = {"stride", "chase", "random"};
 
-	for (int w = 0; w < 4; w++) {
+	for (int w = 0; w < 3; w++) {
 		if (!enabled[w]) continue;
 		printf("#\n# --- raw_samples (%s) ---\n", labels[w]);
 		printf("# freq_MHz  sample_idx  mops\n");
@@ -2790,7 +2783,7 @@ int main(int argc, char **argv)
 	/* Per-workload throughput arrays (descending-freq order in results[],
 	 * but find_sweet_spot() walks the array linearly so order doesn't matter
 	 * as long as we pass valid data). We build ascending-freq arrays. */
-	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], random_mops[MAX_FREQS], compute_mops[MAX_FREQS];
+	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], random_mops[MAX_FREQS];
 	int    freqs_khz[MAX_FREQS];
 	int    n_valid = 0;
 	for (int fi = 0; fi < nfreqs; fi++) {
@@ -2798,7 +2791,6 @@ int main(int argc, char **argv)
 		stride_mops[n_valid]  = results[fi].stride_tput;
 		chase_mops[n_valid]   = results[fi].chase_tput;
 		random_mops[n_valid]  = results[fi].random_tput;
-		compute_mops[n_valid] = results[fi].compute_tput;
 		freqs_khz[n_valid]    = results[fi].freq_khz;
 		n_valid++;
 	}
@@ -2875,12 +2867,12 @@ int main(int argc, char **argv)
 	 * statistics, and a confidence interval on the sweet spot has
 	 * to propagate resampled medians, not raw IQR. The bootstrap
 	 * does this correctly. */
-	/* workload-enabled flags: stride always, chase/random if enabled, compute always */
-	int wl_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0, 1};
+	/* workload-enabled flags: stride always, chase/random if enabled */
+	int wl_enabled[] = {1, do_chase ? 1 : 0, do_random ? 1 : 0};
 
 	if (raw && !summary) {
-		const double *ci_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
-		int headline_khz[] = {stride_sweet, chase_sweet, 0, 0};
+		const double *ci_mops[] = {stride_mops, chase_mops, random_mops};
+		int headline_khz[] = {stride_sweet, chase_sweet, 0};
 		print_sweet_spot_ci(raw, nsamples, ci_mops, freqs_khz, n_valid,
 		                    threshold, headline_khz, wl_enabled,
 		                    compact_to_results);
@@ -2889,10 +2881,9 @@ int main(int argc, char **argv)
 	/* ---- sensitivity blocks (only if --thresholds / -L was given) ----
 	 * Re-runs sweet-spot detection at each user-supplied threshold so the
 	 * user can see how sensitive the decision is to threshold choice.
-	 * Per workload: stride always; chase/random only if that workload ran.
-	 * Workloads with no plateau (compute) emit em-dash for every threshold. */
+	 * Per workload: stride always; chase/random only if that workload ran. */
 	if (n_user_thresholds > 0 && !summary) {
-		const double *sens_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
+		const double *sens_mops[] = {stride_mops, chase_mops, random_mops};
 		print_sensitivity(n_user_thresholds, user_thresholds,
 		                  sens_mops, freqs_khz, n_valid, wl_enabled);
 	}
@@ -2903,7 +2894,7 @@ int main(int argc, char **argv)
 	 * the slope ratio. slope_ratio > 2.0 ⇒ real plateau (mem-bound);
 	 * < 2.0 ⇒ throughput keeps rising with frequency (compute-bound). */
 	if (!no_plateau && !summary) {
-		const double *plat_mops[] = {stride_mops, chase_mops, random_mops, compute_mops};
+		const double *plat_mops[] = {stride_mops, chase_mops, random_mops};
 		print_plateau(plat_mops, freqs_khz, n_valid, threshold,
 		              results, nfreqs, wl_enabled, compact_to_results);
 	}

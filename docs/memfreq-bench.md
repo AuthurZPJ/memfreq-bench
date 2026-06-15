@@ -384,7 +384,6 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # stride    2000       1500     2050      bootstrap_1000
 # chase     2000       1800     2050      bootstrap_1000
 # random    1800       1700     2000      bootstrap_1000
-# compute   —          —        —         no_plateau
 ```
 
 - `sweet_MHz` = 现有 95% 甜点(标题值,基于 raw median 吞吐)
@@ -400,7 +399,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 - `low < sweet < high` 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
 - 区间宽(> 500 MHz)→ 测量噪声大,或工作负载对频率敏感;考虑增加 `-n 5` 或更长 `-t`
 - `low > sweet` 或 `high < sweet` → bootstrap 发现 headline 可能偏乐观(或偏悲观)。考虑把甜点定在 `[low, high]` 区间内
-- `— / — / —` + `no_plateau` → 该 workload 无平台(典型 compute-bound),`find_sweet_spot` 返回 0
+- `— / — / —` + `no_plateau` → 该 workload 无平台,`find_sweet_spot` 返回 0
 
 **示例输出**(`-m 512 -t 3 -n 5 -r`):
 
@@ -409,10 +408,9 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # workload  sweet_MHz  low_MHz  high_MHz  method
 # stride    1600       1500     2000      bootstrap_1000
 # chase     1200       1200     1600      bootstrap_1000
-# compute   —          —        —         no_plateau
 ```
 
-`stride` 的下界比甜点低(测量有 spread 时乐观地能降频),`chase` 在三档不同频点间分布(因为它三档都接近 max),`compute` 无甜点。
+`stride` 的下界比甜点低(测量有 spread 时乐观地能降频),`chase` 在三档不同频点间分布(因为它三档都接近 max)。
 
 **JSON 字段**:每个 workload 一行 `{"workload": "stride", "sweet_mhz": 1600, "low_mhz": 1500, "high_mhz": 2000, "method": "bootstrap_1000"}`,`null` 表示无数据(对应 em-dash)。
 
@@ -441,11 +439,10 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # --- plateau ---
 # stride   plateau_breakpoint: 2050 MHz  (slope ratio 18.3x, 95% sweet spot 2000 MHz)
 # chase    plateau_breakpoint: 2100 MHz  (slope ratio 22.1x, 95% sweet spot 2000 MHz)
-# compute  plateau_breakpoint: —  (no plateau; throughput keeps rising with frequency)
 ```
 
 - `slope ratio > 2.0` → 有明显平台期,mem-bound 信号强
-- `—`  → 无平台,吞吐随频率持续上升（典型 compute-bound）
+- `—`  → 无平台,吞吐随频率持续上升
 - 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
 - 每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时输出):
 
@@ -487,30 +484,25 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
   "per_freq_stats": {
     "stride": [{"freq_mhz": 800, "min": 140.1, "max": 142.5, "median": 141.3, "iqr": 1.2}, ...],
     "chase":  [...],
-    "random": [...],
-    "compute": [...]
+    "random": [...]
   },
   "sensitivity": {
     "stride": [{"threshold": 0.80, "sweet_spot_mhz": 1800}, {"threshold": 0.95, "sweet_spot_mhz": 2000}, ...],
-    "chase":  [...],
-    "compute": [{"threshold": 0.80, "sweet_spot_mhz": null}, ...]   ← null = 无 plateau
+    "chase":  [...]
   },
   "plateau": [
     {"workload": "stride",  "breakpoint_mhz": 2050, "slope_ratio": 18.3, "sweet_spot_mhz": 2000, "has_plateau": true},
-    {"workload": "chase",   "breakpoint_mhz": 2100, "slope_ratio": 22.1, "sweet_spot_mhz": 2000, "has_plateau": true},
-    {"workload": "compute", "breakpoint_mhz": null, "slope_ratio": 0.0,  "sweet_spot_mhz": 0,    "has_plateau": false}
+    {"workload": "chase",   "breakpoint_mhz": 2100, "slope_ratio": 22.1, "sweet_spot_mhz": 2000, "has_plateau": true}
   ],
   "raw_samples": {
     "stride":  [{"freq_mhz": 800, "sample_idx": 1, "mops": 140.5}, ...],
     "chase":   [...],
-    "random":  [...],
-    "compute": [...]
+    "random":  [...]
   },
   "sweet_spot_ci": [
     {"workload": "stride",  "sweet_mhz": 2000, "low_mhz": 1500, "high_mhz": 2050, "method": "bootstrap_1000"},
     {"workload": "chase",   "sweet_mhz": 2000, "low_mhz": 1800, "high_mhz": 2050, "method": "bootstrap_1000"},
-    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "bootstrap_1000"},
-    {"workload": "compute", "sweet_mhz": null, "low_mhz": null, "high_mhz": null, "method": "no_plateau"}
+    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "bootstrap_1000"}
   ],
   "data": [{"freq_mhz": 800, "stride_mops": 141.3, ...}, ...]
 }

@@ -593,7 +593,7 @@ def compare_runs(file_paths: list[str]) -> int:
         sweet = r.get("sweet") or r.get("sweet_spot_mhz") or {}
         normalized.append({"sweet": sweet})
 
-    workloads = ["stride", "chase", "random", "compute"]
+    workloads = ["stride", "chase", "random"]
     print("=" * 78)
     print(f"  Cross-run sweet-spot comparison ({len(normalized)} runs)")
     print("=" * 78)
