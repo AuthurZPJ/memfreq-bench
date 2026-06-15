@@ -15,12 +15,14 @@
   - [运行](#运行)
   - [参数](#参数)
   - [可视化](#可视化)
+- [快速起步](#快速起步)
 - [解读输出](#解读输出)
+  - [速查表](#速查表)
+  - [典型输出](#典型输出)
   - [数据行](#数据行)
-  - [甜点判定](#甜点判定)
-  - [统计块](#统计块)
-  - [JSON 输出](#json-输出)
-  - [关键指标速查](#关键指标速查)
+  - [头部甜点](#头部甜点)
+  - [5 个统计块](#5-个统计块按-tsv-中的出现顺序)
+  - [可视化与 JSON](#可视化与-json)
 - [多核并行模式](#多核并行模式-n)
 - [噪音分析](#噪音分析)
 - [设计原理](#设计原理)
@@ -143,8 +145,15 @@ for (size_t i = 0; i < count; i++)
 
 ```c
 double x = 1.00001;
-for (size_t i = 0; i < 1000000; i++)
-    x = x * 1.0000001 + 0.0000001;
+size_t iterations = 0;
+double t0 = now();
+
+while (now() - t0 < secs) {                  // 外层：按时间循环
+    for (size_t i = 0; i < 1000000; i++)     // 内层 1M：分块,减少 now() 调用开销
+        x = x * 1.0000001 + 0.0000001;
+    iterations++;
+}
+return (double)iterations * 1000000.0 / elapsed;   // 真实 OPS = iterations × 1M / sec
 ```
 
 **微架构分析：**
@@ -170,40 +179,29 @@ for (size_t i = 0; i < count; i += stride) {
 
 ---
 
-## 完整测试流程（以 96 核 ARM 服务器为例）
+## 快速起步
+
+5 步从零跑出第一条甜点曲线。完整命令集见下方 [使用方法](#使用方法) 节,可视化与 JSON 报告见 [memfreq-sweep.md](memfreq-sweep.md)。
 
 ```bash
-# ── 1. 拓扑侦察 ──
-lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
+# 1. 拓扑侦察（看 L3 / NUMA / 频率范围）
+lscpu | grep -E "L[123]|NUMA|Socket"
 numactl -H
-cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq
-cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
 
-# ── 2. 基本测试（L3 自动检测，数组自动 2× L3）──
+# 2. 单核基本测试（数组自动 = 2× L3）
 sudo ./memfreq_bench -c 0 -A -t 3 -n 5
 
-# ── 3. 多核带宽饱和测试（每 NUMA node 各 1 核）──
+# 3. 多核带宽饱和（每 NUMA node 1 核,触发 MC 瓶颈）
 sudo ./memfreq_bench -N 2 -A -t 3 -n 5
 
-# ── 4. 半核带宽饱和测试（48 物理核）──
-sudo ./memfreq_bench -N 48 -A -t 3 -n 5
+# 4. NUMA 远端访问（CPU 跑 Node 1,内存绑 Node 0）
+sudo numactl --membind=0 ./memfreq_bench -c 48 -A -t 3 -n 5
 
-# ── 5. NUMA 绑定测试（强制内存到 Node 0）──
-sudo ./memfreq_bench -c 0 -A -B 0 -t 3 -n 5
-
-# ── 6. 可选：random permutation 测试 ──
-sudo ./memfreq_bench -c 0 -A -R -t 3 -n 5
-
-# ── 7. 可选：cache flush 测试（强制 L3 miss）──
-sudo ./memfreq_bench -c 0 -A -f -t 3 -n 5
-
-# ── 8. 可选：不同 stride 对比 ──
-sudo ./memfreq_bench -c 0 -A -s 1     # prefetcher-friendly
-sudo ./memfreq_bench -c 0 -A -s 64    # 极端 mem-bound
-
-# ── 9. 可选：L3-resident 测试（数据驻留 L3）──
-sudo ./memfreq_bench -c 0 -A -2 -t 3 -n 5
+# 5. 可视化 + JSON 导出
+sudo python3 memfreq_sweep.py --json
 ```
+
+第 2 步的输出就是 [解读输出](#解读输出) 节的所有示例来源。想跑全 8 个 suite（约 30 h）直接用 `sudo ./run_full_sweep.sh --quick --yes`(约 3 h)。
 
 ---
 
@@ -329,27 +327,37 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 ### 可视化
 
 ```bash
-# 自动运行 + ASCII 图表
-sudo python3 memfreq_sweep.py
-
-# 传递参数给 C 程序
-sudo python3 memfreq_sweep.py -c 0 -m 512
-
-# 保存 JSON 用于后续分析
-sudo python3 memfreq_sweep.py --json
-
-# 解析已有输出
-python3 memfreq_sweep.py --file results.txt
-
-# 跨 run 对比（多次 sweep 的甜点稳定性）
-python3 memfreq_sweep.py --compare run1.json run2.json run3.json
+# 5 种最常用模式（从一行到 6 行覆盖所有用例）
+sudo python3 memfreq_sweep.py                  # 自动跑 C 程序 + ASCII 柱状图
+sudo python3 memfreq_sweep.py -c 0 -m 512      # 透传参数给 memfreq_bench
+sudo python3 memfreq_sweep.py --json            # 同时输出 memfreq_results.json
+python3 memfreq_sweep.py --file results.txt     # 解析已有输出(无需 root)
+python3 memfreq_sweep.py --compare r1.json r2.json r3.json   # 跨 run 甜点稳定性
+python3 memfreq_sweep.py --report output/run_*/  # 目录批量出 Markdown 报告
 ```
 
-`--compare` 自动检测每个文件是 JSON 还是 TSV,输出每个 workload 的 mean / std / min / max / range across runs。JSON 来自 `memfreq_sweep.py --json`(单次 sweep 后自动产生)。
+完整模式说明、JSON schema、`--compare` / `--report` 输出示例见 [docs/memfreq-sweep.md](memfreq-sweep.md)。
 
 ---
 
 ## 解读输出
+
+### 速查表
+
+按输出顺序排列——每行都回答一个独立问题：
+
+| 看什么 | 含义 | 出现位置 |
+|--------|------|----------|
+| `*_%` 低频 ≥95% | 该 workload mem-bound | 数据行 |
+| `actual_MHz ≈ target_MHz` | 频率锁定成功 | 数据行 |
+| `compute_% ≈ freq_ratio` | sanity check 独立验证 | 数据行 |
+| `iqr_MOps < 1% of median` | 测量噪声低 | `# --- per-freq stats ---` |
+| `CI width < 200 MHz` | 甜点位置鲁棒 | `# --- sweet-spot CI ---`（`-r`）|
+| `0.80 vs 0.99 sweet 差 < 100 MHz` | 阈值选择不敏感 | `# --- sensitivity ---`（`-L`）|
+| `slope ratio > 2.0` | 平台期强 = 强 mem-bound | `# --- plateau ---` |
+| `power: savings: >30%` | **直接答 DVFS 节能量** | `# --- plateau ---` 的 `power:` 行 |
+
+**反向信号**：`stride_%` / `chase_%` 随频率线性增长，说明该 workload 有 compute 成分（不是纯 mem-bound），降频需谨慎——把 `95%` 阈值降到 `99%` 验证（用 `-L 0.95,0.99` 看 sensitivity）。
 
 ### 典型输出
 
@@ -358,7 +366,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # cpu=0 ncpus=192 array=512MB stride=8 duration=3s samples=5
 # NUMA: 2 nodes allowed   L3 cache: 273 MB   Temp: 42.3°C
 #
-# target_MHz  actual_MHz  stride_Mops  stride_MBs  stride_%  chase_Mops  chase_%  compute_Mops  compute_%
+# target_MHz  actual_MHz  stride_Mops  stride_MBs  stride_%  chase_Mops  chase_%  compute_MOps  compute_%
 2600          2598        156.6        1193.2      100.0     12.8        100.0    325.8         100.0
 2575          2573        156.5        1192.4       99.9     12.8        100.0    322.1          98.9
 2550          2548        156.3        1190.9       99.8     12.8        100.0    319.0          97.9
@@ -369,14 +377,14 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 # stride  sweet spot: 2000 MHz  (77% of max 2600 MHz)
 # chase   sweet spot: 2000 MHz  (77% of max 2600 MHz)
 # compute sweet spot: — (scales linearly, always needs max freq)
-# stride_l3 sweet spot: 1800 MHz  (69% of max 2600 MHz)
+# stride_l3 sweet spot: 1800 MHz  (69% of max 2600 MHz)   ← 仅 -2 时出现
 ```
 
-注意输出包含：
-- **NUMA 节点数、L3 大小、温度**：自动检测并在 header 中显示
-- **stride_l3 sweet spot**：L3-resident sweep 的甜点（仅当使用 `-2` 时输出，数组大小 = 2× L2）
+`#` 前缀行是元信息/统计块，裸行才是 TSV 数据行。`stride_l3 sweet spot` 仅当用 `-2` 时出现。可视化（ASCII 柱状图、`--compare`、`--report`、JSON 导出）见 [memfreq-sweep.md](memfreq-sweep.md)。
 
 ### 数据行
+
+每行 = 一个频率点 × 9 列（部分场景追加 1-4 个功耗列）：
 
 | 列 | 类型 | 计算 |
 |----|------|------|
@@ -394,13 +402,11 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 **隐含的工程细节**：
 
-- **TAB 分隔**：实际是 TSV（本节用空格展示是为了可读性）
+- 实际是 TSV（用 TAB 分隔），本节用空格展示是为了可读性
 - **`actual_MHz ≠ target_MHz` 是诊断信号**：差超过 ±2% 警惕 CPPC 拒步 / turbo 漏过
-- **中位数 vs 平均值**：每个 freq 跑 `nsamples` 次取**中位数**，对单次中断异常不敏感
+- 每个 freq 跑 `nsamples` 次取**中位数**，对单次中断异常不敏感
 
 #### 功耗列（仅当检测到功耗传感器时追加）
-
-两种模式物理意义不同：
 
 | 列 | 类型 | 计算 |
 |----|------|------|
@@ -414,7 +420,7 @@ python3 memfreq_sweep.py --compare run1.json run2.json run3.json
 
 `energy_J` 覆盖整个测试窗口——所有 workload（stride / chase / random / compute）共用一行。传感器未检测到时这 1-4 列不输出。
 
-#### compute_% 作为 sanity check
+#### compute_% 作为频率锁定 sanity check
 
 compute 测试的 `%` 值应该近似等于频率比：
 
@@ -426,20 +432,35 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 如果 compute_% = 30% → 该频率点 set_freq 可能失败了
 ```
 
-### 甜点判定
+### 头部甜点
 
-程序自动计算：**最低频率 ≥ 最大吞吐的 95%** = 甜点。
+程序自动计算：**最低频率 ≥ 最大吞吐的 95%** = 甜点。TSV 数据行结束后的 4 行（或 `-2` 时的 4 行）就是它：
+
+```
+# stride  sweet spot: 2000 MHz  (77% of max 2600 MHz)
+# chase   sweet spot: 2000 MHz  (77% of max 2600 MHz)
+# compute sweet spot: — (scales linearly, always needs max freq)
+# stride_l3 sweet spot: 1800 MHz  (69% of max 2600 MHz)   ← 仅 -2
+```
 
 ```
 甜点在 27% 频率 → 功耗节省 = (1 - 0.27) × (V_low/V_high)² ≈ 50-70%
-甜点在 80% 频率 → 功耗节省有限，工作负载对频率敏感
+甜点在 80% 频率 → 功耗节省有限,工作负载对频率敏感
 ```
 
 95% 阈值可通过 `-T FRAC` 调整（默认 0.95）。想看甜点对阈值的敏感度,加 `-L 0.8,0.9,0.95,0.99` 触发 `# --- sensitivity ---` 块。
 
-### 统计块
+### 5 个统计块（按 TSV 中的出现顺序）
 
-数据行之后,会按顺序追加 5 个 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。
+数据行之后,会按顺序追加 5 个 `#` 前缀的块（默认开启,不影响原 TSV 数据行,旧 parser 不受影响）。解读要点速查：
+
+| 块 | 出现条件 | 关键字段 | 鲁棒判据 |
+|----|---------|---------|---------|
+| `per-freq stats` | 默认 | `iqr_MOps` | IQR < 1% of median |
+| `sweet-spot CI` | `-r` | `low_MHz` ~ `high_MHz` | 区间宽 < 200 MHz |
+| `sensitivity` | `-L` | `0.80` vs `0.99` 甜点差 | 差 < 100 MHz = 决策不敏感 |
+| `plateau` | 默认 | `slope ratio` | > 2.0 = 强 mem-bound |
+| `raw_samples` | `-r` | 行数 = `n_freqs × nsamples` | 给下游自定义分析 |
 
 > **注意：** `-f` 启用的 `bench_stride_flush` 工作负载（强制 L3 miss）**不会**出现在统计块里——它的数据只出现在原始数据行。
 
@@ -453,12 +474,11 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 # 800       140.1     142.5     141.3        1.2
 ```
 
-- IQR 全程 < 1% → 机器安静,数据可信
-- 低频点 IQR 突然变大 → 该频点测量置信度低,谨慎使用
+低频点 IQR 突然变大 → 该频点测量置信度低,谨慎使用。
 
 #### 2. `# --- sweet-spot CI ---`（仅 `-r` 时出现）
 
-每次 sweep 的甜点是单点估计;这个块给出"如果我重跑这个实验,甜点会落在哪"的区间。
+每次 sweep 的甜点是单点估计；这个块给出"如果我重跑这个实验,甜点会落在哪"的区间。
 
 ```
 # --- sweet-spot CI ---
@@ -468,21 +488,11 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 # random    1800       1700     2000      bootstrap_1000
 ```
 
-- `sweet_MHz` = 现有 95% 甜点(标题值)
-- `low_MHz` / `high_MHz` = bootstrap 2.5/97.5 百分位(B = 1000)
-- `method` = `bootstrap_1000`（确定性 LCG 种子 `state=42`,结果可复现）
-
-**Bootstrap 法**：`B = 1000` 次重采样,每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数,重跑 `find_sweet_spot()`。取 1000 个甜点值的 2.5 和 97.5 百分位。
-
-**解读:**
-- `low == sweet == high` → 数据噪声极小,单点估计很可靠
-- 区间窄(< 200 MHz)→ 决策鲁棒,可放心使用
-- 区间宽(> 500 MHz)→ 测量噪声大;考虑增加 `-n 5` 或更长 `-t`
-- `— / — / —` + `no_plateau` → 该 workload 无平台
+`method = bootstrap_1000`：B=1000 次重采样，每次对每个 freq 抽取 `nsamples` 个样本(放回)取中位数，重跑 `find_sweet_spot()`，取 1000 个甜点值的 2.5/97.5 百分位。LCG 种子 `state=42`，结果可复现。`low == sweet == high` 说明噪声极小；`— / — / — + no_plateau` 说明该 workload 无平台。
 
 #### 3. `# --- sensitivity (workload) ---`（仅 `-L` 时出现）
 
-不同阈值下的甜点。判断决策鲁棒性：
+不同阈值下的甜点：
 
 ```
 # --- sensitivity (stride) ---
@@ -492,8 +502,7 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 # 0.99       2400
 ```
 
-- 0.80 和 0.99 给的甜点差 < 100 MHz → 决策鲁棒
-- 差 > 500 MHz → 工作负载对阈值敏感,挑高的阈值更安全
+差 > 500 MHz → 工作负载对阈值敏感,挑高的阈值更安全。
 
 #### 4. `# --- plateau ---`
 
@@ -505,10 +514,9 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 # chase    plateau_breakpoint: 2100 MHz  (slope ratio 22.1x, 95% sweet spot 2000 MHz)
 ```
 
-- `slope ratio > 2.0` → 有明显平台期,mem-bound 信号强
-- `—`  → 无平台,吞吐随频率持续上升
-- 95% sweet spot 同时给出作为对照;两个独立方法一致 = 强证据
-- 每个 workload 行下面会再跟一行 `power:`(仅当检测到 plateau 且有功耗传感器时):
+`—` 表示无平台，吞吐随频率持续上升。95% sweet spot 同时给出作为对照；两个独立方法一致 = 强证据。
+
+每个 workload 行下面会再跟一行 `power:`（仅当检测到 plateau 且有功耗传感器时）：
 
 ```
 # stride   power: 45W at sweet spot (savings: 36% vs 71W at 2600 MHz)
@@ -518,7 +526,7 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 
 #### 5. `# --- raw_samples (workload) ---`（仅 `-r` 时出现）
 
-每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）。
+每个 freq × sample 的原始吞吐。用于自定义分析（bootstrap CI、分布检验）：
 
 ```
 # --- raw_samples (stride) ---
@@ -527,61 +535,9 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 # 800       2           141.2
 ```
 
-行数 = `n_freqs × nsamples`。
+### 可视化与 JSON
 
-### JSON 输出
-
-`memfreq_sweep.py --json` 导出的 JSON 包含上面 5 个块的全部数据:
-
-```json
-{
-  "meta": {...},
-  "sweet_spot_mhz": {"stride": 2000, "chase": 2000},
-  "per_freq_stats": {
-    "stride": [{"freq_mhz": 800, "min": 140.1, "max": 142.5, "median": 141.3, "iqr": 1.2}, ...],
-    "chase":  [...],
-    "random": [...]
-  },
-  "sensitivity": {
-    "stride": [{"threshold": 0.80, "sweet_spot_mhz": 1800}, {"threshold": 0.95, "sweet_spot_mhz": 2000}, ...],
-    "chase":  [...]
-  },
-  "plateau": [
-    {"workload": "stride",  "breakpoint_mhz": 2050, "slope_ratio": 18.3, "sweet_spot_mhz": 2000, "has_plateau": true},
-    {"workload": "chase",   "breakpoint_mhz": 2100, "slope_ratio": 22.1, "sweet_spot_mhz": 2000, "has_plateau": true}
-  ],
-  "raw_samples": {
-    "stride":  [{"freq_mhz": 800, "sample_idx": 1, "mops": 140.5}, ...],
-    "chase":   [...],
-    "random":  [...]
-  },
-  "sweet_spot_ci": [
-    {"workload": "stride",  "sweet_mhz": 2000, "low_mhz": 1500, "high_mhz": 2050, "method": "bootstrap_1000"},
-    {"workload": "chase",   "sweet_mhz": 2000, "low_mhz": 1800, "high_mhz": 2050, "method": "bootstrap_1000"},
-    {"workload": "random",  "sweet_mhz": 1800, "low_mhz": 1700, "high_mhz": 2000, "method": "bootstrap_1000"}
-  ],
-  "data": [{"freq_mhz": 800, "stride_mops": 141.3, ...}, ...]
-}
-```
-
-`null` / `0` 表示无数据(对应 TSV 里的 `—`)。`compare_runs()` 只看 `sweet_spot_mhz`,新加的字段是给下游自定义分析用的。
-
-### 关键指标速查
-
-按输出顺序排列——每行都回答一个独立问题：
-
-| 看什么 | 含义 | 出现位置 |
-|--------|------|----------|
-| `*_%` 低频 ≥95% | 该 workload mem-bound | 数据行 |
-| `actual_MHz ≈ target_MHz` | 频率锁定成功 | 数据行 |
-| `compute_% ≈ freq_ratio` | sanity check 独立验证 | 数据行 |
-| `iqr_MOps < 1% of median` | 测量噪声低 | `# --- per-freq stats ---` |
-| `CI width < 200 MHz` | 甜点位置鲁棒 | `# --- sweet-spot CI ---`（`-r`）|
-| `0.80 vs 0.99 sweet 差 < 100 MHz` | 阈值选择不敏感 | `# --- sensitivity ---`（`-L`）|
-| `slope ratio > 2.0` | 平台期强 = 强 mem-bound | `# --- plateau ---` |
-| `power: savings: >30%` | **直接答 DVFS 节能量** | `# --- plateau ---` 的 `power:` 行 |
-
-**反向信号**：`stride_%` / `chase_%` 随频率线性增长，说明该 workload 有 compute 成分（不是纯 mem-bound），降频需谨慎——把 `95%` 阈值降到 `99%` 验证（用 `-L 0.95,0.99` 看 sensitivity）。
+ASCII 柱状图、`--compare` 跨 run 对比、`--report` 目录报告，以及 `memfreq_sweep.py --json` 的 schema 完整说明见 [docs/memfreq-sweep.md](memfreq-sweep.md)。本节只覆盖 `memfreq_bench` 的原始 TSV 输出。
 
 ---
 
