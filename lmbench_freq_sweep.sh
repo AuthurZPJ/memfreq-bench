@@ -191,6 +191,21 @@ for tool in bw_mem lat_mem_rd; do
     fi
 done
 
+# Pin the benchmark process to the CPU we control the frequency for.
+# Without this, on systems with per-cluster or per-CPU freq domains
+# (e.g., ARM big.LITTLE), the OS scheduler may run bw_mem on a
+# different CPU whose frequency we did NOT set, making the measurement
+# invalid. On unified-domain systems this is a no-op for correctness
+# but still cleaner. taskset is in util-linux (universal on Linux).
+if command -v taskset &>/dev/null; then
+    TASKSET_PREFIX=(taskset -c "$CPU")
+    log_info "Will pin benchmark to CPU $CPU via taskset"
+else
+    TASKSET_PREFIX=()
+    log_warn "taskset not found — benchmark may run on a different CPU than the one we control"
+    log_warn "On per-cluster / per-CPU freq domains (big.LITTLE), this gives wrong results"
+fi
+
 CPUFREQ="/sys/devices/system/cpu/cpu${CPU}/cpufreq"
 if [[ ! -d "$CPUFREQ" ]]; then
     log_error "cpufreq not available at $CPUFREQ"; exit 1
@@ -317,25 +332,25 @@ for freq in $FREQ_LIST; do
 
     # ---- bw_mem: read bandwidth ----
     # Output: rows of "<size_MB> <MB/s>". We want the row where size = ARRAY_MB.
-    BW_VAL=$(bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
+    BW_VAL=$("${TASKSET_PREFIX[@]}" bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
              awk -v target="$ARRAY_MB" '
                  $1 ~ /^[0-9]/ && $1+0 == target+0 { print $2; exit }
              ')
     if [[ -z "$BW_VAL" ]]; then
         log_warn "bw_mem: no row for ${ARRAY_MB} MB, capturing last numeric row"
-        BW_VAL=$(bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
+        BW_VAL=$("${TASKSET_PREFIX[@]}" bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
                  awk '$1 ~ /^[0-9]/ {bw=$2} END{print bw+0}')
     fi
 
     # ---- lat_mem_rd: random-access read latency ----
     # Output: rows of "<size_MB> <ns>". Same extraction.
-    LAT_VAL=$(lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
+    LAT_VAL=$("${TASKSET_PREFIX[@]}" lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
               awk -v target="$ARRAY_MB" '
                   $1 ~ /^[0-9]/ && $1+0 == target+0 { print $2; exit }
               ')
     if [[ -z "$LAT_VAL" ]]; then
         log_warn "lat_mem_rd: no row for ${ARRAY_MB} MB, capturing last numeric row"
-        LAT_VAL=$(lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
+        LAT_VAL=$("${TASKSET_PREFIX[@]}" lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
                   awk '$1 ~ /^[0-9]/ {lat=$2} END{print lat+0}')
     fi
 
