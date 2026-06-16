@@ -86,10 +86,13 @@ numbers drift with edits — use the banners, not line refs, to find things):
      access (forces L3 miss). Enabled by `-f`.
    - `bench_random` — pre-built Fisher-Yates shuffled index; measures
      random-access bandwidth (parallel outstanding loads, no serial dep).
-   - `bench_chase` — pointer-chasing a Fisher-Yates-shuffled singly-linked
-     list of 64-byte `pnode`s. The serial dep chain `p = p->next` is the
-     design — this is pure DRAM latency, not bandwidth. This is the
-     "purest" memory-bound test.
+   - `bench_chase` — pointer-chasing a singly-linked list of 64-byte
+     `pnode`s. The serial dep chain `p = p->next` is the design — this
+     is pure DRAM latency, not bandwidth. This is the "purest"
+     memory-bound test. **Anti-prefetch** (default): two-level
+     construction — page-order Fisher-Yates shuffle + intra-page
+     cache-line bit-reversal permutation (lmbench technique). `--simple-chase`
+     reverts to single-layer flat Fisher-Yates.
    - `bench_compute` — `x = x * A + B` chain, zero memory access.
      **Sanity check**: `compute_%` should track the freq ratio; if it
      doesn't, the frequency lock didn't take (turbo leaked through, or
@@ -132,6 +135,7 @@ numbers drift with edits — use the banners, not line refs, to find things):
 | `-2` | L3-resident sweep: also measure sweet spot with 2× L2 array (data fits in L3). Reports `stride_l3 sweet spot`. |
 | `-B N` | Bind array to NUMA node N. Use with `numactl` to create local/remote latency splits. |
 | `-R -f` | Add random-permutation and clflush workloads. |
+| `--simple-chase` | Use flat Fisher-Yates for chase chain (weaker anti-prefetch). Default: two-level (page-shuffle + bit-reversal). |
 | `-F` | Skip the idle gate. |
 | `-T FRAC` | Sweet-spot threshold (default 0.95). Must be in (0, 1]. |
 | `-L LIST` | Multi-threshold sweep, comma-separated (e.g. `0.8,0.9,0.95,0.99`). Emits the per-workload `# --- sensitivity ---` block. |

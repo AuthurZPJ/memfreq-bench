@@ -787,32 +787,164 @@ struct pnode {
 _Static_assert(sizeof(struct pnode) == CL,
 	       "pnode must be exactly one cache line");
 
-static struct pnode *build_chase(size_t nnodes)
+/*
+ * Bit-reversal permutation: returns array where result[i] = bitrev(i) * scale.
+ * Maximises the distance between consecutive indices, which defeats sequential
+ * and strided hardware prefetchers within a page (lmbench technique).
+ * n must be a power of two.
+ */
+static size_t *bitrev_permute(size_t n, size_t scale)
+{
+	size_t nbits = 0;
+	for (size_t tmp = n >> 1; tmp; tmp >>= 1)
+		nbits++;
+
+	size_t *r = malloc(n * sizeof(*r));
+	if (!r)
+		return NULL;
+	for (size_t i = 0; i < n; i++) {
+		size_t v = 0;
+		for (size_t b = 0; b < nbits; b++)
+			if (i & ((size_t)1 << b))
+				v |= (size_t)1 << (nbits - 1 - b);
+		r[i] = v * scale;
+	}
+	return r;
+}
+
+/*
+ * Build a circular pointer-chase linked list over nnodes cache-line-sized nodes.
+ *
+ * simple=0 (default): Two-level anti-prefetch construction inspired by lmbench:
+ *   Level 1 — page order:   Fisher-Yates shuffle of physical page visit order
+ *   Level 2 — line order:   bit-reversal permutation of cache lines within a page
+ * This defeats stride prefetchers (random page jumps), stream/adjacent-line
+ * prefetchers (maximally-spaced intra-page visits), and virtual-address
+ * prefetchers (randomised virtual page number transitions).
+ *
+ * simple=1: Single-layer Fisher-Yates index shuffle (original implementation).
+ */
+static struct pnode *build_chase(size_t nnodes, int simple)
 {
 	struct pnode *nodes;
 
-	/* Returns NULL on failure (caller checks). The posix_memalign return
-	 * value is the only failure indicator; on success nodes is set, on
-	 * failure it is left unchanged but we return NULL without touching it. */
 	if (posix_memalign((void **)&nodes, CL, nnodes * sizeof(*nodes)))
 		return NULL;
 
-	/* Fisher-Yates index shuffle */
-	size_t *idx = malloc(nnodes * sizeof(*idx));
-	if (!idx) { free(nodes); return NULL; }
-	for (size_t i = 0; i < nnodes; i++)
-		idx[i] = i;
-	for (size_t i = nnodes - 1; i > 0; i--) {
-		size_t j = (size_t)rand() % (i + 1);
-		size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+	if (simple) {
+		/* Original: flat Fisher-Yates shuffle on all node indices */
+		size_t *idx = malloc(nnodes * sizeof(*idx));
+		if (!idx) { free(nodes); return NULL; }
+		for (size_t i = 0; i < nnodes; i++)
+			idx[i] = i;
+		for (size_t i = nnodes - 1; i > 0; i--) {
+			size_t j = (size_t)rand() % (i + 1);
+			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+		}
+		for (size_t i = 0; i < nnodes - 1; i++)
+			nodes[idx[i]].next = &nodes[idx[i + 1]];
+		nodes[idx[nnodes - 1]].next = &nodes[idx[0]];
+		free(idx);
+		return nodes;
 	}
 
-	/* Build circular linked list in shuffled order */
+	/* ---- two-level anti-prefetch ---- */
+	long pgsz = sysconf(_SC_PAGESIZE);
+	if (pgsz <= 0)
+		pgsz = 4096;
+	size_t lines_per_page = (size_t)pgsz / CL;
+	if (lines_per_page < 2)
+		lines_per_page = 2;
+
+	size_t npages = nnodes / lines_per_page;
+	size_t remainder = nnodes - npages * lines_per_page;
+
+	if (npages < 2) {
+		/* Array smaller than two pages — fall back to flat shuffle */
+		size_t *idx = malloc(nnodes * sizeof(*idx));
+		if (!idx) { free(nodes); return NULL; }
+		for (size_t i = 0; i < nnodes; i++)
+			idx[i] = i;
+		for (size_t i = nnodes - 1; i > 0; i--) {
+			size_t j = (size_t)rand() % (i + 1);
+			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+		}
+		for (size_t i = 0; i < nnodes - 1; i++)
+			nodes[idx[i]].next = &nodes[idx[i + 1]];
+		nodes[idx[nnodes - 1]].next = &nodes[idx[0]];
+		free(idx);
+		return nodes;
+	}
+
+	/* Level 1: Fisher-Yates shuffle of page visit order */
+	size_t *pages = malloc(npages * sizeof(*pages));
+	if (!pages) { free(nodes); return NULL; }
+	for (size_t i = 0; i < npages; i++)
+		pages[i] = i;
+	for (size_t i = npages - 1; i > 0; i--) {
+		size_t j = (size_t)rand() % (i + 1);
+		size_t t = pages[i]; pages[i] = pages[j]; pages[j] = t;
+	}
+
+	/* Level 2: bit-reversal permutation of cache lines within a page.
+	 * bitrev requires n to be a power of two (documented contract).
+	 * Standard page sizes (4K/16K/64K) / 64B always give a power of two,
+	 * but fall back to flat shuffle for safety on exotic page sizes. */
+	if ((lines_per_page & (lines_per_page - 1)) != 0) {
+		free(pages);
+		size_t *idx = malloc(nnodes * sizeof(*idx));
+		if (!idx) { free(nodes); return NULL; }
+		for (size_t i = 0; i < nnodes; i++)
+			idx[i] = i;
+		for (size_t i = nnodes - 1; i > 0; i--) {
+			size_t j = (size_t)rand() % (i + 1);
+			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+		}
+		for (size_t i = 0; i < nnodes - 1; i++)
+			nodes[idx[i]].next = &nodes[idx[i + 1]];
+		nodes[idx[nnodes - 1]].next = &nodes[idx[0]];
+		free(idx);
+		return nodes;
+	}
+
+	size_t *lines = bitrev_permute(lines_per_page, 1);
+	if (!lines) { free(pages); free(nodes); return NULL; }
+
+	/* Build a traversal-order index array: pages[i] × lines[j] + remainder */
+	size_t *idx = malloc(nnodes * sizeof(*idx));
+	if (!idx) { free(lines); free(pages); free(nodes); return NULL; }
+
+	size_t pos = 0;
+	for (size_t i = 0; i < npages; i++)
+		for (size_t j = 0; j < lines_per_page; j++)
+			idx[pos++] = pages[i] * lines_per_page + lines[j];
+
+	/* Append remainder nodes (partial trailing page) in random order */
+	if (remainder > 0) {
+		size_t *rbuf = malloc(remainder * sizeof(*rbuf));
+		if (rbuf) {
+			size_t base = npages * lines_per_page;
+			for (size_t i = 0; i < remainder; i++)
+				rbuf[i] = base + i;
+			for (size_t i = remainder - 1; i > 0; i--) {
+				size_t j = (size_t)rand() % (i + 1);
+				size_t t = rbuf[i]; rbuf[i] = rbuf[j]; rbuf[j] = t;
+			}
+			for (size_t i = 0; i < remainder; i++)
+				idx[pos++] = rbuf[i];
+			free(rbuf);
+		}
+	}
+	/* pos == nnodes */
+
+	/* Link circular chain in traversal order */
 	for (size_t i = 0; i < nnodes - 1; i++)
 		nodes[idx[i]].next = &nodes[idx[i + 1]];
 	nodes[idx[nnodes - 1]].next = &nodes[idx[0]];
 
 	free(idx);
+	free(lines);
+	free(pages);
 	return nodes;
 }
 
@@ -1559,8 +1691,8 @@ static void print_data_rows(const struct result *results, int nfreqs,
  *   - Aggregation: median across cores per frequency point
  */
 static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
-			 int nsamples, int do_chase, int step_khz,
-			 int force_run, double threshold)
+			 int nsamples, int do_chase, int simple_chase,
+			 int step_khz, int force_run, double threshold)
 {
 	/* ---- detect topology ---- */
 	struct numa_node nodes[MAX_NODES];
@@ -1693,7 +1825,7 @@ static int run_multicore(int ncpu, int size_mb, int stride, int test_secs,
 				if (do_chase) {
 					seed_rand((unsigned int)my_cpu);
 					nn = array_bytes / CL;
-					chase_nodes = build_chase(nn);
+					chase_nodes = build_chase(nn, simple_chase);
 				}
 
 				/* verify actual frequency */
@@ -2329,6 +2461,8 @@ static void usage(const char *prog)
 "  -n N        Samples per point (median) (default: 3)\n"
 "  -S STEP_KHZ Frequency step in kHz      (default: 25000, CPPC range mode only)\n"
 "  -C          Skip pointer chase test\n"
+"  --simple-chase Use flat Fisher-Yates chain (weaker anti-prefetch)\n"
+"              Default: two-level (page-shuffle + bit-reversal) chain\n"
 "  -R          Add random permutation test (Fisher-Yates, defeats prefetcher)\n"
 "  -f          Flush cache line after each access (clflush/dc cvac)\n"
 "  -F          Force run even if system is busy (skip idle check)\n"
@@ -2358,6 +2492,7 @@ int main(int argc, char **argv)
 	int   test_secs = 2;
 	int   nsamples  = 3;
 	int   do_chase  = 1;
+	int   simple_chase = 0;  /* --simple-chase: flat Fisher-Yates (no bit-rev) */
 	int   do_random = 0;  /* -R: random permutation test */
 	int   do_flush  = 0;  /* -f: flush cache line after each access */
 	int   do_l3_resident = 0;  /* -2: also run sweep with 2× L2 array */
@@ -2377,6 +2512,18 @@ int main(int argc, char **argv)
 		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			usage(argv[0]);
 			return 0;
+		}
+	}
+
+	/* ---- strip long options before getopt ---- */
+	for (int i = 1; i < argc; ) {
+		if (strcmp(argv[i], "--simple-chase") == 0) {
+			simple_chase = 1;
+			for (int k = i; k < argc; k++)
+				argv[k] = argv[k + 1];
+			argc--;
+		} else {
+			i++;
 		}
 	}
 
@@ -2506,8 +2653,8 @@ int main(int argc, char **argv)
 	/* ---- multi-core mode ---- */
 	if (ncpu > 1) {
 		return run_multicore(ncpu, size_mb, stride, test_secs,
-				     nsamples, do_chase, step_khz, force_run,
-				     threshold);
+				     nsamples, do_chase, simple_chase,
+				     step_khz, force_run, threshold);
 	}
 
 	/* ---- validate ---- */
@@ -2557,7 +2704,7 @@ int main(int argc, char **argv)
 	if (do_chase) {
 		seed_rand(0);
 		nnodes = array_bytes / CL;
-		chase_nodes = build_chase(nnodes);
+		chase_nodes = build_chase(nnodes, simple_chase);
 		if (!chase_nodes) {
 			dprintf("WARN: chase alloc failed, skipping\n");
 			do_chase = 0;
@@ -2620,7 +2767,10 @@ int main(int argc, char **argv)
 		dprintf("NUMA bind : node %d\n", numa_node);
 	dprintf("Stride    : %d (= %d B, %s)\n", stride, stride * 8,
 		stride >= 8 ? "1 cache line / access" : "prefetcher-friendly");
-	dprintf("Chase     : %s\n", do_chase ? "enabled" : "disabled");
+	dprintf("Chase     : %s\n", do_chase
+		? (simple_chase ? "enabled (simple Fisher-Yates)"
+				: "enabled (page-shuffle + bit-reversal)")
+		: "disabled");
 	dprintf("Duration  : %d s × %d samples (median)\n",
 		test_secs, nsamples);
 	dprintf("Power     : %s\n", npower_paths > 0 ?
