@@ -3,13 +3,13 @@
 # (bandwidth reaching 95% of peak) is steeper than typical real systems where
 # mem-bound workloads plateau much earlier (memfreq_bench stride typically hits
 # 95% of peak at ~30% of max freq). Use lmbench_freq_sweep.sh for real data.
-target_MHz	actual_MHz	bw_mem_MBps	lat_mem_rd_ns
-800	798	2840.5	104.2
-1000	998	3620.1	102.8
-1200	1198	4280.6	101.5
-1500	1498	4950.2	100.8
-1800	1798	5410.9	100.3
-2100	2098	5680.4	100.1
-2400	2398	5820.7	100.0
-2700	2698	5910.3	99.8
-3000	2998	5950.1	99.7
+target_MHz	actual_MHz	bw_mem_MBps	lat_mem_rd_ns	size_used_MB
+800	798	2840.5	104.2	1024
+1000	998	3620.1	102.8	1024
+1200	1198	4280.6	101.5	1024
+1500	1498	4950.2	100.8	1024
+1800	1798	5410.9	100.3	1024
+2100	2098	5680.4	100.1	1024
+2400	2398	5820.7	100.0	1024
+2700	2698	5910.3	99.8	1024
+3000	2998	5950.1	99.7	1024

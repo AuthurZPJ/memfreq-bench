@@ -459,11 +459,20 @@ def parse_lmbench_output(text: str) -> dict:
             lat    = float(parts[3])
         except ValueError:
             continue
+        # 5th column (size_used_MB) is optional — only present in newer
+        # lmbench_freq_sweep.sh output. Tolerate its absence.
+        size_used = None
+        if len(parts) >= 5:
+            try:
+                size_used = float(parts[4])
+            except ValueError:
+                pass
         rows.append({
             "target_mhz": target,
             "actual_mhz": actual,
             "bw_mem_mbps": bw,
             "lat_mem_rd_ns": lat,
+            "size_used_mb": size_used,
         })
 
     if not rows:

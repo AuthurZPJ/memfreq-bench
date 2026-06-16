@@ -315,8 +315,8 @@ elif [[ -f $CPUFREQ/boost ]]; then
 fi
 
 # Write headers
-echo -e "target_MHz\tactual_MHz\tbw_mem_MBps\tlat_mem_rd_ns" > $BW_OUT
-echo -e "target_MHz\tactual_MHz\tlat_mem_rd_ns"               > $LAT_OUT
+echo -e "target_MHz\tactual_MHz\tbw_mem_MBps\tlat_mem_rd_ns\tsize_used_MB" > $BW_OUT
+echo -e "target_MHz\tactual_MHz\tlat_mem_rd_ns\tsize_used_MB"               > $LAT_OUT
 
 # ============================================================================
 # Main sweep
@@ -332,32 +332,51 @@ for freq in $FREQ_LIST; do
 
     # ---- bw_mem: read bandwidth ----
     # Output: rows of "<size_MB> <MB/s>". We want the row where size = ARRAY_MB.
-    BW_VAL=$("${TASKSET_PREFIX[@]}" bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
-             awk -v target="$ARRAY_MB" '
-                 $1 ~ /^[0-9]/ && $1+0 == target+0 { print $2; exit }
-             ')
+    # Two-tier extraction: exact match for ARRAY_MB, fallback to largest <= target.
+    # lmbench's default size list varies by version — 1024m may not always
+    # appear even when we asked for it. Capture the actual size used too.
+    BW_LINE=$("${TASKSET_PREFIX[@]}" bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
+              awk -v target="$ARRAY_MB" '
+                  $1 ~ /^[0-9]/ {
+                      v = $1 + 0
+                      if (v == target+0 && !exact) { exact = 1; print $1, $2; exit }
+                      if (v <= target+0 && v > best)  { best = v; best_sz = $1; best_bw = $2 }
+                  }
+                  END { if (!exact && best_bw != "") print best_sz, best_bw }
+              ')
+    BW_SIZE=$(echo "$BW_LINE" | awk '{print $1}')
+    BW_VAL=$(echo "$BW_LINE"  | awk '{print $2}')
+    if [[ -n "$BW_VAL" && "$BW_SIZE" != "$ARRAY_MB" ]]; then
+        log_warn "bw_mem: requested ${ARRAY_MB} MB, lmbench only had ${BW_SIZE} MB; using that"
+    fi
     if [[ -z "$BW_VAL" ]]; then
-        log_warn "bw_mem: no row for ${ARRAY_MB} MB, capturing last numeric row"
-        BW_VAL=$("${TASKSET_PREFIX[@]}" bw_mem -W $WARMUP -N $REPS ${ARRAY_MB}m rd 2>/dev/null | \
-                 awk '$1 ~ /^[0-9]/ {bw=$2} END{print bw+0}')
+        log_warn "bw_mem: no usable row in output (ARRAY_MB=${ARRAY_MB})"
     fi
 
     # ---- lat_mem_rd: random-access read latency ----
     # Output: rows of "<size_MB> <ns>". Same extraction.
-    LAT_VAL=$("${TASKSET_PREFIX[@]}" lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
-              awk -v target="$ARRAY_MB" '
-                  $1 ~ /^[0-9]/ && $1+0 == target+0 { print $2; exit }
-              ')
+    LAT_LINE=$("${TASKSET_PREFIX[@]}" lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
+               awk -v target="$ARRAY_MB" '
+                   $1 ~ /^[0-9]/ {
+                       v = $1 + 0
+                       if (v == target+0 && !exact) { exact = 1; print $1, $2; exit }
+                       if (v <= target+0 && v > best)  { best = v; best_sz = $1; best_lat = $2 }
+                   }
+                   END { if (!exact && best_lat != "") print best_sz, best_lat }
+               ')
+    LAT_SIZE=$(echo "$LAT_LINE" | awk '{print $1}')
+    LAT_VAL=$(echo "$LAT_LINE"  | awk '{print $2}')
+    if [[ -n "$LAT_VAL" && "$LAT_SIZE" != "$ARRAY_MB" ]]; then
+        log_warn "lat_mem_rd: requested ${ARRAY_MB} MB, lmbench only had ${LAT_SIZE} MB; using that"
+    fi
     if [[ -z "$LAT_VAL" ]]; then
-        log_warn "lat_mem_rd: no row for ${ARRAY_MB} MB, capturing last numeric row"
-        LAT_VAL=$("${TASKSET_PREFIX[@]}" lat_mem_rd -N $REPS ${ARRAY_MB}m 2>/dev/null | \
-                  awk '$1 ~ /^[0-9]/ {lat=$2} END{print lat+0}')
+        log_warn "lat_mem_rd: no usable row in output (ARRAY_MB=${ARRAY_MB})"
     fi
 
-    echo -e "$freq\t$actual_mhz\t${BW_VAL:-?}\t${LAT_VAL:-?}" >> $BW_OUT
-    echo -e "$freq\t$actual_mhz\t${LAT_VAL:-?}"                  >> $LAT_OUT
+    echo -e "$freq\t$actual_mhz\t${BW_VAL:-?}\t${LAT_VAL:-?}\t${BW_SIZE:-${LAT_SIZE:-?}}" >> $BW_OUT
+    echo -e "$freq\t$actual_mhz\t${LAT_VAL:-?}\t${LAT_SIZE:-?}"                              >> $LAT_OUT
 
-    log_ok "  bw_mem=${BW_VAL:-?} MB/s,  lat_mem_rd=${LAT_VAL:-?} ns"
+    log_ok "  bw_mem=${BW_VAL:-?} MB/s (${BW_SIZE:-?}MB),  lat_mem_rd=${LAT_VAL:-?} ns (${LAT_SIZE:-?}MB)"
 done
 
 # ============================================================================
