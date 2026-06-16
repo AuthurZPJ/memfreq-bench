@@ -9,9 +9,15 @@
 #
 # Workflow:
 #   1. (one-time) Build lmbench3 and copy bw_mem / lat_mem_rd to PATH:
+#        # Source build:
 #        git clone https://github.com/intel/lmbench.git /tmp/lmbench
 #        cd /tmp/lmbench/src && make
 #        sudo cp bw_mem lat_mem_rd /usr/local/bin/
+#        # Debian/Ubuntu package (auto-detected at /opt/lmbench/bin):
+#        sudo apt install lmbench
+#        # Or symlink if installed elsewhere:
+#        sudo ln -s /opt/lmbench/bin/bw_mem /usr/local/bin/bw_mem
+#        sudo ln -s /opt/lmbench/bin/lat_mem_rd /usr/local/bin/lat_mem_rd
 #   2. Run memfreq_bench baseline (for later comparison):
 #        sudo ./run_full_sweep.sh --quick --yes --force
 #   3. Run this script (parallel, independent measurement):
@@ -103,13 +109,29 @@ if [[ $EUID -ne 0 ]]; then
     log_error "Must run as root (sudo)"; exit 1
 fi
 
+# Auto-detect lmbench in common system install path /opt/lmbench/bin
+# (Debian/Ubuntu package, or source build installed to /opt). The user
+# reported `which lmbench` -> /opt/lmbench/bin/lmbench, so the binaries
+# are likely next to it. Add to PATH only if not already in PATH.
+if ! command -v bw_mem &>/dev/null && [[ -x /opt/lmbench/bin/bw_mem ]] \
+   && ! command -v lat_mem_rd &>/dev/null && [[ -x /opt/lmbench/bin/lat_mem_rd ]]; then
+    export PATH="/opt/lmbench/bin:$PATH"
+    log_info "Auto-detected lmbench at /opt/lmbench/bin, added to PATH"
+fi
+
 for tool in bw_mem lat_mem_rd; do
     if ! command -v "$tool" &>/dev/null; then
         log_error "$tool not found in PATH."
-        log_error "Build lmbench and install:"
+        log_error "Build lmbench and install (one of):"
+        log_error "  # Source build:"
         log_error "  git clone https://github.com/intel/lmbench.git /tmp/lmbench"
         log_error "  cd /tmp/lmbench/src && make"
         log_error "  sudo cp bw_mem lat_mem_rd /usr/local/bin/"
+        log_error "  # Debian/Ubuntu package (installs to /opt/lmbench/bin):"
+        log_error "  sudo apt install lmbench"
+        log_error "  # Or symlink:"
+        log_error "  sudo ln -s /opt/lmbench/bin/bw_mem /usr/local/bin/bw_mem"
+        log_error "  sudo ln -s /opt/lmbench/bin/lat_mem_rd /usr/local/bin/lat_mem_rd"
         exit 1
     fi
 done
