@@ -32,7 +32,7 @@
 ├─────┼──────────────┼────────────┼────────────┼──────────────────┤
 │  1  │ L1 dTLB       │  64 条目   │   1 cycle  │  → L2 dTLB       │
 │  2  │ L2 dTLB       │ 1024 条目  │  10 cycles │  → page walk     │
-│  3  │ Page walk     │ (无容量)   │ 60-200 cyc │  → 安装到 L1 dTLB│
+│  3  │ Page walk     │ (过程)     │ 60-200 cyc │  → 翻译结果装入 L1 dTLB │
 │  4  │ L1 dcache     │  64 KB     │   4 cycles │  → L2 cache      │
 │  5  │ L2 cache      │   1 MB     │  12 cycles │  → L3 cache      │
 │  6  │ L3 cache      │  22 MB     │  30 cycles │  → DRAM          │
@@ -42,6 +42,11 @@
 (数字基于 ARM Neoverse N1 风格的 96 核 server,
  L1/L2/L3 数据是用户的 `lscpu` 输出,
  DRAM 延迟是实测反推 —— 第 6 章会讲怎么算)
+
+**注意**:Page walk 不是一个 cache 层级,而是一个**过程**——MMU 硬件
+遍历 4 级页表(PGD/PUD/PMD/PTE)的过程。每级访问可能命中 L1/L2/L3/DRAM
+的不同位置,所以延迟范围 60-200 cycles 是"典型 L3 hit 情况"到
+"全部 DRAM miss 情况"的连续谱。第 4 章会展开。
 ```
 
 **两个独立的 cache 链**:
@@ -52,6 +57,12 @@
 | **数据链**(#4→#5→#6→#7) | 真正的数据 | 每次 deref 都要查,miss → 数据从 DRAM 拉 |
 
 **这两条链是 sequential 的(先 TLB 再 data),不是 parallel 的**。第 4 章会解释为什么。
+
+> **前向引用**:上面 "sequential" 是一阶模型,假设 TLB 链和数链
+> 串行执行完才到下一个 deref。**真实硬件里 OoO 引擎可以
+> 把部分 CPU 工作和 DRAM 等待重叠**——第 6 章会用实测数据
+> 展示 OoO 重叠把"sequential 模型高估的 per-deref 时间"具体
+> 压掉多少 cycles。读到这里先记下 sequential 是简化,别把它当精确模型。
 
 ---
 
@@ -85,28 +96,32 @@ for (size_t i = 0; i < nnodes; i++)
 ```
 时间 →
 
-       step 1        step 2        step 3         step 4         step 5
-       ─────        ─────        ─────          ─────         ─────
-L1dTLB │── 1c ──────►│ miss        │              │              │
-       │             │             │              │              │
-L2dTLB │             │── 10c ─────►│ miss         │              │
-       │             │             │              │              │
-PageWLK│             │             │── 60-200c ──►│ install TLB  │
-       │             │             │              │              │
-L1dcache│            │             │              │── 4c (miss)──►│
-       │             │             │              │              │
-L2     │             │             │              │          (12c miss)
-       │             │             │              │              │
-L3     │             │             │              │          (30c miss)
-       │             │             │              │              │
-DRAM   │             │             │              │          ◄── 40 ns (读)
+       step 1        step 2        step 3        step 4        step 5a/5b/5c
+       ─────        ─────        ─────        ─────        ─────────────
+L1dTLB │── 1c ──────►│ miss        │              │             │
+       │             │             │              │             │
+L2dTLB │             │── 10c ─────►│ miss         │             │
+       │             │             │              │             │
+PageWLK│             │             │── 60-200c ──►│ install TLB │
+       │             │             │              │             │
+L1dcache│            │             │              │── 4c miss──►│
+       │             │             │              │             │── 12c miss
+       │             │             │              │             │       (L2)
+       │             │             │              │             │             ── 30c miss
+       │             │             │              │             │                   (L3)
+       │             │             │              │             │                          ── 40 ns 读
+       │             │             │              │             │
+       step 1: L1 dTLB 查        │             │              step 5a: L1 dcache miss
+                                 step 2: L2 dTLB 查      step 5b: L2 miss → L3
+                                 step 3: page walk 走      step 5c: L3 miss → DRAM
 ```
 
 **关键点**:
 - step 1-3 是 **TLB 链**(串行)
-- step 4-5 是 **数据链**(串行)
+- step 4 + 5a/5b/5c 是 **数据链**(串行,**4 级逐级穿透**)
 - TLB 链必须在数据链**之前**完成(没有物理地址,发不出 L1 access)
 - 整个 deref 的 wall time = TLB 时间 + 数据时间(sequential,不是 max)
+- 一次 deref 总共 **5 + 3 = 8 个 sequential step**
 
 具体到 chase:
 - 几乎不可能 L1/L2 dcache hit(`p` 每次在不同的 cache line,L1 装不下 8 M 个 line)
@@ -116,6 +131,8 @@ DRAM   │             │             │              │          ◄── 4
 ---
 
 ## 第 4 章:critical path 怎么算
+
+> **本章定位**:本章建立 chase per-deref 时间的一阶模型——**TLB 链和数链完全 sequential**。**这个模型高估了 per-deref 时间**,因为它没考虑 OoO 引擎把 TLB walk 的部分时间跟下一条 deref 的 CPU 工作重叠。**第 6 章会用实测数据反推 K 值,展示 OoO 重叠具体把"sequential 模型高估的 cycles"压掉多少**。读到这里先记下这是简化。
 
 chase 的 per-deref wall time = **TLB 链时间 + 数据链时间**(因为 TLB 必须先完成才能发数据访问)。
 
@@ -184,34 +201,46 @@ f_crossover = K / B (单位要对齐:cycles / ns × 1000 = MHz)
 套进模型:
 
 ```
-54 = K / 1700 × 1000 + B   →  K/1700 + B = 54
-40 = K / 2300 × 1000 + B   →  K/2300 + B = 40
-
-两式相减: K/1700 - K/2300 = 14
-         K × (1/1700 - 1/2300) = 14
-         K × 0.0002205 = 14
-         K ≈ 63 active cycles
-
-代回:  B = 40 - 63/2300 × 1000 = 40 - 27.4 = 12.6
+T(1700) = K/(1700×10^6) × 10^9 + B = 1000·K/1700 + B = 54
+T(2300) = K/(2300×10^6) × 10^9 + B = 1000·K/2300 + B = 40
 ```
 
-但 B 也应该满足 54 = 63/1700 × 1000 + B → B = 17
-
-B 不一致,说明**模型不完美**。真实情况是 K 和 B 都随 freq 略有变化(TLB page walk 内部也有 L1/L2/L3 命中,不是常数)。
-
-但作为一阶近似,**用 K ≈ 90 cycles / B ≈ 0 ns** 能很好地拟合数据:
+两式相减(单位要小心):
 
 ```
-K=90: 90/1700 × 1000 = 52.9,  90/2300 × 1000 = 39.1
-实测: 54                40
-误差: 2%                2%
+54 - 40 = 1000·K × (1/1700 - 1/2300)
+14     = 1000·K × (2300 - 1700)/(1700 × 2300)
+14     = 1000·K × 600/3,910,000
+14     = 1000·K × 0.0001535
+14     = 0.1535·K
+K      = 14 / 0.1535 ≈ 91.2 cycles
 ```
 
-所以**chase 的 per-deref 时间几乎完全是 CPU 工作(约 90 cycles)**,DRAM 延迟(40 ns)在这套数据里没出现 —— 因为它被 OoO 引擎跟下一条 deref 的 CPU 工作重叠了。
+代回 (2): B = 40 - 91.2/2.3 = 40 - 39.7 ≈ **0.3 ns ≈ 0**
 
-> **注意**:这跟第 4 章的"TLB + 数据 sequential"模型矛盾。
-> 原因:OoO 引擎有"投机执行 + 多 in-flight load"的能力,让 TLB walk 和下一次 deref 的 CPU 工作重叠。
-> 在 chase 这种"MLP=1 严格串行"的工作里,OoO 也只能隐藏**部分** DRAM 延迟 —— 但足够让 B ≈ 0。
+> **常见单位换算错误**(从 0.000154 错成 0.000221):如果忘了 ×1000
+> 那一步,直接把 ns 跟 MHz 相比,会得到
+> `14 = K × (1/1700 - 1/2300) = K × 0.0002205`,K = 63,然后代回
+> 得到 B = 17(且 B 不一致)。**这是典型的"算式看上去合理
+> 但单位错位"陷阱,任何用"per-deref time"做拟合时都该多看一眼单位**。
+
+**结论**:**K ≈ 91 cycles, B ≈ 0 ns**。
+
+```
+验证: K=91: 91/1700×1000 = 53.5,  91/2300×1000 = 39.6
+实测:        54                40
+误差:        1%                1%
+```
+
+物理解读:**chase 的 per-deref 时间几乎完全是 CPU 工作(约 91 cycles),DRAM 延迟(40 ns)在这套数据里没出现**——因为它被 OoO 引擎跟下一条 deref 的 CPU 工作重叠了。
+
+> **跟第 4 章的 sequential 模型对照**:
+> sequential 模型预测 K = page_walk(~60-200) + data_chain_levels(4+12+30) = **~106-242 cycles**
+> 实测 K = **91 cycles**
+> 
+> **91 < 106-242,差值 15-150 cycles 是 OoO 引擎隐藏掉的**。
+> 也就是说,sequential 模型高估了 per-deref 时间 15-150 cycles,
+> OoO 引擎通过"page walk 期间不空等,而是继续推进其他工作"消化掉了这部分。
 > 这是 chase 在 ARM Neoverse 上的具体行为,**不同微架构会得到不同的 K 和 B**。
 
 ---
@@ -270,9 +299,20 @@ total    = max(0.4, 40) = 40 ns (DRAM-bound)
 | L2 dTLB | 10 (hit 0% 触发 page walk) | 0 |
 | Page walk | 60-200 | 0 |
 | L1 dcache | 4 | 4 |
-| L2 + L3 | 12 + 30 | 12 + 30(OoO 重叠) |
+| L2 + L3 | (被 OoO 重叠,不计入 K) | (被 OoO 重叠,不计入 K) |
 | Loop | 3 | 3 |
-| **总 (active cycles)** | **~90** | **~5** |
+| **K (active cycles,critical path 上)** | **~90** | **~5** |
+
+> **为什么 L2 + L3 的 cycles 不计入 K**:L2 miss (12 cycles) 和 L3 miss (30 cycles) 是在 OoO 引擎**等 DRAM 数据回来**的"间隙"里发生的(等数据时 CPU 继续推进其他工作),所以它们的 wall time 跟 40 ns DRAM 等待**重叠**。**它们的 cycle 数被 OoO 隐藏了**,不贡献到 critical path。**K 只算 OoO 没法隐藏的 active 工作**:TLB 查(必须 sequential)、L1 dcache miss(必须 sequential,因为 L1 access 必须等物理地址)、loop overhead。
+>
+> 这解释了为什么 K=5 比表格里"1+4+12+30+3 = 50"小一个数量级——**50 是所有 cycle 的算术和,K 是 critical path 上 OoO 重叠后剩下的 cycle**。
+
+**新 crossover**:
+```
+f_crossover = 5 / 40 × 1000 = 125 MHz
+```
+
+用户 freq 范围 1700-2300 MHz **全部在 crossover 之上** → **整个范围 DRAM-bound** → sweet spot 跌到 1700 MHz(最低)。
 
 **新 crossover**:
 ```
@@ -285,11 +325,20 @@ f_crossover = 5 / 40 × 1000 = 125 MHz
 
 ## 第 9 章:对比"huge page 前 vs 后"的预测
 
+**用 K=5, B=40 重新算(不是 25)**:
+
+```
+1700 MHz: T = 5/1.7 + 40 = 2.94 + 40 = 42.94 ns → 23.3 Mops
+2300 MHz: T = 5/2.3 + 40 = 2.17 + 40 = 42.17 ns → 23.7 Mops
+```
+
+两个频率 throughput 几乎一样(~24 Mops),sweet spot 应该在最低频。
+
 | 指标 | 4 KB page(实测) | 2 MB huge page(预测) |
 |---|---|---|
-| 1700 MHz throughput | 18.4 Mops | ~25 Mops |
-| 2300 MHz throughput | 24.9 Mops | ~25 Mops |
-| 95% sweet spot | 2200 MHz | 1700 MHz |
+| 1700 MHz throughput | 18.4 Mops | **~23.3 Mops** |
+| 2300 MHz throughput | 24.9 Mops | **~23.7 Mops** |
+| 95% sweet spot | 2200 MHz | 1700 MHz(最低) |
 | Plateau 检测 | "无平台" | "有平台" |
 | 每次 deref 在哪一级成为瓶颈 | TLB(page walk) | DRAM |
 
@@ -297,38 +346,78 @@ f_crossover = 5 / 40 × 1000 = 125 MHz
 - 之前:TLB 链是 max 的那项,所以 chase 测的是"TLB 性能"(误打误撞)
 - 之后:DRAM 是 max 的那项,所以 chase 真的在测它名字承诺的"DRAM 延迟"
 
+注意 huge page 后的 throughput (~23.3-23.7) **比 4 KB page 在 2300 MHz 时的 24.9 略低**。原因:4 KB page 测量到的 24.9 Mops = "40 ns / max(CPU, DRAM)",但因为有 TLB page walk 在跑,**OoO 引擎把 page walk 时间跟 DRAM 等待重叠了**,实际 wall time 不是 40 ns 而是 ~30 ns(24.9 Mops)。huge page 后 TLB 不再 hide 这种 overlap,看到的就是"干净的 40 ns DRAM 等待",所以反而**略慢**。这进一步证实了"TLB 在 chase 里是个意外的 throughput 优化器"。
+
 ---
 
 ## 第 10 章:open questions(下次 review 时填)
 
-下面是这次推演中**我不确定 / 需要实测验证**的点:
+下面是这次推演中**我不确定 / 需要实测验证**的点,**按优先级排序**:
 
-1. **K=90 cycles 的拆分**:
-   - 真 page walk 多少 cycles(60? 80? 100?)
-   - L1/L2/L3 cache miss 多少 cycles(被 OoO 重叠后净增多少?)
-   - Pipeline stall(分支预测失败、串行依赖等)多少 cycles?
-   - **验证方法**:`perf stat -e instructions,cycles,dTLB-loads,dTLB-load-misses,LLC-load-misses,stalled-cycles-frontend,stalled-cycles-backend ./memfreq_bench -c 0 -A -t 1 -n 1`
+### 优先级 1(必做):`-H` flag 实现状态 + huge page 后实测
 
-2. **TLB page walk 内部各级的命中分布**:
-   - PGD 是不是总在 L1?
-   - PTE 是不是真在 L3(30 cycles),还是有时落 DRAM(40 ns + stall)
-   - **验证方法**:`perf stat -e dtlb_load_misses.walk_active,dtlb_load_misses.walk_pending ./memfreq_bench ...`
+**(a) `-H` flag 状态**:
+- memfreq_bench.c 目前**不支持** `-H` flag(只在我之前的 chat 讨论里提议过,没改代码)
+- 没有 `-H` flag,Q3(预测验证)做不了,本文的"huge page 预测"部分就只是纸面推演
+- **第一步**:在 memfreq_bench.c 加 `-H` flag,mmap(MAP_HUGETLB) 路径,madvise(MADV_HUGEPAGE) fallback
+- 详见 `docs/memfreq-bench.md` 现有 flag 列表
 
-3. **huge page 后的实测**:
-   - per-deref 时间真的降到 ~5 cycles 吗?还是更低?
-   - 95% sweet spot 真的到 1700 吗?
-   - Plateau 检测会报"有平台"吗?
-   - **验证方法**:跑 `-H` flag 后的 chase,看 sweet spot
+**(b) huge page 后实测**:
+- per-deref 时间真的降到 ~5 cycles 吗?还是更低?
+- 95% sweet spot 真的到 1700 吗?
+- Plateau 检测会报"有平台"吗?
+- **验证方法**:跑 `-H` flag 后的 chase,跟 4 KB page 的 chase 对比
 
-4. **其他 workload 受 TLB 影响的程度**:
-   - random workload 的 TLB miss 率(也用 huge page 测)
-   - stride workload 的 TLB miss 率(应该低,因为有 spatial locality)
-   - **验证方法**:同上的 perf stat,加 `-R` 看 random
+### 优先级 2(必做):K=91 的拆分
 
-5. **不同微架构下的 K 和 B**:
-   - Apple M1(小 L2,大 L3):K 多少?B 多少?
-   - 笔记本 LPDDR5:K 和 B 又多少?
-   - 验证这些需要换机器跑
+K=91 里到底 page walk 占多少、L1/L2/L3 cache miss 占多少、pipeline stall 占多少?
+
+```
+perf stat -e instructions,cycles,dTLB-loads,dTLB-load-misses,\
+    LLC-load-misses,stalled-cycles-frontend,stalled-cycles-backend \
+    ./memfreq_bench -c 0 -A -t 1 -n 1
+```
+
+预期:
+- `dTLB-load-misses / cycles` ≈ 91% (TLB miss per cycle ≈ 1)
+- `stalled-cycles-frontend + backend` 占 cycles 的 ~80%(大部分 stall 在等 TLB)
+- 如果 `dTLB-load-misses × ~80 cycles ≈ K - 其他`,确认 TLB 是主因
+
+### 优先级 3(细化):TLB page walk 内部命中分布
+
+```
+perf stat -e dtlb_load_misses.walk_active,dtlb_load_misses.walk_pending \
+    ./memfreq_bench ...
+```
+
+(Intel 有这两个事件,ARM Neoverse 可能需要 impdef PMU events)
+
+回答:PGD 是不是总在 L1?PTE 是不是真在 L3(30 cycles)还是有时落 DRAM?
+
+### 优先级 4(探索):其他 workload 的 TLB 影响
+
+- random workload 的 TLB miss 率(应该高,跟 chase 类似)
+- stride workload 的 TLB miss 率(应该低,有 spatial locality,L2 streamer 预热 TLB)
+
+不是 chase 的 sweet spot 分析必需,但帮理解**其他 4 个 workload 在 4 KB page 上的 fidelity 损失**。
+
+### 优先级 5(换机器):不同微架构下的 K 和 B
+
+- Apple M1(小 L2,大 L3):K 多少?B 多少?
+- 笔记本 LPDDR5:K 和 B 又多少?
+- 验证这些需要换机器跑
+
+---
+
+**v2 修订记录**:
+- (1a) page walk 标注为"过程"不是"cache",加注释说明 60-200 cycles 是典型范围
+- (1b) 第 1 章"sequential"声明处加前向引用,提示第 6 章会精化
+- (2) 第 3 章 step 5 拆 5a/5b/5c,数据链逐级穿透清晰可见
+- (3) 第 4 章加定位句,显式说"是一阶模型,会被第 6 章精化"
+- (4) 第 6 章修 K=63 算错的单位换算陷阱(K 实际是 91),改"模型不完美"为"OoO 重叠隐藏 15-150 cycles"
+- (5) 第 8 章明确说"为什么 L2/L3 cycles 不计入 K"——它们被 OoO 引擎跟 DRAM 等待重叠了
+- (6) 第 9 章预测表改 25→23.3/23.7 Mops,并解释"huge page 后略慢于 4 KB page 在 2300 MHz 的 24.9 Mops,这是 TLB 意外优化器的副作用"
+- (7) 第 10 章按用户给的优先级重排,加 (a) `-H` flag 状态 (b) K=91 拆分两个高优先级项
 
 ---
 
