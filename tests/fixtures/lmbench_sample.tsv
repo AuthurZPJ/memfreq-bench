@@ -1,3 +1,8 @@
+# Synthetic lmbench fixture for testing --format lmbench parsing/visualization.
+# Numbers are illustrative, not real measurements. The "knee" at 1800-2100 MHz
+# (bandwidth reaching 95% of peak) is steeper than typical real systems where
+# mem-bound workloads plateau much earlier (memfreq_bench stride typically hits
+# 95% of peak at ~30% of max freq). Use lmbench_freq_sweep.sh for real data.
 target_MHz	actual_MHz	bw_mem_MBps	lat_mem_rd_ns
 800	798	2840.5	104.2
 1000	998	3620.1	102.8
