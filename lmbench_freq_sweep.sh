@@ -30,7 +30,13 @@
 #   sudo ./lmbench_freq_sweep.sh [OPTIONS]
 #
 # Options:
-#   --freqs "F F F"   Frequencies in MHz (default: 800 1000 1200 1500 1800 2100 2400 2700 3000)
+#   --freqs "F F F"   Frequencies in MHz (default: auto-detected from cpufreq,
+#                      matches memfreq_bench's read_freqs: tries
+#                      scaling_available_frequencies, falls back to
+#                      cpuinfo_min/max with --step-khz step)
+#   --step-khz N      Step size in kHz for range mode (default: 25000 = 25 MHz;
+#                      matches memfreq_bench -S default). Only used when
+#                      scaling_available_frequencies is absent.
 #   --array-mb N      Working set size in MB (default: 1024, must exceed L3)
 #   --warmup N        bw_mem warmup iterations (default: 2)
 #   --reps N          bw_mem / lat_mem_rd measurement reps (default: 5)
@@ -54,8 +60,9 @@ set -uo pipefail
 # Defaults
 # ============================================================================
 
-FREQ_LIST_DEFAULT="800 1000 1200 1500 1800 2100 2400 2700 3000"
+FREQ_LIST_DEFAULT=""
 FREQ_LIST="$FREQ_LIST_DEFAULT"
+STEP_KHZ=25000     # range-mode step (matches memfreq_bench -S default)
 ARRAY_MB=1024
 WARMUP=2
 REPS=5
@@ -72,6 +79,53 @@ fi
 
 log_info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+
+# Detect the frequency list that memfreq_bench would use, in MHz.
+# Mirrors memfreq_bench's read_freqs() logic (memfreq_bench.c):
+#   1. Read /sys/.../scaling_available_frequencies (discrete list) — most
+#      systems have this; the values are in kHz.
+#   2. Fall back to cpuinfo_min/max with a stepped range (matches memfreq_bench
+#      -S STEP_KHZ, default 25000 = 25 MHz). Used when the driver is in
+#      CPPC range mode and only exposes min/max.
+# ACPI CPPC abstract-performance translation is not implemented here —
+# in practice, scaling_available_frequencies is present on >95% of
+# production systems, and cpuinfo_min/max covers the rest.
+# Returns space-separated MHz list, or empty string on failure.
+detect_freqs() {
+    local cpu_path="/sys/devices/system/cpu/cpu${CPU}/cpufreq"
+    local avail_file="${cpu_path}/scaling_available_frequencies"
+    local out=""
+
+    # 1. Discrete list (most common)
+    if [[ -r "$avail_file" ]]; then
+        while IFS= read -r line; do
+            local khz=$(echo "$line" | tr -d '[:space:]')
+            [[ -z "$khz" ]] && continue
+            out="$out $((khz / 1000))"
+        done < "$avail_file"
+        if [[ -n "$out" ]]; then
+            echo "$out"
+            return 0
+        fi
+    fi
+
+    # 2. Range mode with step
+    local min_khz max_khz
+    min_khz=$(cat "${cpu_path}/cpuinfo_min_freq" 2>/dev/null || echo 0)
+    max_khz=$(cat "${cpu_path}/cpuinfo_max_freq" 2>/dev/null || echo 0)
+    if [[ $min_khz -gt 0 && $max_khz -gt $min_khz ]]; then
+        local step_khz=${STEP_KHZ:-25000}
+        local khz=$min_khz
+        while [[ $khz -le $max_khz ]]; do
+            out="$out $((khz / 1000))"
+            khz=$((khz + step_khz))
+        done
+        echo "$out"
+        return 0
+    fi
+
+    return 1
+}
 log_error() { echo -e "${RED}[ERR]${NC} $*" >&2; }
 log_ok()    { echo -e "${GREEN}[ OK]${NC} $*"; }
 
@@ -90,6 +144,7 @@ show_help() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         --freqs)    FREQ_LIST="$2"; shift 2 ;;
+        --step-khz) STEP_KHZ="$2"; shift 2 ;;
         --array-mb) ARRAY_MB="$2"; shift 2 ;;
         --warmup)   WARMUP="$2"; shift 2 ;;
         --reps)     REPS="$2"; shift 2 ;;
@@ -145,6 +200,20 @@ HW_MAX_KHZ=$(cat $CPUFREQ/cpuinfo_max_freq)
 HW_MIN_KHZ=$(cat $CPUFREQ/cpuinfo_min_freq)
 HW_MAX_MHZ=$((HW_MAX_KHZ / 1000))
 HW_MIN_MHZ=$((HW_MIN_KHZ / 1000))
+
+# Auto-detect frequency list (mirrors memfreq_bench read_freqs). Only
+# invoked when the user didn't pass --freqs explicitly.
+if [[ -z "$FREQ_LIST" ]]; then
+    DETECTED=$(detect_freqs)
+    if [[ -n "$DETECTED" ]]; then
+        FREQ_LIST="$DETECTED"
+        log_info "Auto-detected frequencies from /sys/cpufreq (matches memfreq_bench)"
+    else
+        log_error "Could not auto-detect frequency list."
+        log_error "Pass --freqs '800 1500 3000' explicitly to override."
+        exit 1
+    fi
+fi
 
 # Clamp FREQ_LIST to hardware range
 CLAMPED=""
