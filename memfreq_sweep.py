@@ -426,6 +426,74 @@ def parse_output(text: str) -> dict:
     }
 
 
+def parse_lmbench_output(text: str) -> dict:
+    """Parse lmbench_freq_sweep.sh output TSV (cross-validation format).
+
+    Format (from lmbench_freq_sweep.sh):
+        target_MHz<TAB>actual_MHz<TAB>bw_mem_MBps<TAB>lat_mem_rd_ns
+    First non-empty line is the header. Lines starting with '#' are skipped.
+
+    Returns dict shaped like parse_output() so the existing JSON pipeline
+    can consume it with a "format": "lmbench" marker. Sweet-spot detection
+    differs from memfreq_bench because the lmbench metrics have different
+    monotonicity:
+      - bw_mem: higher is better → 95% of peak (matches stride logic)
+      - lat_mem_rd: lower is better → within 5% of min (matches chase logic)
+    """
+    meta = {"format": "lmbench"}
+    rows = []
+
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("target_MHz"):  # header row
+            continue
+        parts = s.split("\t")
+        if len(parts) < 4:
+            continue
+        try:
+            target = int(parts[0])
+            actual = int(parts[1])
+            bw     = float(parts[2])
+            lat    = float(parts[3])
+        except ValueError:
+            continue
+        rows.append({
+            "target_mhz": target,
+            "actual_mhz": actual,
+            "bw_mem_mbps": bw,
+            "lat_mem_rd_ns": lat,
+        })
+
+    if not rows:
+        return {"meta": meta, "rows": [], "sweet": {}}
+
+    rows.sort(key=lambda r: r["target_mhz"])
+
+    bw_max  = max(r["bw_mem_mbps"]  for r in rows)
+    lat_min = min(r["lat_mem_rd_ns"] for r in rows)
+    for r in rows:
+        r["bw_mem_pct"] = 100.0 * r["bw_mem_mbps"]  / bw_max
+        # latency: lower is better → percent = min/lat (so smaller lat → higher %)
+        r["lat_pct"]    = 100.0 * lat_min / r["lat_mem_rd_ns"]
+
+    sweet: dict = {}
+    # bw_mem sweet spot: lowest freq meeting 95% peak (mirrors memfreq_bench stride)
+    for r in rows:
+        if r["bw_mem_pct"] >= 95.0:
+            sweet["bw_mem"] = r["target_mhz"]
+            break
+    # lat_mem_rd sweet spot: lowest freq whose latency is within 5% of min
+    # (mirrors memfreq_bench chase: latency is DRAM-bound, plateau wide)
+    for r in rows:
+        if r["lat_mem_rd_ns"] <= 1.05 * lat_min:
+            sweet["lat_mem_rd"] = r["target_mhz"]
+            break
+
+    return {"meta": meta, "rows": rows, "sweet": sweet}
+
+
 def bar(pct: float, width: int = BAR_W) -> str:
     filled = int(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
@@ -567,6 +635,76 @@ def visualize(data: dict):
         print("  → slope_ratio > 2.0 ⇒ real plateau (memory-bound signal).")
         print("  → savings = power saved by running at sweet spot vs. max freq.")
         print()
+
+
+def visualize_lmbench(data: dict):
+    """ASCII visualization for lmbench cross-validation results.
+
+    Two bar charts:
+      - bw_mem MB/s vs freq (bandwidth, parallels memfreq_bench's stride)
+      - lat_mem_rd ns vs freq (latency, parallels memfreq_bench's chase)
+    Plus a side-by-side sweet-spot summary that the user can compare
+    against the corresponding memfreq_bench numbers.
+    """
+    rows = data["rows"]
+    sweet = data["sweet"]
+
+    print("=" * 78)
+    print("  lmbench Cross-Validation — Frequency Sweep")
+    print("=" * 78)
+    print(f"  Source format: {data['meta'].get('format', '?')}")
+    print(f"  Rows: {len(rows)}")
+    if rows:
+        fmin, fmax = rows[0]["target_mhz"], rows[-1]["target_mhz"]
+        print(f"  Freq range:   {fmin} – {fmax} MHz")
+    print()
+
+    # --- bw_mem chart ---
+    print("── bw_mem (memory bandwidth, ~stride) ───────────────────────────")
+    print(f"{'MHz':>6}  {'MB/s':>10}  {'%':>5}  {'throughput':<{BAR_W}}")
+    for r in rows:
+        marker = " ◄ sweet spot" if (
+            "bw_mem" in sweet and r["target_mhz"] == sweet["bw_mem"]) else ""
+        print(f"{r['target_mhz']:>6}  {r['bw_mem_mbps']:>10.1f}  "
+              f"{r['bw_mem_pct']:>5.1f}  {bar(r['bw_mem_pct'])}{marker}")
+    print()
+
+    # --- lat_mem_rd chart ---
+    print("── lat_mem_rd (memory read latency, ~chase) ───────────────────────")
+    print(f"{'MHz':>6}  {'ns':>8}  {'%':>5}  {'inverse-throughput':<{BAR_W}}")
+    for r in rows:
+        marker = " ◄ sweet spot" if (
+            "lat_mem_rd" in sweet and r["target_mhz"] == sweet["lat_mem_rd"]) else ""
+        # Bar shrinks as latency increases (since lat_pct is "min/lat" in %)
+        print(f"{r['target_mhz']:>6}  {r['lat_mem_rd_ns']:>8.1f}  "
+              f"{r['lat_pct']:>5.1f}  {bar(r['lat_pct'])}{marker}")
+    print()
+
+    # --- Summary ---
+    max_mhz = rows[-1]["target_mhz"] if rows else 0
+    print("=" * 78)
+    print("  SWEET SPOT SUMMARY  (lowest freq meeting threshold)")
+    print("=" * 78)
+    if "bw_mem" in sweet:
+        ratio = sweet["bw_mem"] / max_mhz * 100 if max_mhz else 0
+        print(f"  bw_mem    : {sweet['bw_mem']:>5} MHz  "
+              f"({ratio:.0f}% of {max_mhz} MHz, 95% peak)")
+    else:
+        print(f"  bw_mem    :   {EMDASH}  (no row met 95% peak)")
+    if "lat_mem_rd" in sweet:
+        ratio = sweet["lat_mem_rd"] / max_mhz * 100 if max_mhz else 0
+        print(f"  lat_mem_rd: {sweet['lat_mem_rd']:>5} MHz  "
+              f"({ratio:.0f}% of {max_mhz} MHz, latency within 5%)")
+    else:
+        print(f"  lat_mem_rd:   {EMDASH}  (no row within 5% of min)")
+    print()
+    print("  → Cross-validate against memfreq_bench:")
+    print("    stride sweet spot  ≈  bw_mem sweet spot   (bandwidth-bound)")
+    print("    chase  sweet spot  ≈  lat_mem_rd sweet spot (latency-bound)")
+    print("    If they agree within ±5%, two independent tools confirm the")
+    print("    sweet-spot signal.  Larger gap = measurement-method difference")
+    print("    (parallelism, prefetch, TLB) rather than a bug.")
+    print()
 
 
 def compare_runs(file_paths: list[str]) -> int:
@@ -753,6 +891,10 @@ def main():
         description="Run memfreq_bench and visualize sweet spot")
     parser.add_argument("--file",
                         help="Parse existing output file instead of running")
+    parser.add_argument("--format", choices=["memfreq_bench", "lmbench"],
+                        default="memfreq_bench",
+                        help="Input format: 'memfreq_bench' (default, C binary) "
+                             "or 'lmbench' (lmbench_freq_sweep.sh output)")
     parser.add_argument("--json", "-j", action="store_true",
                         help="Also save results as JSON")
     parser.add_argument("--report", metavar="DIR",
@@ -768,6 +910,32 @@ def main():
     if args.compare:
         return compare_runs(args.compare)
 
+    # --format lmbench: lmbench cross-validation path
+    if args.format == "lmbench":
+        if not args.file:
+            print("ERROR: --format lmbench requires --file", file=sys.stderr)
+            sys.exit(1)
+        with open(args.file) as fh:
+            text = fh.read()
+        data = parse_lmbench_output(text)
+        if not data["rows"]:
+            print("ERROR: no data rows parsed (expected target_MHz header + TSV rows)",
+                  file=sys.stderr)
+            sys.exit(1)
+        visualize_lmbench(data)
+        if args.json:
+            out = {
+                "meta": data["meta"],
+                "sweet_spot_mhz": data["sweet"],
+                "data": data["rows"],
+            }
+            jpath = "lmbench_results.json"
+            with open(jpath, "w") as f:
+                json.dump(out, f, indent=2)
+            print(f"  JSON saved to {jpath}")
+        return 0
+
+    # Default: memfreq_bench path (run C binary or parse its TSV)
     if args.file:
         with open(args.file) as fh:
             text = fh.read()
