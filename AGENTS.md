@@ -1,6 +1,8 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+Instruction file for AI agent sessions in this repository. `CLAUDE.md` is an
+older, stale copy of this file — treat `AGENTS.md` as canonical and do not
+trust `CLAUDE.md` when they disagree.
 
 ## What this project is
 
@@ -18,38 +20,75 @@ make                              # → memfreq_bench binary
 # Build + run the C unit tests for the stats helpers (no root needed):
 make test_stats && ./test_stats
 
+# Standalone chase-chain integrity test (NOT in the Makefile — build by hand).
+# Verifies build_chase chain closure + bitrev permutation; no cpufreq needed:
+cc -O2 -Wall -o test_chase_chain tests/test_chase_chain.c && ./test_chase_chain
+
 # Requires root for cpufreq sysfs writes
 sudo ./memfreq_bench -m 512       # array must exceed L3 cache
 
-# One-click wrappers
-sudo ./run_all_tests.sh           # 7 predefined suites, ~2.5-5 hr default / ~20-45 min --quick
-sudo ./run_full_sweep.sh          # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/2/3/5/7/8)
+# One-click wrappers (all accept --yes to skip the confirmation prompt)
+sudo ./run_all_tests.sh                 # 7 predefined suites, ~2.5-5 hr default / ~20-45 min --quick
+sudo ./run_all_tests.sh --suite 1,4     # run only specific suites
+sudo ./run_full_sweep.sh                # exhaustive grid, ~30 h (use --quick for ~3 h, Suites 1/2/3/5/7/8)
+sudo ./run_full_sweep.sh --force        # pass -F to memfreq_bench (skip idle gate, for busy systems)
+
+# Cross-validate against lmbench (wraps bw_mem + lat_mem_rd with a freq sweep;
+# TSV aligned with memfreq_bench for direct sweet-spot comparison):
+sudo ./lmbench_freq_sweep.sh --yes
 
 # Visualization
-sudo python3 memfreq_sweep.py     # run + ASCII bar charts
-python3 memfreq_sweep.py --file results.txt   # re-parse saved output
-python3 memfreq_sweep.py --json                # also write memfreq_results.json
+sudo python3 memfreq_sweep.py                          # run + ASCII bar charts
+python3 memfreq_sweep.py --file results.txt            # re-parse saved output
+python3 memfreq_sweep.py --json                        # also write memfreq_results.json
+python3 memfreq_sweep.py --compare a.json b.json       # cross-run sweet-spot comparison
+python3 memfreq_sweep.py --report results_dir/         # scan a results dir → Markdown report
+python3 memfreq_sweep.py --format lmbench --file ...   # parse lmbench_freq_sweep.sh output
 ```
 
-There is one lightweight test suite (`bash tests/test_stats_output.sh`,
-77 assertions, runs anywhere POSIX) plus the e2e `run_*.sh` scripts.
+## Verify before committing
+
+There is no lint/typecheck step. Mirror CI (`.github/workflows/ci.yml`) on a
+POSIX box — these all run without root or cpufreq:
+
+```bash
+make clean && make && make test_stats && ./test_stats
+bash tests/test_stats_output.sh        # 77 assertions on a no-cpufreq box; 3 e2e checks auto-SKIP without /sys/.../cpufreq
+bash -n run_all_tests.sh && bash -n run_full_sweep.sh   # shell syntax check
+python3 -m py_compile memfreq_sweep.py
+python3 memfreq_sweep.py --file tests/fixtures/with_stats.txt > /dev/null   # parser smoke test
+```
+
+`tests/test_stats_output.sh` is the main regression harness: it builds
+`test_stats`, runs the C unit checks, then exercises the Python parser / JSON
+output / `--compare` mode against `tests/fixtures/`. The full e2e checks
+(Test 6-8: real cpufreq sweeps) are skipped unless
+`/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq` is writable.
 
 ## Repository layout
 
 | File | Role |
 |------|------|
-| `memfreq_bench.c` | Main C benchmark (~90 KB, ~2930 lines). Workloads, sysfs, topology, fork-based multicore coordinator, output formatting. |
+| `memfreq_bench.c` | Main C benchmark (~105 KB, ~3200 lines). Workloads, sysfs, topology, fork-based multicore coordinator, output formatting. |
 | `stats.c` | Statistical helpers (~213 lines): `find_sweet_spot`, `bootstrap_sweet_spot_ci`, `detect_plateau`, `percentile`, `cmp_double`. |
 | `stats.h` | Public API for stats.c plus `MAX_FREQS` / `MAX_SAMPLES` constants. |
-| `memfreq_sweep.py` | Python runner + TSV parser + ASCII chart visualizer. |
-| `Makefile` | Build for `memfreq_bench` and `test_stats`. |
+| `memfreq_sweep.py` | Python runner + TSV parser + ASCII chart visualizer (`--file`, `--json`, `--compare`, `--report`, `--format lmbench`). |
+| `Makefile` | Build for `memfreq_bench` and `test_stats` only. |
 | `tests/test_stats.c` | C unit tests for the stats helpers (no Linux/cpufreq required). |
+| `tests/test_chase_chain.c` | Standalone chase-chain + bitrev test (not in Makefile; build with `cc -O2 -Wall -o test_chase_chain tests/test_chase_chain.c`). |
 | `tests/test_stats_output.sh` | Shell test harness: 77 assertions over Python parser, JSON output, compare mode, plus runs `test_stats`. |
 | `tests/fixtures/` | TSV/JSON fixtures used by the shell harness. |
-| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA, cache hierarchy). |
-| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (58 tests). |
+| `run_all_tests.sh` | One-click suite runner (single-core, multi-core, strides, random, flush, NUMA, cache hierarchy). Flags: `--quick`, `--yes`, `--suite LIST`. |
+| `run_full_sweep.sh` | Exhaustive multi-hour sweep across stride × core-count × NUMA × cache hierarchy matrix (58 tests). Flags: `--quick`, `--yes`, `--force` (→ `-F`). |
+| `lmbench_freq_sweep.sh` | Cross-validation: wraps lmbench `bw_mem` + `lat_mem_rd` with a cpufreq sweep; TSV aligned with memfreq_bench. |
+| `Dockerfile` | Ubuntu build/test image. Builds + runs unit tests only — no cpufreq kernel, so the benchmark itself cannot run end-to-end in-container. |
 | `docs/memfreq-bench.md` | Full design rationale, microarchitectural analysis, noise model, tuning guide. **The single best reference for "why" questions.** |
+| `docs/workloads.md` | Cache-hierarchy walkthrough of all 5 workloads. |
+| `docs/memory-hierarchy-chase.md` | Deep dive on why chase's sweet spot is high + huge-page / crossover effects. |
+| `docs/run_full_sweep.md` | Guide to the 58-test deep sweep and its `FULL_REPORT.txt`. |
+| `docs/memfreq-sweep.md` | `memfreq_sweep.py` visualizer usage. |
 | `README.md` | Quick-start only. |
+| `CLAUDE.md` | Stale copy of this file — do not edit; update `AGENTS.md` instead. |
 
 ## Architecture of `memfreq_bench.c`
 
@@ -57,7 +96,7 @@ The main translation unit, organized by `/* --- */` section banners (line
 numbers drift with edits — use the banners, not line refs, to find things):
 
 1. **Platform flush primitive** (`flush_cacheline`): `clflush` on x86,
-   `dc cvac` on aarch64, no-op elsewhere. Used only by the `-f` (cache-flush)
+   `dc civac` on aarch64, no-op elsewhere. Used only by the `-f` (cache-flush)
    workload.
 
 2. **Topology detection** (`detect_numa_nodes`, `detect_freq_domains`,
@@ -161,7 +200,7 @@ After the data rows, up to 5 optional `# --- ... ---` blocks (all default-on unl
 | `# --- plateau ---` | on | `-P` to suppress | piecewise-linear breakpoint + slope ratio + 95% sweet spot, with a `power:` sub-row per workload when a power sensor is available |
 | `# --- raw_samples (workload) ---` | off | `-r` | per-freq × per-sample raw throughput |
 
-Sweet-spot threshold is the literal constant `THRESHOLD` (= 0.95) in the C source; override at runtime with `-T`.
+Sweet-spot threshold defaults to 0.95 in the C source (the `threshold` variable in `main`, *not* a `#define`); override at runtime with `-T`.
 
 ## Important constraints when modifying
 
@@ -171,7 +210,7 @@ Sweet-spot threshold is the literal constant `THRESHOLD` (= 0.95) in the C sourc
 - **`-m` must exceed L3** or the benchmark measures cache, not DRAM. Use `-A`.
 - **chase is the latency-bound test, stride is moderate, compute is the control.** Don't conflate their sweet spots — they answer different questions.
 - **`compute_%` is a sanity check on freq locking**, not a result. If it doesn't track the freq ratio, the measurement is invalid.
-- The main C file is `memfreq_bench.c` (~90 KB, ~2930 lines); statistical
+- The main C file is `memfreq_bench.c` (~105 KB, ~3200 lines); statistical
   helpers live in `stats.c` (~213 lines) + `stats.h` (~84 lines). All
   files are cleanly sectioned by `/* --- */` banners — find-by-section
   is faster than find-by-symbol, and line numbers drift with edits.
@@ -179,6 +218,6 @@ Sweet-spot threshold is the literal constant `THRESHOLD` (= 0.95) in the C sourc
 ## Where to look when…
 
 - **"Why does output look weird"** → `docs/memfreq-bench.md` "噪音分析" / "解读输出" sections.
-- **"How do I add a new workload"** → model after `bench_compute` (`__attribute__((noinline))`, signature `double bench_X(double secs)`, return Mops, called from `main`'s per-freq inner loop and `run_multicore`'s per-child loop).
-- **"How do I change the sweet-spot definition"** → the `THRESHOLD` constant + the per-metric sweet-spot scan near the print loop in `main`.
-- **"How do I support a new arch for cache flush"** → extend the `#if defined(__x86_64__)` block at the top of the C file.
+- **"How do I add a new workload"** → model after the existing `bench_*` functions (all `__attribute__((noinline))`, return Mops). `bench_compute(double secs)` is the simplest; the memory workloads take data + size + secs (e.g. `bench_stride(arr, count, stride, secs)`). Wire the new fn into `main`'s per-freq inner loop and `run_multicore`'s per-child loop.
+- **"How do I change the sweet-spot definition"** → the `threshold` variable (default 0.95) in `main` plus the per-metric `find_sweet_spot` scan in `stats.c`; override at runtime with `-T`.
+- **"How do I support a new arch for cache flush"** → extend the `#if defined(__x86_64__) || defined(__i386__)` / `__aarch64__` block at the top of the C file.

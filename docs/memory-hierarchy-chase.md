@@ -247,6 +247,9 @@ K      = 14 / 0.1535 ≈ 91.2 cycles
 
 ## 第 7 章:huge page 改了什么
 
+> **⚠ 未实现**:memfreq_bench 目前**不支持** `-H` flag,内存用 `posix_memalign`(4KB page)分配。
+> 本章及第 8、9 章的 huge page 分析是**纸面预测**,尚未实测验证。详见第 10 章 open questions。
+
 huge page 改的是**TLB 链**(第 1/2/3 级),**不动数据链**(第 4/5/6/7 级)。
 
 ```
@@ -306,13 +309,6 @@ total    = max(0.4, 40) = 40 ns (DRAM-bound)
 > **为什么 L2 + L3 的 cycles 不计入 K**:L2 miss (12 cycles) 和 L3 miss (30 cycles) 是在 OoO 引擎**等 DRAM 数据回来**的"间隙"里发生的(等数据时 CPU 继续推进其他工作),所以它们的 wall time 跟 40 ns DRAM 等待**重叠**。**它们的 cycle 数被 OoO 隐藏了**,不贡献到 critical path。**K 只算 OoO 没法隐藏的 active 工作**:TLB 查(必须 sequential)、L1 dcache miss(必须 sequential,因为 L1 access 必须等物理地址)、loop overhead。
 >
 > 这解释了为什么 K=5 比表格里"1+4+12+30+3 = 50"小一个数量级——**50 是所有 cycle 的算术和,K 是 critical path 上 OoO 重叠后剩下的 cycle**。
-
-**新 crossover**:
-```
-f_crossover = 5 / 40 × 1000 = 125 MHz
-```
-
-用户 freq 范围 1700-2300 MHz **全部在 crossover 之上** → **整个范围 DRAM-bound** → sweet spot 跌到 1700 MHz(最低)。
 
 **新 crossover**:
 ```

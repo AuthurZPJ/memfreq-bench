@@ -694,7 +694,7 @@ bench_stride(const uint64_t *arr, size_t count, size_t stride, double secs)
 	return (double)iterations * (double)inner_iters / elapsed;
 }
 
-/* Flush-enabled stride: clflush/dc cvac after each read */
+/* Flush-enabled stride: clflush/dc civac after each read */
 static double __attribute__((noinline))
 bench_stride_flush(const uint64_t *arr, size_t count, size_t stride,
 		   double secs)
@@ -2464,7 +2464,7 @@ static void usage(const char *prog)
 "  --simple-chase Use flat Fisher-Yates chain (weaker anti-prefetch)\n"
 "              Default: two-level (page-shuffle + bit-reversal) chain\n"
 "  -R          Add random permutation test (Fisher-Yates, defeats prefetcher)\n"
-"  -f          Flush cache line after each access (clflush/dc cvac)\n"
+"  -f          Flush cache line after each access (clflush/dc civac)\n"
 "  -F          Force run even if system is busy (skip idle check)\n"
 "  -2          L3-resident sweep: also measure sweet spot with 2× L2 array\n"
 "  -B NODE     Bind array memory to NUMA node (default: -1 = no binding)\n"
@@ -3063,9 +3063,11 @@ int main(int argc, char **argv)
 	double c_max = do_chase ? results[ref].chase_tput : 0;
 	double p_max = results[ref].compute_tput;
 
-	/* Per-workload throughput arrays (descending-freq order in results[],
-	 * but find_sweet_spot() walks the array linearly so order doesn't matter
-	 * as long as we pass valid data). We build ascending-freq arrays. */
+	/* Per-workload throughput arrays. results[] is descending-freq
+	 * (the sweep loop goes high→low), but find_sweet_spot() returns the
+	 * FIRST element meeting threshold×max — so it depends on ascending
+	 * freq order (lowest freq that still meets the bar). Build ascending
+	 * arrays below by iterating fi=0..nfreqs-1, matching read_freqs order. */
 	double stride_mops[MAX_FREQS], chase_mops[MAX_FREQS], random_mops[MAX_FREQS];
 	int    freqs_khz[MAX_FREQS];
 	int    n_valid = 0;

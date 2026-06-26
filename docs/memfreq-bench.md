@@ -170,7 +170,7 @@ return (double)iterations * 1000000.0 / elapsed;   // 真实 OPS = iterations ×
 ```c
 for (size_t i = 0; i < count; i += stride) {
     sum += arr[i];
-    flush_cacheline(&arr[i]);  // x86: clflush, ARM: dc cvac
+    flush_cacheline(&arr[i]);  // x86: clflush, ARM: dc civac
 }
 ```
 
@@ -317,7 +317,7 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 | `-S STEP_KHZ` | 25000 | CPPC 范围模式下的频率步长（25 MHz） |
 | `-C` | — | 跳过 pointer chase 测试 |
 | `-R` | — | 启用 random permutation 测试 |
-| `-f` | — | 启用 cache flush（clflush/dc cvac） |
+| `-f` | — | 启用 cache flush（clflush/dc civac） |
 | `-2` | — | 额外运行 L3-resident sweep（数组大小 = 2× L2，数据完全驻留在 L3 中） |
 | `-B NODE` | -1 | 将数组绑定到指定 NUMA 节点 |
 | `-F` | — | 强制运行（跳过系统空闲检查） |
