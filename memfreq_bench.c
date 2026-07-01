@@ -72,7 +72,7 @@ static inline void flush_cacheline(const void *addr)
 #elif defined(__aarch64__)
 static inline void flush_cacheline(const void *addr)
 {
-	__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+	__asm__ volatile("dc civac, %0\n\tdsb sy" : : "r"(addr) : "memory");
 }
 #else
 static inline void flush_cacheline(const void *addr)
@@ -171,7 +171,7 @@ static int detect_freq_domains(struct freq_domain *domains)
 	int seen[MAX_CPUS] = {0};
 
 	struct dirent *ent;
-	while ((ent = readdir(d)) != NULL) {
+	while ((ent = readdir(d)) != NULL && ndomains < MAX_CPUS) {
 		if (strncmp(ent->d_name, "cpu", 3) != 0 ||
 		    !isdigit(ent->d_name[3]))
 			continue;
@@ -933,6 +933,11 @@ static struct pnode *build_chase(size_t nnodes, int simple)
 			for (size_t i = 0; i < remainder; i++)
 				idx[pos++] = rbuf[i];
 			free(rbuf);
+		} else {
+			/* fallback: fill sequentially if malloc fails */
+			size_t base = npages * lines_per_page;
+			for (size_t i = 0; i < remainder; i++)
+				idx[pos++] = base + i;
 		}
 	}
 	/* pos == nnodes */
@@ -2535,7 +2540,14 @@ int main(int argc, char **argv)
 		case 'A': auto_size = 1;            break;
 		case 's': stride    = atoi(optarg); break;
 		case 't': test_secs = atoi(optarg); break;
-		case 'n': nsamples  = atoi(optarg); break;
+		case 'n': nsamples  = atoi(optarg);
+			  if (nsamples < 1) nsamples = 1;
+			  if (nsamples > MAX_SAMPLES) {
+			  	fprintf(stderr, "WARN: nsamples capped at %d (max %d)\n",
+			  		nsamples, MAX_SAMPLES);
+			  	nsamples = MAX_SAMPLES;
+			  }
+			  break;
 		case 'S': step_khz  = atoi(optarg); break;
 		case 'B': numa_node = atoi(optarg); break;
 		case 'C': do_chase  = 0;            break;

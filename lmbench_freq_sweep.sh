@@ -98,11 +98,11 @@ detect_freqs() {
 
     # 1. Discrete list (most common)
     if [[ -r "$avail_file" ]]; then
-        while IFS= read -r line; do
-            local khz=$(echo "$line" | tr -d '[:space:]')
+        read -r line < "$avail_file"
+        for khz in $line; do
             [[ -z "$khz" ]] && continue
             out="$out $((khz / 1000))"
-        done < "$avail_file"
+        done
         if [[ -n "$out" ]]; then
             echo "$out"
             return 0

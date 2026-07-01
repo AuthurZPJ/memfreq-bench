@@ -148,7 +148,7 @@ static double piecewise_sse(const double *x, const double *y, int n, int k)
 		return -1.0;
 	double s1, i1, s2, i2;
 	if (fit_line(x, y, k + 1, &s1, &i1) < 0) return -1.0;
-	if (fit_line(x, y + k + 1, n - k - 1, &s2, &i2) < 0) return -1.0;
+	if (fit_line(x + k + 1, y + k + 1, n - k - 1, &s2, &i2) < 0) return -1.0;
 	double sse = 0.0;
 	for (int j = 0; j <= k; j++) {
 		double r = y[j] - (s1 * x[j] + i1);

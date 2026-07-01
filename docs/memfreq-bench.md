@@ -175,9 +175,9 @@ for (size_t i = 0; i < count; i += stride) {
 ```
 
 **微架构分析：**
-- 每次访问后立即驱逐 cache line → 下次必须从 DRAM 重新加载
-- 消除 L3 hit 的可能性 → 测试**纯 DRAM 带宽**
-- 用 `-f` 启用
+- clflush 驱逐当前刚刚访问的 cache line，但 stride=8 时下次访问的是不同的 line → 硬件预取仍生效，L3 hit 不会被消除
+- 测量的是 **stride + clflush 指令开销**（每次迭代增加约 60-120 个周期），不是纯 DRAM 带宽
+- 用于控制 cache 状态做对比实验，不用来测量裸 DRAM 带宽
 
 ---
 

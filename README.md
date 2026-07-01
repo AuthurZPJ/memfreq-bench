@@ -123,7 +123,7 @@ sudo python3 memfreq_sweep.py --json     # also write memfreq_results.json
 
 - `docs/memfreq-bench.md` — full design rationale, microarchitecture, noise
   model, high-core-count tuning. The single best reference for "why".
-- `docs/run_full_sweep.md` — complete guide to the 57-test deep sweep and
+- `docs/run_full_sweep.md` — complete guide to the 58-test deep sweep and
   how to read the FULL_REPORT.txt it generates.
 
 ## Requirements

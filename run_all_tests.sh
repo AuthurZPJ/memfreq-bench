@@ -483,9 +483,9 @@ generate_summary() {
                 echo "  (no sweet spot or test failed)"
             fi
 
-            # Extract max throughput line (highest freq = last data row)
+            # Extract max throughput line (highest freq = first data row (high→low sweep order))
             local max_line
-            max_line=$(grep -E "^[0-9]" "$result_file" 2>/dev/null | tail -1 || true)
+            max_line=$(grep -E "^[0-9]" "$result_file" 2>/dev/null | head -1 || true)
             if [[ -n "$max_line" ]]; then
                 local freq mops mbs
                 freq=$(echo "$max_line" | awk '{print $1}')
