@@ -483,9 +483,8 @@ def parse_lmbench_output(text: str) -> dict:
     bw_max  = max(r["bw_mem_mbps"]  for r in rows)
     lat_min = min(r["lat_mem_rd_ns"] for r in rows)
     for r in rows:
-        r["bw_mem_pct"] = 100.0 * r["bw_mem_mbps"]  / bw_max
-        # latency: lower is better → percent = min/lat (so smaller lat → higher %)
-        r["lat_pct"]    = 100.0 * lat_min / r["lat_mem_rd_ns"]
+        r["bw_mem_pct"] = 100.0 * r["bw_mem_mbps"] / bw_max if bw_max != 0 else 0.0
+        r["lat_pct"]    = 100.0 * lat_min / r["lat_mem_rd_ns"] if lat_min != 0 and r["lat_mem_rd_ns"] != 0 else 0.0
 
     sweet: dict = {}
     # bw_mem sweet spot: lowest freq meeting 95% peak (mirrors memfreq_bench stride)
@@ -529,8 +528,10 @@ def visualize(data: dict):
     for r in rows:
         marker = " ◄ sweet spot" if (
             "stride" in sweet and r["freq_mhz"] == sweet["stride"]) else ""
-        print(f"{r['freq_mhz']:>6}  {r['stride_mops']:>8.1f}  "
-              f"{r['stride_pct']:>5.1f}  {bar(r['stride_pct'])}{marker}")
+        sm = r.get("stride_mops", 0.0)
+        sp = r.get("stride_pct", 0.0)
+        print(f"{r['freq_mhz']:>6}  {sm:>8.1f}  "
+              f"{sp:>5.1f}  {bar(sp)}{marker}")
     print()
 
     # --- Chase chart ---
@@ -540,16 +541,20 @@ def visualize(data: dict):
         for r in rows:
             marker = " ◄ sweet spot" if (
                 "chase" in sweet and r["freq_mhz"] == sweet["chase"]) else ""
-            print(f"{r['freq_mhz']:>6}  {r['chase_mops']:>8.1f}  "
-                  f"{r['chase_pct']:>5.1f}  {bar(r['chase_pct'])}{marker}")
+            cm = r.get("chase_mops", 0.0)
+            cp = r.get("chase_pct", 0.0)
+            print(f"{r['freq_mhz']:>6}  {cm:>8.1f}  "
+                  f"{cp:>5.1f}  {bar(cp)}{marker}")
         print()
 
     # --- Compute (control) chart ---
     print("── Compute (FP arithmetic, no memory) ─────────────────────────────")
     print(f"{'MHz':>6}  {'Mops':>8}  {'%':>5}  {'throughput':<{BAR_W}}")
     for r in rows:
-        print(f"{r['freq_mhz']:>6}  {r['compute_mops']:>8.1f}  "
-              f"{r['compute_pct']:>5.1f}  {bar(r['compute_pct'])}")
+        comp_m = r.get("compute_mops", 0.0)
+        comp_p = r.get("compute_pct", 0.0)
+        print(f"{r['freq_mhz']:>6}  {comp_m:>8.1f}  "
+              f"{comp_p:>5.1f}  {bar(comp_p)}")
     print()
 
     # --- Summary ---

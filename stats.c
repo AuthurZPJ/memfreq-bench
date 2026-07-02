@@ -209,5 +209,10 @@ int detect_plateau(const double *mops, const int *freqs_khz, int n,
 	 * where nothing hits the threshold). Reporting "plateau detected"
 	 * with sweet_MHz = 0 is misleading — return -1 so the caller
 	 * can show "no plateau" instead. */
-	return (slope_ratio > 2.0 && sweet_khz > 0) ? 0 : -1;
+	/* Require sweet spot at least 2 steps above minimum for a real plateau */
+	int sweet_idx_val = -1;
+	for (int i = 0; i < n; i++) {
+		if (freqs_khz[i] == sweet_khz) { sweet_idx_val = i; break; }
+	}
+	return (slope_ratio > 2.0 && sweet_idx_val >= 2) ? 0 : -1;
 }

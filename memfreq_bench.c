@@ -728,6 +728,15 @@ bench_stride_flush(const uint64_t *arr, size_t count, size_t stride,
 /* rather than latency.                                                */
 /* ------------------------------------------------------------------ */
 
+/* 64-bit splitmix64 PRNG — avoids rand() modulo bias for large arrays */
+static uint64_t splitmix64_next(uint64_t *state)
+{
+	uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+	return z ^ (z >> 31);
+}
+
 static size_t *build_random_index(size_t count)
 {
 	size_t *idx = malloc(count * sizeof(size_t));
@@ -739,8 +748,9 @@ static size_t *build_random_index(size_t count)
 		idx[i] = i;
 
 	/* Fisher-Yates shuffle */
+	uint64_t rng = 0x9e3779b97f4a7c15ULL;
 	for (size_t i = count - 1; i > 0; i--) {
-		size_t j = (size_t)rand() % (i + 1);
+		size_t j = (size_t)(splitmix64_next(&rng) % (i + 1));
 		size_t tmp = idx[i];
 		idx[i] = idx[j];
 		idx[j] = tmp;
@@ -837,8 +847,9 @@ static struct pnode *build_chase(size_t nnodes, int simple)
 		if (!idx) { free(nodes); return NULL; }
 		for (size_t i = 0; i < nnodes; i++)
 			idx[i] = i;
+		uint64_t rng = 0x9e3779b97f4a7c15ULL;
 		for (size_t i = nnodes - 1; i > 0; i--) {
-			size_t j = (size_t)rand() % (i + 1);
+			size_t j = (size_t)(splitmix64_next(&rng) % (i + 1));
 			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 		for (size_t i = 0; i < nnodes - 1; i++)
@@ -865,8 +876,9 @@ static struct pnode *build_chase(size_t nnodes, int simple)
 		if (!idx) { free(nodes); return NULL; }
 		for (size_t i = 0; i < nnodes; i++)
 			idx[i] = i;
+		uint64_t rng2 = 0x9e3779b97f4a7c15ULL;
 		for (size_t i = nnodes - 1; i > 0; i--) {
-			size_t j = (size_t)rand() % (i + 1);
+			size_t j = (size_t)(splitmix64_next(&rng2) % (i + 1));
 			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 		for (size_t i = 0; i < nnodes - 1; i++)
@@ -875,14 +887,14 @@ static struct pnode *build_chase(size_t nnodes, int simple)
 		free(idx);
 		return nodes;
 	}
-
 	/* Level 1: Fisher-Yates shuffle of page visit order */
 	size_t *pages = malloc(npages * sizeof(*pages));
 	if (!pages) { free(nodes); return NULL; }
 	for (size_t i = 0; i < npages; i++)
 		pages[i] = i;
+	uint64_t rng3 = 0x9e3779b97f4a7c15ULL;
 	for (size_t i = npages - 1; i > 0; i--) {
-		size_t j = (size_t)rand() % (i + 1);
+		size_t j = (size_t)(splitmix64_next(&rng3) % (i + 1));
 		size_t t = pages[i]; pages[i] = pages[j]; pages[j] = t;
 	}
 
@@ -896,8 +908,9 @@ static struct pnode *build_chase(size_t nnodes, int simple)
 		if (!idx) { free(nodes); return NULL; }
 		for (size_t i = 0; i < nnodes; i++)
 			idx[i] = i;
+		uint64_t rng4 = 0x9e3779b97f4a7c15ULL;
 		for (size_t i = nnodes - 1; i > 0; i--) {
-			size_t j = (size_t)rand() % (i + 1);
+			size_t j = (size_t)(splitmix64_next(&rng4) % (i + 1));
 			size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 		for (size_t i = 0; i < nnodes - 1; i++)
@@ -2098,8 +2111,8 @@ static void print_data_rows(const struct result *results, int nfreqs,
 			continue;
 		int target_mhz = results[fi].freq_khz / 1000;
 		int actual_mhz = results[fi].actual_khz / 1000;
-		double s_pct = results[fi].stride_tput / s_max * 100.0;
-		double p_pct = results[fi].compute_tput / p_max * 100.0;
+		double s_pct = s_max > 0 ? results[fi].stride_tput / s_max * 100.0 : 0.0;
+		double p_pct = p_max > 0 ? results[fi].compute_tput / p_max * 100.0 : 0.0;
 
 		if (pm == PWR_HWMON) {
 			double idle_w = results[fi].idle_power_uw / 1e6;
@@ -2109,7 +2122,7 @@ static void print_data_rows(const struct result *results, int nfreqs,
 			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
+					c_max > 0 ? results[fi].chase_tput / c_max * 100.0 : 0.0;
 				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%.2f\t%.3f\n",
 				       target_mhz, actual_mhz,
 				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
@@ -2128,7 +2141,7 @@ static void print_data_rows(const struct result *results, int nfreqs,
 			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
+					c_max > 0 ? results[fi].chase_tput / c_max * 100.0 : 0.0;
 				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.3f\n",
 				       target_mhz, actual_mhz,
 				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
@@ -2146,7 +2159,7 @@ static void print_data_rows(const struct result *results, int nfreqs,
 			double s_mbs = OPS_TO_MBS(results[fi].stride_tput);
 			if (do_chase) {
 				double c_pct =
-					results[fi].chase_tput / c_max * 100.0;
+					c_max > 0 ? results[fi].chase_tput / c_max * 100.0 : 0.0;
 				printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
 				       target_mhz, actual_mhz,
 				       results[fi].stride_tput / 1e6, s_mbs, s_pct,
@@ -2335,9 +2348,12 @@ static void print_plateau(const double *mops[3], const int *freqs_khz,
 		for (int fi = 0; fi < nfreqs; fi++) {
 			if (!results[fi].valid) continue;
 			if (results[fi].load_power_uw <= 0) continue;
-			max_power_idx      = fi;
-			max_power_w        = results[fi].load_power_uw / 1e6;
-			max_power_freq_khz = results[fi].freq_khz;
+			double pw = results[fi].load_power_uw / 1e6;
+			if (pw > max_power_w) {
+				max_power_w        = pw;
+				max_power_idx      = fi;
+				max_power_freq_khz = results[fi].freq_khz;
+			}
 		}
 		if (rc == 0 && max_power_idx >= 0) {
 			int sweet_compact_idx = -1;

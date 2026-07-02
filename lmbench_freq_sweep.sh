@@ -115,6 +115,10 @@ detect_freqs() {
     max_khz=$(cat "${cpu_path}/cpuinfo_max_freq" 2>/dev/null || echo 0)
     if [[ $min_khz -gt 0 && $max_khz -gt $min_khz ]]; then
         local step_khz=${STEP_KHZ:-25000}
+        if [[ $step_khz -le 0 ]]; then
+            echo "ERROR: --step-khz must be positive" >&2
+            return 1
+        fi
         local khz=$min_khz
         while [[ $khz -le $max_khz ]]; do
             out="$out $((khz / 1000))"
