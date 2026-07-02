@@ -52,7 +52,7 @@ $ sudo ./memfreq_bench -c 0 -m 256 -s 8 -t 2 -n 3
   → CHASE is purely latency-bound (DRAM round-trip).
 ```
 
-三张柱状图（Stride / Chase / Compute）+ 甜点摘要 + 分析建议。统计块（per-freq stats / CI / sensitivity / plateau / raw_samples）只包含 stride / chase / random，不含 compute（compute 仅用于频率锁定 sanity check）。如果用了 `-r`，还会输出 bootstrap CI 和 plateau 检测。
+三张柱状图（Stride / Chase / Compute）+ 甜点摘要 + 分析建议。统计块（per-freq stats / CI / sensitivity / plateau / raw_samples）只包含 stride / chase / random，不含 compute（compute 仅用于频率锁定 sanity check）。CI / sensitivity / plateau 块也不含 compute——compute 无甜点概念，不参与甜点相关的统计。如果用了 `-r`，还会输出 bootstrap CI 和 plateau 检测。
 
 ---
 

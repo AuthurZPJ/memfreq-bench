@@ -228,6 +228,8 @@ lscpu | grep -E "L[123]|Thread|Core|Socket|NUMA"
 | 32-128 MB | 256-512 | 高端服务器 |
 | 128-300 MB | 512-1024 | 高核数 ARM（如 96 核 / 273 MB L3） |
 
+当 L3 恰好为 128 MB 时，默认 `-m 128` 等于 L3（未超出 L3），测试可能部分 cache-bound。此时务必使用 `-A` 或 `-m 256`。
+
 **验证方法**：如果低频的 stride_% 异常高（接近 100%），可能数组没超出 L3——加大 `-m` 重测。
 
 #### 2. 处理 SMT
@@ -325,6 +327,8 @@ watch -n 1 'cat /sys/class/hwmon/hwmon*/power1_input'
 | `-L LIST` | — | 多阈值扫描,逗号分隔,例如 `0.8,0.9,0.95,0.99`,最多 16 个 |
 | `-r` | — | 输出每样本原始数据(用于自定义分析) |
 | `-P` | — | 抑制 plateau 检测输出(默认开启) |
+| `-y` | — | 抑制所有可选统计块(per-freq stats、plateau、CI、sensitivity、raw samples)。各 workload 甜点行仍然输出 |
+| `--simple-chase` | — | 使用单层 flat Fisher-Yates 构建 chase 链(弱反预取)。默认：双层构造(页级 shuffle + 页内 bit-reversal) |
 
 ### 可视化
 
@@ -446,7 +450,7 @@ compute_% 预期 ≈ 1500/3000 × 100 = 50%
 ```
 
 ```
-甜点在 27% 频率 → 功耗节省 = (1 - 0.27) × (V_low/V_high)² ≈ 50-70%
+甜点在 27% 频率 → P ∝ f² 时节省 ≈ 1 - 0.27² ≈ 93%；计入 V 随 f 降低，实际节省约 50-70%
 甜点在 80% 频率 → 功耗节省有限,工作负载对频率敏感
 ```
 

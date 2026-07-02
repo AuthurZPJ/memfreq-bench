@@ -600,11 +600,11 @@ full_s8:  Max MB/s = 15500, sweet = 2600 MHz
 
 **预期结果**：
 ```
-cache_half_L2_1MB:   stride_sweet = 3300 MHz（无甜点，compute-bound）
-cache_double_L2_2MB: stride_sweet = 2800 MHz（过渡区）
-cache_half_L3_16MB:  stride_sweet = 2400 MHz（L3-bound）
-cache_double_L3_32MB:stride_sweet = 2200 MHz（DRAM-bound）
-cache_quad_L3_64MB:  stride_sweet = 2200 MHz（收敛验证）
+cache_half_L2_1MB:   stride_sweet = 2600 MHz（无甜点，compute-bound）
+cache_double_L2_2MB: stride_sweet = 2200 MHz（过渡区）
+cache_half_L3_16MB:  stride_sweet = 1900 MHz（L3-bound）
+cache_double_L3_32MB:stride_sweet = 1700 MHz（DRAM-bound）
+cache_quad_L3_64MB:  stride_sweet = 1700 MHz（收敛验证）
 ```
 
 **分析方法**：
@@ -613,10 +613,10 @@ cache_quad_L3_64MB:  stride_sweet = 2200 MHz（收敛验证）
    ```
    绘制数组大小 vs 甜点频率曲线：
    
-   3300 ┤╮ ½×L2
-   2800 ┤ ╰╮ 2×L2
-   2400 ┤   ╰╮ ½×L3
-   2200 ┤     ╰──────╮ 2×L3, 4×L3
+   2600 ┤╮ ½×L2
+   2200 ┤ ╰╮ 2×L2
+   1900 ┤   ╰╮ ½×L3
+   1700 ┤     ╰──────╮ 2×L3, 4×L3
       0 ┼───────────────
         1MB  2MB 16MB 32MB 64MB
               Array Size
